@@ -5,7 +5,9 @@ description = "mlx-lm fallback worker speaking the Kiln worker protocol (gRPC ov
 requires-python = ">=3.12"
 dependencies = [
     "grpcio>=1.75",
+    "mlx-lm==0.31.3 ; sys_platform == 'darwin'",
     "protobuf>=6.30",
+    "psutil>=7",
 ]
 
 [dependency-groups]
