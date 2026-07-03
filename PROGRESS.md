@@ -110,3 +110,73 @@
   All checks passed! / 1 file already formatted
   ```
 - Next: Phase 0 complete. Phase 1 — Python worker end-to-end (SPEC §12), pending PM phase gate.
+
+## [2026-07-03] Phase 1 / Python worker end-to-end — DONE
+- What:
+  - `kiln_worker_py` now implements the Phase 1 protocol surface over gRPC/UDS: GetInfo,
+    Health, Submit (server-streamed), Cancel, plus Tokenize (required by
+    CAPABILITY_TOKENIZER_OWNED). Drain/Stats remain UNIMPLEMENTED until their phases.
+  - Sequential generation via mlx-lm `generate_step` on a single dedicated engine thread
+    (all MLX ops confined there). raw_text and token_ids inputs; temp/top_p/top_k/min_p/seed
+    plus repetition/frequency/presence penalties; stop strings via an incremental matcher
+    that never streams matched text; stop token ids; ignore_eos; usage counts + timings +
+    seed echo in `Finished`. Malformed input returns `Finished{ERROR}` — worker never dies.
+  - `scripts/fetch-test-model.sh` created (SPEC §4 lists it; Phase 0 didn't build it):
+    stdlib-only downloader, four models pinned at exact HF revisions, sha256-verified.
+    All four fetched locally.
+  - Test suite: 9 unit tests (stop matcher) + 19 integration tests driving the real pinned
+    llama-3.2-1b-4bit over UDS (`KILN_TEST_MODELS`, skip-with-hint when absent).
+  - CLI: `python -m kiln_worker_py --model <dir> --socket <path>`; RLIMIT_NOFILE raised at
+    start; SIGTERM/SIGINT graceful shutdown; socket binds immediately, LOADING → READY.
+- Decisions:
+  - Test-model pins = repo HEADs as of 2026-07-03 (llama 0823137, qwen3 73e3e38,
+    gemma3 2d44e83). BF16 tiny model slot: `mlx-community/SmolLM2-135M-Instruct`
+    (422de22) — smallest unquantized candidate (~270 MB) and llama-arch, so it doubles as
+    the unquantized path for Phase 3 golden fixtures.
+  - `mlx-lm==0.31.3` pinned exactly, marker `sys_platform == 'darwin'` (mlx has no wheels
+    for the linux CI lint job, which runs `uv sync`). `psutil` added for current-process
+    RSS (`ru_maxrss` is peak, would mislabel the proto field). Both justified in commits.
+  - Cancel guarantee: `generate_step` yields one evaluated token per step; the cancel flag
+    is checked between yields, so overshoot ≤ the one pipelined step. Test asserts
+    `steps_done - cancel_step <= 2` white-box on the live request object.
+  - Every sampled token (incl. the finishing eos/stop token) is delivered in a TokenChunk,
+    so `sum(chunk.token_ids) == completion_tokens`; tests assert the invariant. Text held
+    back by the stop matcher rides on later/final chunks (proto allows lagging text).
+  - `weights_fingerprint` = sha256(config.json bytes + weight file names/sizes): cheap
+    identity, not a weights content hash (~1 GB hash per start not worth it for the
+    fallback worker; the SSD tier scheme is the Rust worker's, Phase 5).
+  - `echo_prompt` → INVALID_REQUEST for now (nothing sends it before Phase 2; honest
+    rejection beats silent misbehavior). `logprobs_top_n` ignored (LOGPROBS not
+    advertised). Grammar → GRAMMAR_UNSUPPORTED (capability not advertised).
+  - Submit during LOADING aborts UNAVAILABLE (proto comment) rather than Finished{error}.
+  - Generated-stub import shim (`_gen.py`) inserts `gen/` on sys.path once — the stubs'
+    absolute `kiln.v1` imports require it; committed stub layout is CI-checked, unchanged.
+- Deviations: none
+- Acceptance:
+  ```
+  $ export KILN_TEST_MODELS=~/.kiln/test-models
+  $ uv run --project python/kiln_worker_py pytest python/kiln_worker_py/tests -v
+  tests/test_worker.py::test_submit_streams_tokens PASSED
+  tests/test_worker.py::test_health_reports_memory_numbers PASSED
+  tests/test_worker.py::test_cancel_mid_stream_stops_within_two_steps PASSED
+  tests/test_worker.py::test_greedy_is_deterministic PASSED
+  tests/test_worker.py::test_seeded_sampling_is_reproducible PASSED
+  tests/test_worker.py::test_stop_string_ends_generation_and_is_excluded PASSED
+  ... (28 passed in 6.70s)
+
+  $ python -m kiln_worker_py --model ~/.kiln/test-models/llama-3.2-1b-4bit \
+      --socket /tmp/kiln-test.sock &   # then, from a grpc client on that socket:
+  state: WORKER_STATE_READY | rss MB: 194 | mlx_active MB: 695
+  model: llama-3.2-1b-4bit llama q4_g64
+  text: 'Paris.\nThe capital of France is Paris.\nThe capital of'
+  finish: FINISH_REASON_LENGTH | prompt: 6 | completion: 12
+
+  $ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+      (clean; Rust untouched this task)
+  $ ruff check python/ && ruff format --check python/
+  All checks passed! / 11 files already formatted
+  ```
+- Next: Phase 2 — Gateway v0 (axum app, supervisor spawning this worker, OpenAI chat
+  completions, /v1/models, auth, metrics), pending PM phase gate. Note for PM: CI does not
+  yet run the python worker pytest suite (needs test-model caching on the macos runner) —
+  worth adding when the cache strategy is decided.
