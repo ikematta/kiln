@@ -1,0 +1,8 @@
+[package]
+name = "kiln-worker"
+description = "Rust worker binary: gRPC server wiring kiln-engine + kiln-models over a Unix domain socket"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

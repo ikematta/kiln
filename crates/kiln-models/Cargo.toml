@@ -1,0 +1,8 @@
+[package]
+name = "kiln-models"
+description = "Model implementations (llama, qwen*, gemma*) and config.json parsing"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

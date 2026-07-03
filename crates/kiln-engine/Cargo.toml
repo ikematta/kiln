@@ -1,0 +1,8 @@
+[package]
+name = "kiln-engine"
+description = "Batching scheduler, paged KV block manager, radix prefix cache, sampler, speculative decoding, SSD tier"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

@@ -1,0 +1,8 @@
+[package]
+name = "kiln-gateway"
+description = "Gateway binary: axum HTTP server, API adapters, router, worker supervisor, metrics"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

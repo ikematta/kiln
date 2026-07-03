@@ -1,0 +1,8 @@
+[package]
+name = "kiln-tokenize"
+description = "Tokenizer loading, chat templates (minijinja), incremental detokenization, tool-call parsers"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

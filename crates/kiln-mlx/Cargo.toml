@@ -1,0 +1,15 @@
+[package]
+name = "kiln-mlx"
+description = "FFI over vendored mlx-c plus safe wrappers — the only crate in the workspace allowed to contain unsafe"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = ["metal"]
+# Builds and statically links the vendored mlx-c (and MLX) via cmake.
+# Disabled for the Linux CI compile-check: `cargo build --workspace --no-default-features`.
+metal = []
+
+[build-dependencies]
+cmake.workspace = true
