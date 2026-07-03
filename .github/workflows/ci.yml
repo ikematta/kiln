@@ -73,3 +73,18 @@ jobs:
             --grpc_python_out=python/kiln_worker_py/src/kiln_worker_py/gen \
             proto/kiln/v1/worker.proto
           git diff --exit-code python/kiln_worker_py/src/kiln_worker_py/gen
+      # The pinned revisions/sha256s live in fetch-test-model.sh, so hashing the
+      # script keys the cache to the pins: a pin bump invalidates the cache.
+      - name: Cache pinned test models
+        id: test-models
+        uses: actions/cache@v4
+        with:
+          path: ~/.kiln/test-models
+          key: test-models-${{ hashFiles('scripts/fetch-test-model.sh') }}
+      - name: Fetch pinned test models
+        if: steps.test-models.outputs.cache-hit != 'true'
+        run: ./scripts/fetch-test-model.sh
+      - name: Python worker tests
+        run: |
+          export KILN_TEST_MODELS="$HOME/.kiln/test-models"
+          uv run --project python/kiln_worker_py pytest python/kiln_worker_py/tests -v
