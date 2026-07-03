@@ -1,0 +1,313 @@
+// kiln/v1/worker.proto
+//
+// The contract between kiln-gateway and any model worker (Rust or Python).
+//
+// COMPATIBILITY RULES (enforced by CLAUDE.md / SPEC §5):
+//   - Wire semantics are FROZEN after Phase 2.
+//   - Additive changes only: new fields, new enum values, new capability flags.
+//   - Never renumber, retype, or repurpose a field. Removed fields go to `reserved`.
+//   - Unknown enum values must be treated as their *_UNSPECIFIED default by receivers.
+//   - Every RPC is served over a Unix domain socket; there is no network exposure.
+//
+// Conventions:
+//   - All sizes in bytes, all times in milliseconds unless suffixed otherwise.
+//   - request_id is a gateway-generated UUIDv7 string; workers treat it as opaque.
+
+syntax = "proto3";
+
+package kiln.v1;
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+service Worker {
+  // Static description of the loaded model and worker capabilities.
+  // Safe to call at any time after the process accepts connections.
+  rpc GetInfo(InfoRequest) returns (WorkerInfo);
+
+  // Liveness + memory report. Gateway polls this on an interval (default 1s)
+  // and treats a missed deadline (default 3s) as Unhealthy.
+  rpc Health(HealthRequest) returns (HealthStatus);
+
+  // The hot path. One call per inference request; server-streamed events until
+  // a terminal Finished event. The stream MUST end with exactly one Finished.
+  rpc Submit(SubmitRequest) returns (stream TokenEvent);
+
+  // Best-effort cancellation. Worker must emit Finished{finish_reason=CANCELLED}
+  // on the corresponding Submit stream within 2 engine steps.
+  rpc Cancel(CancelRequest) returns (CancelAck);
+
+  // Stop admitting new requests; finish (or cancel, per mode) in-flight work.
+  // Gateway sends this before SIGTERM during eviction.
+  rpc Drain(DrainRequest) returns (DrainAck);
+
+  // Counters/gauges for gateway re-export to Prometheus.
+  rpc Stats(StatsRequest) returns (WorkerStats);
+
+  // Tokenization service for workers that own their tokenizer
+  // (capability TOKENIZER_OWNED — the Python worker). Rust workers may
+  // return UNIMPLEMENTED; the gateway tokenizes for them.
+  rpc Tokenize(TokenizeRequest) returns (TokenizeResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Info / capabilities
+// ---------------------------------------------------------------------------
+
+message InfoRequest {}
+
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_LOGPROBS        = 1;   // per-token logprobs in TokenChunk
+  CAPABILITY_GRAMMAR         = 2;   // GrammarSpec honored (llguidance)
+  CAPABILITY_SPECULATIVE     = 3;   // draft/verify decoding available
+  CAPABILITY_PREFIX_CACHE    = 4;   // radix prefix reuse
+  CAPABILITY_SSD_TIER        = 5;   // cold KV tier on disk
+  CAPABILITY_EMBEDDINGS      = 6;   // (python worker) embedding generation
+  CAPABILITY_VISION          = 7;   // image inputs (reserved; Phase 11)
+  CAPABILITY_TOKENIZER_OWNED = 8;   // worker accepts raw_text and serves Tokenize
+}
+
+message WorkerInfo {
+  string model_id = 1;              // as configured in kiln.toml
+  string model_path = 2;            // resolved local path
+  string architecture = 3;          // e.g. "llama", "qwen3", "gemma3" (config.json model_type)
+  string weights_fingerprint = 4;   // hash of weights digest + arch + dtype + block_size (SPEC §6.4)
+  uint32 max_context_len = 5;
+  uint32 vocab_size = 6;
+  string dtype = 7;                 // "q4_g64" | "q8_g64" | "bf16" | "f16" ...
+  repeated Capability capabilities = 8;
+  string worker_kind = 9;           // "rust" | "python"
+  string worker_version = 10;       // semver of the worker binary/package
+  uint32 kv_block_size = 11;        // tokens per KV block (0 if not paged)
+  string chat_template_hash = 12;   // so gateway can verify its vendored template matches
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+message HealthRequest {}
+
+enum WorkerState {
+  WORKER_STATE_UNSPECIFIED = 0;
+  WORKER_STATE_LOADING     = 1;    // weights loading; Submit returns UNAVAILABLE
+  WORKER_STATE_READY       = 2;
+  WORKER_STATE_DRAINING    = 3;    // finishing in-flight; rejecting new Submit
+  WORKER_STATE_UNHEALTHY   = 4;    // self-detected fault; gateway should recycle
+}
+
+message MemoryReport {
+  uint64 weights_bytes = 1;
+  uint64 kv_pool_allocated_bytes = 2;
+  uint64 kv_pool_used_bytes = 3;
+  uint64 mlx_active_bytes = 4;      // mlx get_active_memory
+  uint64 mlx_cache_bytes = 5;       // mlx get_cache_memory
+  uint64 mlx_peak_bytes = 6;
+  uint64 process_rss_bytes = 7;
+  uint64 ssd_cache_bytes = 8;       // current cold-tier footprint on disk
+}
+
+message HealthStatus {
+  WorkerState state = 1;
+  MemoryReport memory = 2;
+  uint32 requests_waiting = 3;
+  uint32 requests_running = 4;
+  uint64 uptime_ms = 5;
+  string detail = 6;                // human-readable, only meaningful when UNHEALTHY
+}
+
+// ---------------------------------------------------------------------------
+// Submit
+// ---------------------------------------------------------------------------
+
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;         // treated as INTERACTIVE
+  PRIORITY_INTERACTIVE = 1;
+  PRIORITY_BATCH       = 2;         // preempted first under memory pressure
+}
+
+message TokenIds {
+  repeated uint32 ids = 1;          // full prompt, template already applied by gateway
+}
+
+message SamplingParams {
+  float temperature = 1;            // 0 => greedy (argmax); ignore other knobs when 0
+  float top_p = 2;                  // 1.0 = disabled
+  uint32 top_k = 3;                 // 0 = disabled
+  float min_p = 4;                  // 0.0 = disabled
+  float repetition_penalty = 5;     // 1.0 = disabled
+  float frequency_penalty = 6;      // 0.0 = disabled (OpenAI semantics)
+  float presence_penalty = 7;       // 0.0 = disabled (OpenAI semantics)
+  uint32 repetition_window = 8;     // tokens considered by penalties; 0 = worker default (64)
+  uint64 seed = 9;                  // 0 = worker chooses; echoed back in Finished
+  uint32 logprobs_top_n = 10;       // 0 = no logprobs; requires CAPABILITY_LOGPROBS
+}
+
+message StoppingParams {
+  uint32 max_tokens = 1;            // hard cap on generated tokens; 0 invalid (gateway validates)
+  repeated uint32 stop_token_ids = 2;
+  repeated string stop_strings = 3; // matched on detokenized output; matched text excluded
+  bool ignore_eos = 4;              // benchmarking aid
+}
+
+message GrammarSpec {
+  // Requires CAPABILITY_GRAMMAR. Worker returns Finished{error=GRAMMAR_UNSUPPORTED}
+  // if it advertised the capability but cannot compile this grammar.
+  oneof grammar {
+    string json_schema = 1;         // JSON Schema (draft 2020-12 subset per llguidance)
+    string regex = 2;
+    string lark = 3;                // llguidance lark-like grammar
+  }
+}
+
+message SubmitRequest {
+  string request_id = 1;
+  oneof input {
+    TokenIds token_ids = 2;         // rust worker path (gateway pre-tokenized)
+    string raw_text = 3;            // python worker path (requires CAPABILITY_TOKENIZER_OWNED)
+  }
+  SamplingParams sampling = 4;
+  StoppingParams stopping = 5;
+  GrammarSpec grammar = 6;          // absent = unconstrained
+  Priority priority = 7;
+  uint64 prefix_hint = 8;           // advisory gateway-side prefix hash; worker may ignore
+  bool echo_prompt = 9;             // completions-API echo support; default false
+  reserved 10 to 15;                // future: vision inputs, draft overrides, lora id
+}
+
+// --- streamed events --------------------------------------------------------
+
+message LogProb {
+  uint32 token_id = 1;
+  float logprob = 2;
+}
+
+message TokenChunk {
+  repeated uint32 token_ids = 1;    // >=1 tokens (speculative accept may deliver several)
+  string text = 2;                  // incremental UTF-8-safe detokenization of token_ids;
+                                    // empty when worker lacks TOKENIZER access mid-stream
+  // Parallel to token_ids when logprobs requested; empty otherwise.
+  repeated LogProb chosen_logprobs = 3;
+  // Flattened top-N alternatives per position (n = logprobs_top_n), row-major.
+  repeated LogProb top_logprobs = 4;
+}
+
+message RequestAdmitted {
+  uint32 queue_position = 1;        // 0 = admitted immediately
+  uint32 prompt_tokens = 2;         // as counted by the worker (authoritative for usage)
+  uint32 prefill_chunks_estimated = 3;
+}
+
+message PrefixCacheHit {
+  uint32 tokens_reused = 1;
+  bool from_ssd = 2;
+}
+
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_STOP        = 1;    // stop token/string
+  FINISH_REASON_LENGTH      = 2;    // max_tokens or context limit
+  FINISH_REASON_CANCELLED   = 3;
+  FINISH_REASON_ERROR       = 4;    // see error fields
+  FINISH_REASON_PREEMPTED_FATAL = 5; // could not resume after preemption (rare; gateway may retry)
+}
+
+enum WorkerErrorCode {
+  WORKER_ERROR_UNSPECIFIED   = 0;
+  WORKER_ERROR_INTERNAL      = 1;
+  WORKER_ERROR_OOM_REJECTED  = 2;   // admission refused: prefill projection exceeds headroom
+  WORKER_ERROR_CTX_OVERFLOW  = 3;   // prompt + max_tokens > max_context_len
+  WORKER_ERROR_GRAMMAR_UNSUPPORTED = 4;
+  WORKER_ERROR_GRAMMAR_COMPILE     = 5;
+  WORKER_ERROR_INVALID_REQUEST     = 6;
+  WORKER_ERROR_DRAINING            = 7;
+}
+
+message Timings {
+  uint64 queued_ms = 1;
+  uint64 prefill_ms = 2;
+  uint64 decode_ms = 3;
+  float prefill_tokens_per_sec = 4;
+  float decode_tokens_per_sec = 5;
+  uint32 spec_tokens_proposed = 6;  // 0 when speculation off
+  uint32 spec_tokens_accepted = 7;
+}
+
+message Finished {
+  FinishReason finish_reason = 1;
+  uint32 prompt_tokens = 2;
+  uint32 completion_tokens = 3;
+  uint32 cached_prompt_tokens = 4;  // subset of prompt_tokens served from prefix cache
+  Timings timings = 5;
+  uint64 seed_used = 6;
+  WorkerErrorCode error_code = 7;   // set iff finish_reason == ERROR
+  string error_detail = 8;          // safe to log; never contains prompt content
+  string matched_stop = 9;          // the stop string/token that fired, if STOP
+}
+
+message TokenEvent {
+  // Exactly one Finished terminates the stream. Admitted is sent first, once.
+  oneof event {
+    RequestAdmitted admitted = 1;
+    PrefixCacheHit cache = 2;
+    TokenChunk tokens = 3;
+    Finished finished = 4;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cancel / Drain
+// ---------------------------------------------------------------------------
+
+message CancelRequest { string request_id = 1; }
+message CancelAck { bool found = 1; }             // false if unknown/already finished
+
+enum DrainMode {
+  DRAIN_MODE_UNSPECIFIED = 0;                     // treated as GRACEFUL
+  DRAIN_MODE_GRACEFUL = 1;                        // finish in-flight requests
+  DRAIN_MODE_IMMEDIATE = 2;                       // cancel in-flight requests
+}
+message DrainRequest { DrainMode mode = 1; uint64 deadline_ms = 2; }
+message DrainAck { uint32 requests_remaining = 1; }
+
+// ---------------------------------------------------------------------------
+// Stats (re-exported by gateway with a `model` label)
+// ---------------------------------------------------------------------------
+
+message StatsRequest {}
+
+message WorkerStats {
+  uint64 requests_total = 1;
+  uint64 requests_failed = 2;
+  uint64 requests_cancelled = 3;
+  uint64 requests_preempted = 4;
+  uint64 tokens_prefilled_total = 5;
+  uint64 tokens_generated_total = 6;
+  uint64 prefix_tokens_reused_total = 7;
+  uint64 kv_blocks_allocated = 8;                 // gauge
+  uint64 kv_blocks_free = 9;                      // gauge
+  uint64 ssd_blocks_stored = 10;                  // gauge
+  uint64 ssd_reads_total = 11;
+  uint64 ssd_writes_total = 12;
+  uint64 ssd_fingerprint_rejects_total = 13;
+  uint64 spec_tokens_proposed_total = 14;
+  uint64 spec_tokens_accepted_total = 15;
+  uint64 engine_steps_total = 16;
+  double engine_step_overhead_us_p50 = 17;        // non-GPU overhead per step
+  double engine_step_overhead_us_p99 = 18;
+}
+
+// ---------------------------------------------------------------------------
+// Tokenize (CAPABILITY_TOKENIZER_OWNED workers only)
+// ---------------------------------------------------------------------------
+
+message TokenizeRequest {
+  string text = 1;
+  bool add_special_tokens = 2;
+}
+
+message TokenizeResponse {
+  repeated uint32 token_ids = 1;
+}
