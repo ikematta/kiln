@@ -72,3 +72,41 @@
   test smoke::tests::one_plus_two_is_three ... ok    (1 passed)
   ```
 - Next: kiln.toml parsing with figment (this session, entry below).
+
+## [2026-07-03] Phase 0 / kiln.toml parsing with figment + kiln.toml.example — DONE
+- What:
+  - `kiln-gateway` gains a lib target with `config` module: full SPEC §10 schema (`[server]`, `[memory]`, `[defaults]`, `[[model]]` incl. `[model.speculative]`, `[auth]` + `[[auth.api_keys]]`), all defaults per spec.
+  - Loading via figment: `Toml::file_exact` merged with `Env::prefixed("KILN_").split("__")` (e.g. `KILN_SERVER__PORT=9090`), then validation: non-zero port, `budget_fraction` in (0,1], power-of-two `block_size`, non-zero `prefill_chunk`, `max_batch_tokens >= block_size`, unique non-empty model ids/paths, `gamma >= 1`.
+  - `kiln.toml.example` at repo root (valid-TOML rendering of the §10 sketch, with env-override docs).
+  - 8 unit tests: example-file parse, empty-file defaults, env override, unrelated-`KILN_*`-var isolation, missing-file error, three validation rejections.
+- Decisions:
+  - Config module lives in kiln-gateway (its consumer; SPEC §4 defines no config crate). Can be split out later if workers/jobs need it.
+  - Env overrides restricted to SERVER/MEMORY/DEFAULTS/AUTH prefixes so unrelated vars like `KILN_TEST_MODELS` (CLAUDE.md) cannot corrupt config keys; `[[model]]` entries are file-only.
+  - Missing config file is a hard error (`file_exact`) — silently serving defaults on a typo'd `--config` path is a footgun.
+  - `worker` defaults to `"auto"`; `~` in paths kept verbatim, expansion deferred to use sites (Phase 2).
+  - New workspace deps, all MIT/Apache-2.0: figment (toml+env features; the SPEC §3-mandated config loader), serde (derive), thiserror (config error type). figment "test" feature (Jail) as dev-dependency only.
+  - `allow(clippy::result_large_err)` scoped to the test module — figment's `Jail::expect_with` fixes the closure's error type; library code is unaffected.
+- Deviations: none
+- Acceptance:
+  ```
+  $ cargo test -p kiln-gateway
+  test config::tests::duplicate_model_ids_are_rejected ... ok
+  test config::tests::empty_file_yields_spec_defaults ... ok
+  test config::tests::env_overrides_file_values ... ok
+  test config::tests::missing_file_is_an_error ... ok
+  test config::tests::non_power_of_two_block_size_is_rejected ... ok
+  test config::tests::out_of_range_budget_fraction_is_rejected ... ok
+  test config::tests::parses_the_committed_example_file ... ok
+  test config::tests::unrelated_kiln_env_vars_are_ignored ... ok
+  test result: ok. 8 passed; 0 failed
+
+  $ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings \
+      && cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+      (clean)
+  $ cargo build --workspace && cargo build --workspace --no-default-features
+      Finished `dev` profile [unoptimized + debuginfo] target(s)   (both clean)
+  $ cargo test --workspace     (9 passed total, 0 failed)
+  $ ruff check python/ && ruff format --check python/
+  All checks passed! / 1 file already formatted
+  ```
+- Next: Phase 0 complete. Phase 1 — Python worker end-to-end (SPEC §12), pending PM phase gate.

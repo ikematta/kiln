@@ -1,0 +1,54 @@
+# Kiln configuration. Schema: docs/SPEC.md §10.
+#
+# Every value shown for [server], [memory], and [defaults] is also the built-in
+# default — omit any key (or the whole file section) to get it.
+#
+# Any scalar key can be overridden via environment variables prefixed KILN_,
+# with `__` separating nesting levels:
+#   KILN_SERVER__PORT=9090
+#   KILN_MEMORY__BUDGET_FRACTION=0.7
+#   KILN_DEFAULTS__SSD_TIER=false
+# Only the server/memory/defaults/auth sections are env-addressable; [[model]]
+# entries come from the file. Unrelated KILN_* variables (e.g. KILN_TEST_MODELS)
+# are ignored.
+
+[server]
+host = "127.0.0.1"
+port = 8080
+runtime_dir = "~/.kiln/run"
+cache_dir = "~/.kiln/cache"
+model_dir = "~/.kiln/models"
+
+[memory]
+# Fraction of unified memory the gateway may hand out across all workers.
+budget_fraction = 0.80
+
+[defaults]
+max_batch_tokens = 8192
+prefill_chunk = 2048
+block_size = 32          # tokens per KV block; must be a power of two
+ssd_cache_max_gb = 64
+ssd_tier = true
+
+# One [[model]] block per servable model.
+[[model]]
+id = "qwen3-14b-4bit"
+path = "mlx-community/Qwen3-14B-4bit" # HF repo id or local path
+worker = "auto"                       # rust | python | auto (rust if arch supported)
+pinned = true                         # never evicted under memory pressure
+ttl_seconds = 0                       # idle auto-unload; 0 = never
+
+# Optional per-model speculative decoding (served from Phase 8).
+[model.speculative]
+draft = "mlx-community/Qwen3-0.6B-4bit"
+gamma = 4
+
+[auth]
+# argon2 hash of the admin bearer token — never the raw token.
+admin_token_hash = ""
+
+[[auth.api_keys]]
+name = "example"
+key_hash = ""  # argon2 hash of the API key
+rpm = 600      # requests/minute
+tpm = 500000   # tokens/minute

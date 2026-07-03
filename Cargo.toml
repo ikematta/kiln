@@ -24,3 +24,7 @@ tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 # Drives the vendored mlx-c cmake build from kiln-mlx's build.rs.
 cmake = "0.1"
+# kiln.toml parsing with env overrides (SPEC §3, §10).
+figment = { version = "0.10", features = ["toml", "env"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
