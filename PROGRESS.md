@@ -180,3 +180,39 @@
   completions, /v1/models, auth, metrics), pending PM phase gate. Note for PM: CI does not
   yet run the python worker pytest suite (needs test-model caching on the macos runner) —
   worth adding when the cache strategy is decided.
+
+## [2026-07-03] Phase 1 / Follow-up — python worker suite in CI + ADR 0001 addendum — DONE
+- What:
+  - `test-macos` CI job now runs `pytest python/kiln_worker_py/tests` against the pinned
+    test models, with `actions/cache` on `~/.kiln/test-models` keyed by
+    `hashFiles('scripts/fetch-test-model.sh')` — the pins (revisions + sha256s) live in
+    that script, so a pin bump changes the key and re-fetches; otherwise the ~2 GB model
+    download is skipped (`Fetch pinned test models` step is `if: cache-hit != 'true'`).
+  - Appended an addendum to `docs/decisions/0001-mlx-c-pin.md` at explicit PM instruction
+    (that directory is otherwise agent read-only): `mlx-lm==0.31.3` resolves to
+    **mlx.core 0.31.2** in the worker venv, one patch version ahead of the **MLX v0.31.1**
+    that vendored mlx-c v0.6.0 builds for kiln-mlx. Verified both sides
+    (`import mlx.core` in the venv; `GIT_TAG v0.31.1` in mlx-c's CMakeLists). Recorded
+    only — no pins changed.
+- Decisions:
+  - Cache key hashes the whole fetch script, not just the pin lines: any script change
+    invalidates the cache (conservative; worst case one re-download).
+  - This session's push also published the five Phase 1 commits (they were local-only).
+- Deviations: none
+- Acceptance:
+  ```
+  push 41563f9 → run 28671645169: all jobs green, test-macos 4m14s (cache MISS)
+    Cache not found for input keys: test-models-e57549323c60...
+    Fetch pinned test models: ==> llama-3.2-1b-4bit ... ==> smollm2-135m-bf16 (all 4 fetched)
+    Python worker tests: ============ 28 passed in 12.14s ============
+    Post Cache: Cache saved with key: test-models-e57549323c60...
+
+  push cd3aa22 → run 28671908976: all jobs green, test-macos 2m40s (cache HIT)
+    Cache restored from key: test-models-e57549323c60...
+    - Fetch pinned test models        (skipped)
+    Python worker tests: ============ 28 passed in 15.93s ============
+
+  $ uv run --project python/kiln_worker_py python -c "import mlx.core as mx; print(mx.__version__)"
+  0.31.2
+  ```
+- Next: Phase 2 — Gateway v0 (SPEC §12), pending PM phase gate.
