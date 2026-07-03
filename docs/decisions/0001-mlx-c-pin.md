@@ -29,3 +29,22 @@ this submodule pin moves.
   in PROGRESS.md, not a bump and not a workaround.
 - Stale-build recovery after checkout changes:
   `rm -rf target/mlx-c-build && cargo build -p kiln-mlx`.
+
+## Addendum (2026-07-03): Python worker MLX version alignment
+
+Appended at explicit PM instruction (docs/decisions/ is otherwise agent
+read-only). Recording only; no pins changed.
+
+`kiln_worker_py` pins `mlx-lm==0.31.3` (pyproject.toml), whose `mlx` wheel
+dependency resolves to **mlx.core 0.31.2** in the worker venv (verified:
+`uv run --project python/kiln_worker_py python -c "import mlx.core as mx;
+print(mx.__version__)"` → `0.31.2`; uv.lock agrees). This **drifts by one
+patch version** from the MLX the Rust side builds: the vendored mlx-c v0.6.0
+FetchContent-pins MLX **v0.31.1** (see Decision above).
+
+Consequence to keep in mind: the two workers run different MLX patch
+releases, so bit-exact cross-worker output identity is not guaranteed even
+for greedy decoding. Golden-parity fixtures (SPEC §11.2) are generated from
+mlx-lm as the reference — if patch-level drift ever surfaces as a fixture
+mismatch, reconcile the pins (quarterly mlx-c bump task) rather than relaxing
+the parity bar.
