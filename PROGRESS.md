@@ -45,3 +45,30 @@
   All checks passed! / 1 file already formatted
   ```
 - Next: remaining Phase 0 item — `kiln.toml` parsing with figment + `kiln.toml.example` (SPEC §10, §12 Phase 0). Then Phase 1 (Python worker end-to-end).
+
+## [2026-07-03] Phase 0 / Correction — Metal toolchain now available on the dev machine
+- What:
+  - Corrects the 2026-07-02 entry's deviation note "full build incl. Metal is not achievable on this host": the Metal Toolchain has since been installed (`xcodebuild -downloadComponent MetalToolchain`), and `xcrun -sdk macosx metal --version` now succeeds (Apple metal 32023.883). Re-verified Metal-ON build + smoke locally (output below). build.rs autodetection now selects `MLX_BUILD_METAL=ON` on this machine without the `KILN_MLX_METAL=1` override.
+  - Remote housekeeping: `origin` verified as `https://github.com/ikematta/kiln.git`, `main` pushed with upstream tracking. GitHub Actions ran on the pushed head and is green — closes the "CI green" Phase 0 acceptance item that was previously unverifiable (run 28638701212, `completed success`, 5m57s).
+- Decisions: none (no code changed; the original entry stands as written per append-only rule)
+- Deviations: none
+- Acceptance:
+  ```
+  $ git remote -v
+  origin  https://github.com/ikematta/kiln.git (fetch/push)
+  $ git push -u origin main
+  branch 'main' set up to track 'origin/main'.        (Everything up-to-date)
+  $ gh run list --repo ikematta/kiln --limit 1
+  completed  success  P0: record Phase 0 scaffold completion...  CI  main  push  28638701212  5m57s
+
+  $ KILN_MLX_METAL=1 cargo build -p kiln-mlx
+  warning: kiln-mlx@0.0.1: kiln-mlx: building vendored mlx-c (MLX_BUILD_METAL=ON)
+      Finished `dev` profile [unoptimized + debuginfo] target(s)
+  $ grep MLX_BUILD_METAL target/mlx-c-build/build/CMakeCache.txt
+  MLX_BUILD_METAL:BOOL=ON
+  $ cargo run -p kiln-mlx --example smoke
+  3.0
+  $ cargo test -p kiln-mlx
+  test smoke::tests::one_plus_two_is_three ... ok    (1 passed)
+  ```
+- Next: kiln.toml parsing with figment (this session, entry below).
