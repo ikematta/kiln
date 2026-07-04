@@ -216,3 +216,54 @@
   0.31.2
   ```
 - Next: Phase 2 — Gateway v0 (SPEC §12), pending PM phase gate.
+
+## [2026-07-03] Phase 1 / Investigation — mlx-c tag for core MLX 0.31.2 — DONE (decision left to PM)
+- What: investigated (read-only; no pins changed, submodule untouched) whether an mlx-c
+  tagged release builds core MLX v0.31.2, to close the one-patch drift recorded in the
+  ADR 0001 addendum (python worker on 0.31.2 vs kiln-mlx on 0.31.1).
+- Findings (all via GitHub/PyPI API, 2026-07-03):
+  - **No mlx-c tag pins core 0.31.2.** Newest tag is v0.6.0 (2026-03-20, our pin);
+    its CMakeLists pins `GIT_TAG v0.31.1` (verified at the tag). No CHANGELOG file,
+    no GitHub releases — tags only. Hypothesized option A is unavailable today.
+  - **mlx-c lags core by design but the work exists upstream:** main is 4 commits ahead
+    of v0.6.0 — `#110` distributed_group_free, `#111` gguf, `#112` graph export, and
+    `#114` "regenerate bindings for MLX 0.31.2" (2026-04-24, two days after core
+    v0.31.2 shipped on 2026-04-22). Untagged for >2 months since.
+  - **mlx-lm==0.31.3 hard-requires `mlx>=0.31.2`** on Darwin — it cannot run on core
+    0.31.1. But **mlx-lm==0.31.2 requires only `mlx>=0.30.4`**, so pinning
+    `mlx-lm==0.31.2` plus an explicit `mlx==0.31.1` aligns the python worker with
+    kiln-mlx's core exactly. What 0.31.3 adds over 0.31.2: batch-KV-cache fixes,
+    server/tool-call fixes, thread-local generation stream — none load-bearing for our
+    sequential Phase-1 worker.
+  - **The 0.31.1→0.31.2 core delta is NOT parity-benign:** it includes Metal split-K
+    quantized matmul for small M (mlx#3120) — a reduction-order change in exactly the
+    4-bit matmul path our pinned test models hit — plus fp16/bf16 sort-NaN fixes
+    (mlx#3269). Cross-version bitwise logit divergence on 4-bit models is plausible to
+    likely, so "generate goldens on 0.31.2, verify Rust on 0.31.1" risks failing the
+    SPEC §11.2 exact bar for reasons that are neither side's bug.
+- Deviations: none
+- DECISION NEEDED: how to reconcile MLX core versions before Phase 3 golden fixtures
+  are generated (fixtures record mlx_lm_version + expected ids; generating them before
+  deciding bakes the drift in):
+  - **Option A (unavailable):** bump submodule to an mlx-c tag pinning core 0.31.2 —
+    no such tag exists as of today.
+  - **Option B1 (agent's recommendation):** pin python worker down to core 0.31.1:
+    `mlx-lm==0.31.2` + explicit `mlx==0.31.1` in pyproject.toml. Pros: both workers on
+    identical core; goldens generated from the mlx-lm reference then target exactly the
+    bytes kiln-mlx builds; preserves the exact-parity bar; smallest change (two dep
+    lines + lockfile + ADR addendum update + suite re-run). Cons: forgoes mlx-lm
+    0.31.3's fixes (assessed irrelevant to this worker today); a later un-pin needs a
+    golden re-run anyway.
+  - **Option B2 (not recommended):** keep 0.31.3/0.31.2 and accept drift via a dated
+    ADR invoking SPEC §11.2's relaxed bar. Cons: mlx#3120 makes divergence likely on
+    precisely the 4-bit fixture models, so the relaxed bar could become the de-facto
+    norm across all models — permanently weakening the keystone test.
+  - **Option C1 (durable fix, timing not ours):** when mlx-c tags its next release
+    (main already regenerates for 0.31.2), bump the submodule via the ADR 0001
+    quarterly process (bump → rebuild → full golden re-run → human approval) and keep
+    mlx-lm current. Combine: B1 now, C1 when the tag lands.
+  - **Option C2/C3 (rejected):** pin submodule to untagged main (4 unreviewed commits;
+    ADR pins tags deliberately), or force core v0.31.2 under v0.6.0 bindings via a
+    FetchContent override (#114 exists precisely because bindings needed regenerating —
+    that's the "silent semantic change under the bindings" ADR 0001 guards against).
+- Next: PM decision on the above; then Phase 2 — Gateway v0 (SPEC §12), pending phase gate.
