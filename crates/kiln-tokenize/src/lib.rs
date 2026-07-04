@@ -35,7 +35,11 @@
 //! later phases.
 
 pub mod chat_template;
+pub mod detok;
+pub mod stops;
 pub mod tokenizer;
 
 pub use chat_template::{ChatMessage, ChatTemplate, TemplateError};
+pub use detok::StreamingDecoder;
+pub use stops::StopStringMatcher;
 pub use tokenizer::{Tokenizer, TokenizerError};
