@@ -24,3 +24,11 @@ tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# tests/rpc.rs dials the spawned worker binary over UDS with the tonic
+# client: tower::service_fn + hyper-util's TokioIo build the connector —
+# the exact pattern kiln-gateway/src/uds.rs already uses, so both crates
+# are in the workspace dependency tree already (no new external code).
+hyper-util.workspace = true
+tower.workspace = true

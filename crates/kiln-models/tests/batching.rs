@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use kiln_engine::{
-    Engine, EngineConfig, EngineRequest, FinishKind, FinishSummary, PenaltyOptions,
-    SamplingOptions, SeqEvent,
+    Engine, EngineConfig, EngineRequest, ErrorCause, FinishKind, FinishSummary, PenaltyOptions,
+    Priority, SamplingOptions, SeqEvent,
 };
 use kiln_mlx::{Stream, debug};
 use kiln_models::{LlamaModel, generate};
@@ -49,6 +49,7 @@ fn request(prompt: &[u32], max_tokens: usize, stop: &[u32]) -> (EngineRequest, C
         },
         penalty_window: 0,
         stop_tokens: stop.iter().copied().collect(),
+        priority: Priority::Interactive,
         cancel: Arc::new(AtomicBool::new(false)),
         on_event: Box::new(move |event| {
             match event {
@@ -229,9 +230,13 @@ fn batched_greedy_matches_single_stream() {
         }
         eprintln!("stop-token semantics ok");
 
-        // 5) Pool exhaustion: an unservable request fails on submit; a
-        //    mid-flight exhaustion fails one request and leaves the
-        //    survivor's stream bit-exact.
+        // 5) Pool pressure: an unservable request still fails at submit
+        //    (in-band, with the OOM_REJECTED-mapped capacity cause). A
+        //    mid-flight exhaustion no longer fails the loser — the §6.1
+        //    preemption returns the most recent request to WAITING and it
+        //    resumes to a bit-exact stream once the survivor frees blocks
+        //    (deeper scenarios, priorities, and the golden-fixture case
+        //    live in tests/preemption.rs).
         {
             let tiny = EngineConfig {
                 num_blocks: 4,
@@ -244,21 +249,20 @@ fn batched_greedy_matches_single_stream() {
             drain(&mut engine);
             let summary = finish.borrow().clone().expect("finished");
             assert_eq!(summary.reason, FinishKind::Error);
+            assert_eq!(summary.error_cause, Some(ErrorCause::Capacity));
             assert!(
                 summary.error.as_deref().unwrap_or("").contains("KV pool"),
                 "unexpected error: {:?}",
                 summary.error
             );
 
-            // Mid-flight exhaustion. Pool: 6 blocks (192 token slots).
-            // The survivor (short prompt, 60 tokens) holds 1 block early
-            // and grows to 3. The loser passes the submit-time capacity
-            // check (150 + 24 = 174 <= 192) but its 150-token prompt plus
-            // the survivor's holdings exhaust the pool: it prefills into
-            // 5 blocks, then fails ~11 decode steps in when position 160
-            // needs a 6th block while only 5 are free pool-wide. The
-            // failure lands well before the survivor's own growth, whose
-            // stream must be untouched.
+            // Mid-flight pressure. Pool: 6 blocks (192 token slots). The
+            // survivor (short prompt, 60 tokens) grows from 1 to 3 blocks;
+            // the loser passes the submit-time capacity check
+            // (150 + 24 = 174 <= 192) but needs a 6th block ~11 decode
+            // steps in while the pool is full: it self-preempts (it is the
+            // most recently admitted), waits for the survivor, and resumes
+            // through re-prefill + replay onto the same greedy stream.
             let filler = &long[..150];
             let squeeze = EngineConfig {
                 num_blocks: 6,
@@ -267,38 +271,43 @@ fn batched_greedy_matches_single_stream() {
             let mut engine = Engine::new(&model, model.kv_dims(), squeeze, Stream::gpu())
                 .expect("engine builds");
             let (first, (first_tokens, first_finish)) = request_pair(&short, 60);
-            let (second, (_, second_finish)) = request_pair(filler, 24);
+            let (second, (second_tokens, second_finish)) = request_pair(filler, 24);
             engine.submit(first);
             engine.submit(second);
             drain(&mut engine);
             let first_summary = first_finish.borrow().clone().expect("finished");
             let second_summary = second_finish.borrow().clone().expect("finished");
-            assert_eq!(second_summary.reason, FinishKind::Error, "loser fails");
-            assert!(
-                second_summary
-                    .error
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains("exhausted"),
-                "unexpected error: {:?}",
-                second_summary.error
-            );
-            assert!(
-                second_summary.completion_tokens > 0,
-                "loser should fail mid-decode, not at submit"
-            );
             assert_eq!(
                 first_summary.reason,
                 FinishKind::Length,
                 "survivor finishes"
             );
             assert_eq!(
+                second_summary.reason,
+                FinishKind::Length,
+                "preempted request must finish after resuming: {second_summary:?}"
+            );
+            assert!(
+                second_summary.preemptions >= 1,
+                "the most recent request was never preempted: {second_summary:?}"
+            );
+            assert_eq!(
+                first_summary.preemptions, 0,
+                "the senior request must not be preempted"
+            );
+            assert_eq!(
                 first_tokens.borrow().clone(),
                 reference(&short, 60),
-                "survivor's stream disturbed by the failed request"
+                "survivor's stream disturbed by the preempted request"
             );
+            assert_eq!(
+                second_tokens.borrow().clone(),
+                reference(filler, 24),
+                "preempted request's resumed stream diverged from its solo run"
+            );
+            assert!(engine.preemptions() >= 1, "engine preemption counter");
         }
-        eprintln!("pool-exhaustion handling ok");
+        eprintln!("pool-pressure preemption ok");
     }
     assert_eq!(
         debug::live_objects(),

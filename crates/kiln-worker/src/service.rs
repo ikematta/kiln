@@ -2,8 +2,12 @@
 //!
 //! Validation failures never abort the RPC or crash the worker: malformed
 //! input yields a single `Finished{finish_reason=ERROR}` event (matching the
-//! Python worker). `Drain`/`Stats` arrive with their phases; `Tokenize` is
-//! UNIMPLEMENTED by design — the gateway owns tokenization for Rust workers
+//! Python worker). `Drain` is flag-based: GRACEFUL stops admitting and lets
+//! in-flight requests finish (an optional deadline escalates to
+//! cancellation); IMMEDIATE additionally cancels everything live through
+//! the same flags `Cancel` uses, so the engine loop needs no drain-specific
+//! path. `Stats` arrives with Phase 4 part 4; `Tokenize` is UNIMPLEMENTED
+//! by design — the gateway owns tokenization for Rust workers
 //! (kiln-tokenize BOS contract).
 
 use std::pin::Pin;
@@ -11,19 +15,21 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kiln_proto::v1::worker_server::Worker;
 use kiln_proto::v1::{
-    CancelAck, CancelRequest, DrainAck, DrainRequest, FinishReason, Finished, HealthRequest,
-    HealthStatus, InfoRequest, RequestAdmitted, StatsRequest, SubmitRequest, TokenEvent,
-    TokenizeRequest, TokenizeResponse, WorkerErrorCode, WorkerInfo, WorkerState, WorkerStats,
-    submit_request, token_event,
+    CancelAck, CancelRequest, DrainAck, DrainMode, DrainRequest, FinishReason, Finished,
+    HealthRequest, HealthStatus, InfoRequest, RequestAdmitted, StatsRequest, SubmitRequest,
+    TokenEvent, TokenizeRequest, TokenizeResponse, WorkerErrorCode, WorkerInfo, WorkerState,
+    WorkerStats, submit_request, token_event,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tonic::{Request, Response, Status};
 
-use crate::engine::{RequestHandle, Shared, Submission};
+use crate::engine::{
+    DRAIN_GRACEFUL, DRAIN_IMMEDIATE, DRAIN_NONE, RequestHandle, Shared, Submission,
+};
 
 pub struct WorkerService {
     shared: Arc<Shared>,
@@ -93,11 +99,17 @@ impl Worker for WorkerService {
     }
 
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthStatus>, Status> {
-        let (state, detail) = self.shared.state();
+        let (mut state, detail) = self.shared.state();
+        // Draining is a posture over Ready, not a loading/fault state.
+        if state == WorkerState::Ready && self.shared.drain.load(Ordering::Acquire) != DRAIN_NONE {
+            state = WorkerState::Draining;
+        }
+        let waiting = self.shared.waiting.load(Ordering::Acquire)
+            + self.shared.engine_waiting.load(Ordering::Acquire);
         Ok(Response::new(HealthStatus {
             state: state as i32,
             memory: Some(self.shared.memory_report()),
-            requests_waiting: self.shared.waiting.load(Ordering::Acquire),
+            requests_waiting: waiting,
             requests_running: self.shared.running.load(Ordering::Acquire),
             uptime_ms: self.shared.uptime_ms(),
             detail,
@@ -111,6 +123,17 @@ impl Worker for WorkerService {
         request: Request<SubmitRequest>,
     ) -> Result<Response<Self::SubmitStream>, Status> {
         let request = request.into_inner();
+        // Unknown enum values decode as UNSPECIFIED (treated INTERACTIVE);
+        // read before fields are moved out of the message below.
+        let priority = request.priority();
+        // Draining rejects new work in-band (proto WORKER_ERROR_DRAINING),
+        // so the gateway gets a structured, retriable-elsewhere error.
+        if self.shared.drain.load(Ordering::Acquire) != DRAIN_NONE {
+            return Ok(Response::new(error_stream(
+                WorkerErrorCode::WorkerErrorDraining,
+                "worker is draining; not admitting new requests",
+            )));
+        }
         let (state, _) = self.shared.state();
         if state != WorkerState::Ready {
             return Err(Status::unavailable(format!(
@@ -188,6 +211,15 @@ impl Worker for WorkerService {
             }
             registry.insert(request.request_id.clone(), Arc::clone(&handle));
         }
+        // Close the race with a concurrent Drain: either its cancel sweep
+        // saw our registry entry, or this re-check sees the drain flag.
+        if self.shared.drain.load(Ordering::Acquire) != DRAIN_NONE {
+            self.shared.retire(&request.request_id);
+            return Ok(Response::new(error_stream(
+                WorkerErrorCode::WorkerErrorDraining,
+                "worker is draining; not admitting new requests",
+            )));
+        }
 
         let (events_tx, events_rx) = unbounded_channel();
         let queue_position = self.shared.waiting.load(Ordering::Acquire)
@@ -212,6 +244,7 @@ impl Worker for WorkerService {
             prompt_ids,
             sampling: request.sampling.unwrap_or_default(),
             stopping,
+            priority,
             enqueued_at: Instant::now(),
             handle,
             events: events_tx,
@@ -242,10 +275,39 @@ impl Worker for WorkerService {
         Ok(Response::new(CancelAck { found }))
     }
 
-    async fn drain(&self, _: Request<DrainRequest>) -> Result<Response<DrainAck>, Status> {
-        // Eviction (Drain + SIGTERM) arrives in Phase 9; the Python worker
-        // inherits UNIMPLEMENTED here too.
-        Err(Status::unimplemented("Drain arrives in Phase 9"))
+    async fn drain(&self, request: Request<DrainRequest>) -> Result<Response<DrainAck>, Status> {
+        let request = request.into_inner();
+        // Proto: UNSPECIFIED is treated as GRACEFUL. The posture only
+        // escalates (fetch_max) — re-draining GRACEFUL after IMMEDIATE
+        // must not resurrect admission.
+        let (level, mode) = match request.mode() {
+            DrainMode::Immediate => (DRAIN_IMMEDIATE, DrainMode::Immediate),
+            _ => (DRAIN_GRACEFUL, DrainMode::Graceful),
+        };
+        self.shared.drain.fetch_max(level, Ordering::AcqRel);
+        tracing::info!(mode = ?mode, deadline_ms = request.deadline_ms, "draining");
+        if mode == DrainMode::Immediate {
+            // Cancel in-flight work through the same flags Cancel uses;
+            // the engine honors them within its ≤2-step budget.
+            self.shared.cancel_all();
+        } else if request.deadline_ms > 0 {
+            // GRACEFUL with a deadline: give in-flight requests that long
+            // to finish, then escalate to cancellation (the gateway
+            // SIGTERMs after the drain deadline either way — cancelling
+            // lets streams end with a clean CANCELLED instead of a 502).
+            let shared = Arc::clone(&self.shared);
+            let deadline = Duration::from_millis(request.deadline_ms);
+            tokio::spawn(async move {
+                tokio::time::sleep(deadline).await;
+                if shared.live_requests() > 0 {
+                    tracing::info!("graceful drain deadline passed; cancelling in-flight");
+                    shared.cancel_all();
+                }
+            });
+        }
+        Ok(Response::new(DrainAck {
+            requests_remaining: self.shared.live_requests(),
+        }))
     }
 
     async fn stats(&self, _: Request<StatsRequest>) -> Result<Response<WorkerStats>, Status> {

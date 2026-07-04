@@ -30,7 +30,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use kiln_engine::{
-    Engine, EngineConfig, EngineRequest, FinishKind, PenaltyOptions, SamplingOptions, SeqEvent,
+    Engine, EngineConfig, EngineRequest, FinishKind, PenaltyOptions, Priority, SamplingOptions,
+    SeqEvent,
 };
 use kiln_mlx::{Stream, debug};
 use kiln_models::LlamaModel;
@@ -86,6 +87,7 @@ fn engine_generate(
         },
         penalty_window: 0,
         stop_tokens: std::collections::HashSet::new(),
+        priority: Priority::Interactive,
         cancel: Arc::new(AtomicBool::new(false)),
         on_event: Box::new(move |event| {
             match event {
