@@ -18,6 +18,10 @@ port = 8080
 runtime_dir = "~/.kiln/run"
 cache_dir = "~/.kiln/cache"
 model_dir = "~/.kiln/models"
+# Command prefix used to launch the Python worker; the gateway appends
+# `--model <path> --socket <path> --model-id <id>`. The default assumes the
+# gateway runs from a Kiln checkout.
+python_worker_argv = ["uv", "run", "--project", "python/kiln_worker_py", "python", "-m", "kiln_worker_py"]
 
 [memory]
 # Fraction of unified memory the gateway may hand out across all workers.

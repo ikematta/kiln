@@ -56,6 +56,12 @@ pub struct ServerConfig {
     pub cache_dir: PathBuf,
     #[serde(default = "defaults::model_dir")]
     pub model_dir: PathBuf,
+    /// Command prefix the supervisor uses to launch the Python worker; the
+    /// gateway appends `--model <path> --socket <path> --model-id <id>`.
+    /// The default assumes the gateway runs from a Kiln checkout (Phase 2
+    /// tracer bullet); packaged installs override it (SPEC §12 Phase 10).
+    #[serde(default = "defaults::python_worker_argv")]
+    pub python_worker_argv: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -164,6 +170,10 @@ impl KilnConfig {
         if self.server.port == 0 {
             return invalid("server.port must be non-zero".into());
         }
+        if self.server.python_worker_argv.is_empty() || self.server.python_worker_argv[0].is_empty()
+        {
+            return invalid("server.python_worker_argv must name an executable".into());
+        }
         let fraction = self.memory.budget_fraction;
         if !(fraction > 0.0 && fraction <= 1.0) {
             return invalid(format!(
@@ -224,6 +234,7 @@ impl Default for ServerConfig {
             runtime_dir: defaults::runtime_dir(),
             cache_dir: defaults::cache_dir(),
             model_dir: defaults::model_dir(),
+            python_worker_argv: defaults::python_worker_argv(),
         }
     }
 }
@@ -266,6 +277,19 @@ mod defaults {
     }
     pub(super) fn model_dir() -> PathBuf {
         PathBuf::from("~/.kiln/models")
+    }
+    pub(super) fn python_worker_argv() -> Vec<String> {
+        [
+            "uv",
+            "run",
+            "--project",
+            "python/kiln_worker_py",
+            "python",
+            "-m",
+            "kiln_worker_py",
+        ]
+        .map(String::from)
+        .to_vec()
     }
     pub(super) fn budget_fraction() -> f64 {
         0.80
@@ -341,6 +365,20 @@ mod tests {
             assert_eq!(config.memory.budget_fraction, 0.80);
             assert_eq!(config.defaults.block_size, 32);
             assert!(config.models.is_empty());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn python_worker_argv_defaults_and_rejects_empty() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("kiln.toml", "")?;
+            let config = KilnConfig::load("kiln.toml").expect("defaults valid");
+            assert_eq!(config.server.python_worker_argv[0], "uv");
+
+            jail.create_file("bad.toml", "[server]\npython_worker_argv = []\n")?;
+            let err = KilnConfig::load("bad.toml").unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid(_)));
             Ok(())
         });
     }
