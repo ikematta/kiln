@@ -1,0 +1,5 @@
+{
+ "bos_token": {"content": "<|begin|>", "lstrip": false, "special": true},
+ "eos_token": {"content": "<|im_end|>", "lstrip": false, "special": true},
+ "chat_template": "IGNORED: chat_template.jinja takes precedence over this key"
+}

@@ -1,0 +1,10 @@
+{{- bos_token }}
+{%- for message in messages %}
+{%- if message['role'] not in ['system', 'user', 'assistant'] %}
+{{- raise_exception('unsupported role: ' + message['role']) }}
+{%- endif %}
+{{- '<|im_start|>' + message['role'] + '\n' + message['content'].strip() + '<|im_end|>\n' }}
+{%- endfor %}
+{%- if add_generation_prompt %}
+{{- '<|im_start|>assistant\n' }}
+{%- endif %}

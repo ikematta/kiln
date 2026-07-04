@@ -28,3 +28,13 @@ cmake = "0.1"
 figment = { version = "0.10", features = ["toml", "env"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# Chat templating (SPEC §3, §8.2): Jinja2-compatible rendering of HF chat
+# templates; contrib adds Python-method compat (str.strip() etc.) those
+# templates rely on; chrono backs the strftime_now() template function;
+# serde_json parses tokenizer_config.json; sha2 computes the template hash
+# compared against WorkerInfo.chat_template_hash.
+minijinja = { version = "2", features = ["json"] }
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_json = "1"
+sha2 = "0.10"
