@@ -954,6 +954,7 @@ version = "0.0.1"
 dependencies = [
  "bindgen",
  "cmake",
+ "libc",
  "memmap2",
  "thiserror",
 ]

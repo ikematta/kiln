@@ -28,6 +28,8 @@ pub mod memory;
 #[cfg(feature = "metal")]
 pub mod ops;
 #[cfg(feature = "metal")]
+pub mod os;
+#[cfg(feature = "metal")]
 pub mod random;
 #[cfg(feature = "metal")]
 pub mod smoke;
