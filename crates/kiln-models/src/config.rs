@@ -96,14 +96,22 @@ impl LlamaConfig {
             path: path.display().to_string(),
             source,
         })?;
-        let config: Self = serde_json::from_str(&text)?;
+        Self::from_json_str(&text)
+    }
+
+    /// Parses and validates a `config.json` document. Every unsupported
+    /// variant fails HERE, at load time, with a named reason — never
+    /// mid-forward as an opaque shape error.
+    pub fn from_json_str(text: &str) -> Result<Self, ConfigError> {
+        let raw: serde_json::Value = serde_json::from_str(text)?;
+        let config: Self = serde_json::from_value(raw.clone())?;
         if config.model_type != "llama" {
             return Err(ConfigError::UnsupportedArchitecture(
                 config.model_type.clone(),
             ));
         }
-        // Fail load-time, not forward-time, on unsupported variants.
         config.rope_scaling()?;
+        validate_quantization(&raw)?;
         if let Some(q) = config.quantization
             && (!matches!(q.bits, 4 | 8) || !matches!(q.group_size, 32 | 64 | 128))
         {
@@ -162,6 +170,43 @@ impl LlamaConfig {
             ))),
         }
     }
+}
+
+/// Rejects `quantization` blocks this crate cannot honor. Checked against
+/// the RAW json: mlx-lm mixed-precision checkpoints add per-module override
+/// entries (`"model.embed_tokens": {"bits": 8, ...}` or `"lm_head": false`)
+/// inside the block, and serde's permissive unknown-field handling would
+/// silently drop them from [`Quantization`] — the model would then load with
+/// the uniform parameters and fail far away (an opaque shape error on the
+/// first forward pass), or worse, quietly misread a module. Route such
+/// models to the Python worker instead (SPEC §7.3).
+fn validate_quantization(raw: &serde_json::Value) -> Result<(), ConfigError> {
+    let Some(quant) = raw
+        .get("quantization")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(());
+    };
+    if let Some(mode) = quant.get("mode")
+        && mode.as_str() != Some("affine")
+    {
+        return Err(ConfigError::UnsupportedQuantization(format!(
+            "quantization mode {mode} (supported: \"affine\")"
+        )));
+    }
+    let mut offending: Vec<&str> = quant
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !matches!(*key, "group_size" | "bits" | "mode"))
+        .collect();
+    if offending.is_empty() {
+        return Ok(());
+    }
+    offending.sort_unstable();
+    Err(ConfigError::UnsupportedQuantization(format!(
+        "per-module quantization overrides {offending:?} — the rust worker supports only \
+         uniform affine group_size/bits (SPEC §7.3); route this model to the python worker"
+    )))
 }
 
 #[cfg(test)]
@@ -236,6 +281,74 @@ mod tests {
         assert!(!config.mlp_bias);
         assert_eq!(config.rope_scaling().unwrap(), RopeScaling::Default);
         assert_eq!(config.quantization, None);
+    }
+
+    #[test]
+    fn per_module_quantization_overrides_are_a_named_load_error() {
+        // Mixed-precision checkpoint shape: uniform defaults plus per-module
+        // entries in both forms mlx-lm emits (override dict / `false`).
+        let mut json = llama32_json();
+        json["quantization"] = serde_json::json!({
+            "group_size": 64,
+            "bits": 4,
+            "model.embed_tokens": {"group_size": 32, "bits": 8},
+            "lm_head": false,
+        });
+        let err = LlamaConfig::from_json_str(&json.to_string())
+            .expect_err("per-module overrides must not load");
+        assert!(
+            matches!(err, ConfigError::UnsupportedQuantization(_)),
+            "wrong error variant: {err:?}"
+        );
+        // The message must say WHAT is unsupported (the override keys, by
+        // name) and where such models go instead — not a generic failure.
+        let message = err.to_string();
+        for needle in [
+            "unsupported quantization",
+            "per-module",
+            "model.embed_tokens",
+            "lm_head",
+            "python worker",
+        ] {
+            assert!(
+                message.contains(needle),
+                "error message {message:?} does not mention {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantization_mode_affine_accepted_others_named() {
+        let mut json = llama32_json();
+        json["quantization"] = serde_json::json!({"group_size": 64, "bits": 4, "mode": "affine"});
+        LlamaConfig::from_json_str(&json.to_string()).expect("affine mode is the supported mode");
+
+        json["quantization"] = serde_json::json!({"group_size": 32, "bits": 4, "mode": "mxfp4"});
+        let err = LlamaConfig::from_json_str(&json.to_string())
+            .expect_err("non-affine modes must not load");
+        assert!(
+            matches!(err, ConfigError::UnsupportedQuantization(_)),
+            "wrong error variant: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("mxfp4"),
+            "error message {err} does not name the rejected mode"
+        );
+    }
+
+    #[test]
+    fn uniform_quantization_still_loads() {
+        // The golden model's exact block (plus entry-point coverage for
+        // from_json_str, which the fixture-driven tests reach via
+        // from_model_dir).
+        let config = LlamaConfig::from_json_str(&llama32_json().to_string()).expect("loads");
+        assert_eq!(
+            config.quantization,
+            Some(Quantization {
+                group_size: 64,
+                bits: 4
+            })
+        );
     }
 
     #[test]
