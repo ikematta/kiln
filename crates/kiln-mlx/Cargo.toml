@@ -13,3 +13,8 @@ metal = []
 
 [build-dependencies]
 cmake.workspace = true
+# Generates the raw FFI surface from the vendored mlx-c headers at the pin —
+# SPEC §7.1 mandates bindgen for kiln-mlx/src/sys.rs. Build-time only; the
+# hand-written Phase 0 bindings it replaces could not scale to the full op
+# surface the Llama path needs without transcription risk. BSD-3-Clause.
+bindgen = "0.72"
