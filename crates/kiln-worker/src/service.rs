@@ -88,9 +88,10 @@ impl Worker for WorkerService {
             max_context_len: info.max_context_len,
             vocab_size: info.vocab_size,
             dtype: info.dtype.clone(),
-            // No LOGPROBS/GRAMMAR/PREFIX_CACHE yet; notably NOT
-            // TOKENIZER_OWNED — the gateway tokenizes for this worker.
-            capabilities: Vec::new(),
+            // PREFIX_CACHE/SSD_TIER per the startup flags (Phase 5). No
+            // LOGPROBS/GRAMMAR yet; notably NOT TOKENIZER_OWNED — the
+            // gateway tokenizes for this worker.
+            capabilities: self.shared.capabilities(),
             worker_kind: "rust".to_owned(),
             worker_version: env!("CARGO_PKG_VERSION").to_owned(),
             kv_block_size: kiln_engine::DEFAULT_BLOCK_SIZE as u32,
@@ -311,9 +312,31 @@ impl Worker for WorkerService {
     }
 
     async fn stats(&self, _: Request<StatsRequest>) -> Result<Response<WorkerStats>, Status> {
-        Err(Status::unimplemented(
-            "Stats arrives with the Phase 4 engine",
-        ))
+        let shared = &self.shared;
+        let load = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Acquire);
+        Ok(Response::new(WorkerStats {
+            requests_total: load(&shared.requests_total),
+            requests_failed: load(&shared.requests_failed),
+            requests_cancelled: load(&shared.requests_cancelled),
+            requests_preempted: load(&shared.requests_preempted),
+            tokens_prefilled_total: load(&shared.tokens_prefilled_total),
+            tokens_generated_total: load(&shared.tokens_generated_total),
+            prefix_tokens_reused_total: load(&shared.prefix_tokens_reused_total),
+            kv_blocks_allocated: load(&shared.kv_blocks_allocated),
+            kv_blocks_free: load(&shared.kv_blocks_free),
+            ssd_blocks_stored: load(&shared.ssd_blocks_stored),
+            ssd_reads_total: load(&shared.ssd_reads_total),
+            ssd_writes_total: load(&shared.ssd_writes_total),
+            ssd_fingerprint_rejects_total: load(&shared.ssd_fingerprint_rejects_total),
+            // Speculative decoding is Phase 8; the step-overhead
+            // percentiles need an in-engine reservoir (criterion covers
+            // the gate today) — all zero until they exist.
+            spec_tokens_proposed_total: 0,
+            spec_tokens_accepted_total: 0,
+            engine_steps_total: load(&shared.engine_steps_total),
+            engine_step_overhead_us_p50: 0.0,
+            engine_step_overhead_us_p99: 0.0,
+        }))
     }
 
     async fn tokenize(
