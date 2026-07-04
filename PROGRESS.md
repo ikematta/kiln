@@ -304,3 +304,94 @@
     Python worker tests: ============ 28 passed in 11.03s ============
   ```
 - Next: Phase 2 — Gateway v0 (SPEC §12), pending PM phase gate.
+
+## [2026-07-04] Phase 2 / Gateway v0 (tracer bullet complete) — DONE
+- What:
+  - `kiln-tokenize`: chat templating via minijinja — model-dir loading
+    (chat_template.jinja else tokenizer_config.json, incl. named-list form),
+    bos/eos extraction (string + AddedToken forms), pycompat callback,
+    `raise_exception`/`strftime_now`, lenient undefined; sha256 source hash
+    mirroring the worker's `chat_template_hash` scheme. Tests include the
+    vendored template of the pinned Llama-3.2-1B revision.
+  - `kiln-gateway` v0 (SPEC §8): model registry from kiln.toml (path
+    resolution, `$runtime_dir/worker-<hash12>.sock` per §3 with a 104-byte
+    macOS sun_path guard); lazy tonic-over-UDS channels that survive worker
+    restarts; supervisor per §2.2 — spawns the python worker, forwards its
+    output into gateway logs, 1s Health poll on the frozen proto (2s RPC
+    deadline / 3s missed-deadline budget), child-exit watch, exponential
+    backoff restart (500ms doubling, cap 10s, max 3; 60s-stable Ready resets
+    the counter, then Failed until manual reset), GetInfo cache + template
+    hash verification.
+  - OpenAI surface: POST /v1/chat/completions (stream SSE + non-stream) per
+    §8.2 — validate → render template → worker Tokenize → Submit(token_ids) →
+    TokenEvent translation with usage/finish_reason; GET /v1/models;
+    /healthz; /readyz (per-model worker states); Prometheus GET /metrics
+    (http/chat/token/restart counters, worker_up gauge, latency histogram);
+    argon2 API-key auth with sha256-keyed verify cache + `hash-key`
+    subcommand; structured JSON logs with per-request UUIDv7 ids (echoed as
+    x-request-id, reused as worker request_id).
+  - `tests/e2e`: own uv project; full-stack fixture (gateway builds itself,
+    throwaway config, /readyz gate); 8 tests driving the real `openai` SDK,
+    incl. kill -9 crash/recovery and metrics. CI macos job runs it; ruff
+    scope widened to tests/e2e; CLAUDE.md commands updated.
+- Decisions:
+  - New config knob `server.python_worker_argv` (§10 doesn't say how the
+    gateway finds the worker); default is the CLAUDE.md uv-run invocation,
+    checkout-relative, overridable for packaged installs.
+  - Prompt path tokenizes via the worker's Tokenize RPC with
+    add_special_tokens=false rather than submitting raw_text: the rendered
+    template already contains BOS, and worker-side encode would add a second
+    one (verified against the Llama-3.2 tokenizer/template).
+  - No usable API-key hashes ⇒ auth disabled with a loud warning (localhost
+    bind default per §8.1); empty/malformed hash entries are skipped.
+  - Default max_tokens when the client omits it: remaining context
+    (max_context_len − prompt), 1024 fallback if the worker reported no ctx.
+  - Unsupported OpenAI features (n>1, logprobs, tools, response_format other
+    than text, tool/function roles) are explicit 400s, not silent drops.
+  - Shutdown kills workers with SIGKILL; graceful Drain+SIGTERM arrives with
+    eviction (Phase 9). worker="rust" is a startup error until Phase 3;
+    "auto" resolves to python.
+- Deviations:
+  - §8.3 per-key rate limits (rpm/tpm) and TTFT/total timeouts are NOT
+    implemented — absent from the Phase 2 task list; config keys parse but
+    are unenforced. Flagging here so a later phase picks them up explicitly.
+  - Admin endpoints, /v1/completions, /v1/embeddings, /v1/messages: later
+    phases per §12 (not attempted).
+- Acceptance:
+  ```
+  $ uv run --project tests/e2e pytest tests/e2e -v        (real model, full stack)
+  test_chat.py::test_models_list PASSED
+  test_chat.py::test_auth_rejects_bad_and_missing_keys PASSED
+  test_chat.py::test_chat_completion_non_streaming PASSED
+  test_chat.py::test_greedy_is_reproducible PASSED
+  test_chat.py::test_chat_completion_streaming PASSED
+  test_chat.py::test_validation_errors_are_openai_shaped PASSED
+  test_crash_recovery.py::test_kill9_mid_request_yields_502_then_recovers PASSED
+  test_metrics.py::test_request_counters_increment PASSED
+  ============ 8 passed in 14.52s ============
+
+  $ (acceptance demo: openai SDK vs live stack)
+  == non-streaming chat (temperature=0):
+     content       = 'A kiln is a large, heated oven or furnace used for ...'
+     finish_reason = stop, usage = 46+28=74
+  == streaming chat:
+     streamed 9 deltas -> '1\n2\n3\n4\n5'   (stream usage = 46+10)
+  == kill -9 mid-request:
+     killed worker pid(s) [4126, 4127] mid-generation
+     client got HTTP 502: {'error': {'code': 'worker_crashed', 'type':
+       'server_error', 'message': 'worker RPC failed: Unknown error', ...}}
+  == auto-restart:
+     next request succeeded 2.2s after crash: "I'm ready."
+  == /metrics (selected):
+     kiln_chat_completions_total{...,outcome="ok"} 3
+     kiln_http_requests_total{...,path="/v1/chat/completions",status="200"} 3
+     kiln_http_requests_total{...,path="/v1/chat/completions",status="502"} 2
+     kiln_worker_restarts_total{model="llama-3.2-1b-4bit"} 1
+     kiln_worker_up{model="llama-3.2-1b-4bit"} 1
+
+  $ cargo test --workspace     → all green (22 gateway, 12 tokenize, 1 mlx)
+  $ pytest python/kiln_worker_py/tests   → 28 passed
+  $ cargo fmt --check / clippy -D warnings / ruff check+format → clean
+  ```
+- Next: Phase 3 — Rust worker v0: single-request Llama (SPEC §12), pending
+  PM phase gate.
