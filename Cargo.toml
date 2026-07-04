@@ -59,6 +59,11 @@ async-stream = "0.3"
 # Property-based testing (dev-only): model-based invariant suites for the
 # engine's block manager (SPEC §12 Phase 4, "block manager (+proptests)").
 proptest = "1"
+# Statistical micro-benchmarks (dev-only): the SPEC §6.2 step-overhead gate
+# (<200µs non-forward overhead at batch 16, Phase 4 acceptance) and §11.3
+# perf tracking. Named in the SPEC §3 testing stack. Minimal features: no
+# plotters/rayon, just the cargo-bench harness support.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # Intra-workspace crates.
 kiln-engine = { path = "crates/kiln-engine", default-features = false }
 kiln-mlx = { path = "crates/kiln-mlx", default-features = false }

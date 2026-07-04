@@ -30,8 +30,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use kiln_engine::{
-    Engine, EngineConfig, EngineRequest, FinishKind, PenaltyOptions, Priority, SamplingOptions,
-    SeqEvent,
+    Engine, EngineConfig, EngineRequest, FinishKind, FinishSummary, PenaltyOptions, Priority,
+    SamplingOptions, SeqEvent,
 };
 use kiln_mlx::{Stream, debug};
 use kiln_models::LlamaModel;
@@ -66,13 +66,15 @@ fn model_dir() -> Option<PathBuf> {
     dir.join("config.json").is_file().then_some(dir)
 }
 
-/// Runs one greedy request through the batching engine and returns every
-/// generated token (no stop tokens, so the token stream is complete).
-fn engine_generate(
+type Collected = (Rc<RefCell<Vec<u32>>>, Rc<RefCell<Option<FinishSummary>>>);
+
+/// Submits one greedy request (no stop tokens) and returns its
+/// token-stream/finish handles.
+fn submit_collected(
     engine: &mut Engine<&LlamaModel>,
     prompt_ids: &[u32],
     max_tokens: usize,
-) -> Vec<u32> {
+) -> Collected {
     let tokens = Rc::new(RefCell::new(Vec::new()));
     let finish = Rc::new(RefCell::new(None));
     let (t, f) = (Rc::clone(&tokens), Rc::clone(&finish));
@@ -97,16 +99,103 @@ fn engine_generate(
             true
         }),
     });
-    while !engine.is_idle() {
-        engine.step().expect("engine step");
-    }
+    (tokens, finish)
+}
+
+fn assert_full_length(finish: &Rc<RefCell<Option<FinishSummary>>>) -> FinishSummary {
     let summary = finish.borrow().clone().expect("request finished");
     assert_eq!(
         summary.reason,
         FinishKind::Length,
-        "fixtures run to max_tokens: {summary:?}"
+        "fixtures and fillers run to max_tokens: {summary:?}"
     );
+    summary
+}
+
+/// Runs one greedy request through the batching engine and returns every
+/// generated token (no stop tokens, so the token stream is complete).
+fn engine_generate(
+    engine: &mut Engine<&LlamaModel>,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+) -> Vec<u32> {
+    let (tokens, finish) = submit_collected(engine, prompt_ids, max_tokens);
+    while !engine.is_idle() {
+        engine.step().expect("engine step");
+    }
+    assert_full_length(&finish);
     tokens.borrow().clone()
+}
+
+/// Safety bound for the batch-16 rounds (~200 steps expected each).
+const MAX_STEPS: usize = 4000;
+
+/// Runs one fixture request with its decode batch pinned at width 16 (the
+/// Phase-4 / mlx#3120 checkpoint: trunk-matmul kernel dispatch depends on
+/// M, so parity at M=1 does not imply parity at M=16).
+///
+/// 15 filler requests are submitted (and, being FIFO, admitted) first and
+/// sized to outlive the fixture, so every sampled position of the fixture
+/// comes from a decode step carrying exactly 16 sequences. Asserted, not
+/// assumed: the width stays 16 from fixture admission to fixture finish,
+/// all 15 fillers are still running when the fixture finishes, and no
+/// preemption occurred.
+fn engine_generate_at_width16(
+    engine: &mut Engine<&LlamaModel>,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    filler_prompt: &[u32],
+) -> Vec<u32> {
+    assert!(
+        engine.is_idle(),
+        "width-16 rounds start from an idle engine"
+    );
+    let preemptions_before = engine.preemptions();
+    // Admission is staggered (one prefill per step), so a filler admitted
+    // k steps before the fixture needs at most max_tokens + 16 tokens to
+    // outlive it; +24 leaves margin.
+    let filler_max = max_tokens + 24;
+    let fillers: Vec<Collected> = (0..15)
+        .map(|_| submit_collected(engine, filler_prompt, filler_max))
+        .collect();
+    let (tokens, finish) = submit_collected(engine, prompt_ids, max_tokens);
+
+    let mut width16_seen = false;
+    let mut steps = 0;
+    while finish.borrow().is_none() {
+        assert!(steps < MAX_STEPS, "width-16 round livelocked");
+        engine.step().expect("engine step");
+        steps += 1;
+        let width = engine.num_running();
+        width16_seen |= width == 16;
+        if width16_seen && finish.borrow().is_none() {
+            assert_eq!(width, 16, "decode width fell below 16 mid-fixture");
+        }
+    }
+    assert!(width16_seen, "the batch never reached width 16");
+    for (i, (_, filler_finish)) in fillers.iter().enumerate() {
+        assert!(
+            filler_finish.borrow().is_none(),
+            "filler {i} finished before the fixture — the fixture's tail \
+             decoded below width 16 (resize filler_max)"
+        );
+    }
+    assert_eq!(
+        engine.preemptions(),
+        preemptions_before,
+        "width-16 round preempted; the pool is undersized for this fixture"
+    );
+    assert_full_length(&finish);
+    let out = tokens.borrow().clone();
+    while !engine.is_idle() {
+        assert!(steps < MAX_STEPS, "width-16 drain livelocked");
+        engine.step().expect("engine step");
+        steps += 1;
+    }
+    for (_, filler_finish) in &fillers {
+        assert_full_length(filler_finish);
+    }
+    out
 }
 
 #[test]
@@ -154,35 +243,44 @@ fn llama_32_1b_greedy_parity_is_exact() {
         )
         .expect("engine builds");
 
-        for path in &fixture_paths {
-            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-            let fixture: Fixture =
-                serde_json::from_str(&std::fs::read_to_string(path).expect("fixture readable"))
-                    .expect("fixture parses");
-            assert_eq!(
-                fixture.weights_revision, local_revision,
-                "fixture {name} was generated for a different weights revision than the \
-                 local test model — refetch models or regenerate fixtures (when told to)"
-            );
+        let fixtures: Vec<(String, Fixture, Vec<u32>)> = fixture_paths
+            .iter()
+            .map(|path| {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_owned();
+                let fixture: Fixture =
+                    serde_json::from_str(&std::fs::read_to_string(path).expect("fixture readable"))
+                        .expect("fixture parses");
+                assert_eq!(
+                    fixture.weights_revision, local_revision,
+                    "fixture {name} was generated for a different weights revision than the \
+                     local test model — refetch models or regenerate fixtures (when told to)"
+                );
+                let prompt_ids = if fixture.chat_template {
+                    let rendered = template
+                        .render_with(
+                            &[ChatMessage {
+                                role: "user".into(),
+                                content: fixture.prompt.clone(),
+                            }],
+                            true,
+                            &[("date_string", Value::from(PINNED_DATE_STRING))],
+                        )
+                        .expect("template renders");
+                    // BOS contract: the rendered template already contains BOS.
+                    tokenizer.encode(&rendered, false).expect("encodes")
+                } else {
+                    tokenizer.encode(&fixture.prompt, true).expect("encodes")
+                };
+                (name, fixture, prompt_ids)
+            })
+            .collect();
 
-            let prompt_ids = if fixture.chat_template {
-                let rendered = template
-                    .render_with(
-                        &[ChatMessage {
-                            role: "user".into(),
-                            content: fixture.prompt.clone(),
-                        }],
-                        true,
-                        &[("date_string", Value::from(PINNED_DATE_STRING))],
-                    )
-                    .expect("template renders");
-                // BOS contract: the rendered template already contains BOS.
-                tokenizer.encode(&rendered, false).expect("encodes")
-            } else {
-                tokenizer.encode(&fixture.prompt, true).expect("encodes")
-            };
-
-            let output = engine_generate(&mut engine, &prompt_ids, fixture.max_tokens);
+        for (name, fixture, prompt_ids) in &fixtures {
+            let output = engine_generate(&mut engine, prompt_ids, fixture.max_tokens);
             assert_eq!(
                 output,
                 fixture.expected_token_ids,
@@ -193,6 +291,39 @@ fn llama_32_1b_greedy_parity_is_exact() {
             eprintln!(
                 "golden {name}: {} prompt tokens, {} generated — exact match \
                  (batched/paged engine)",
+                prompt_ids.len(),
+                fixture.max_tokens
+            );
+        }
+
+        // Phase 4 closeout: the same fixtures, bit-exact with the decode
+        // batch pinned at width 16 — the M=16 quantized-matmul dispatch
+        // checkpoint flagged against mlx#3120 (PROGRESS.md 2026-07-04
+        // addendum). A divergence here and not above means the batched-M
+        // kernel variant, not the model, changed the numerics: check which
+        // quantized-matmul kernel dispatches at M=16 vs M=1 first.
+        let filler_prompt = tokenizer
+            .encode("Pottery is one of the oldest human inventions", true)
+            .expect("encodes");
+        for (name, fixture, prompt_ids) in &fixtures {
+            let output = engine_generate_at_width16(
+                &mut engine,
+                prompt_ids,
+                fixture.max_tokens,
+                &filler_prompt,
+            );
+            assert_eq!(
+                output,
+                fixture.expected_token_ids,
+                "greedy token divergence on fixture {name} at decode width 16 \
+                 (prompt tokens: {}) — M-dependent quantized-matmul dispatch \
+                 (mlx#3120 class); identify the kernel variant at M=16 vs M=1 \
+                 before touching the parity bar",
+                prompt_ids.len()
+            );
+            eprintln!(
+                "golden {name}: {} prompt tokens, {} generated — exact match \
+                 at decode width 16",
                 prompt_ids.len(),
                 fixture.max_tokens
             );
