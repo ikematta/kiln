@@ -9,7 +9,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use minijinja::{Environment, ErrorKind, UndefinedBehavior, Value, context};
+use minijinja::{Environment, ErrorKind, UndefinedBehavior, Value};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -128,13 +128,29 @@ impl ChatTemplate {
         messages: &[ChatMessage],
         add_generation_prompt: bool,
     ) -> Result<String, TemplateError> {
+        self.render_with(messages, add_generation_prompt, &[])
+    }
+
+    /// [`Self::render`] with extra template variables layered on top of the
+    /// standard context — e.g. pinning `date_string` so Llama 3.x templates
+    /// don't interpolate today's date via `strftime_now` (the golden
+    /// harness needs render-stable prompts).
+    pub fn render_with(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        extra: &[(&str, Value)],
+    ) -> Result<String, TemplateError> {
         let template = self.env.get_template(TEMPLATE_NAME)?;
-        let rendered = template.render(context! {
-            messages => messages,
-            add_generation_prompt => add_generation_prompt,
-            bos_token => self.bos_token,
-            eos_token => self.eos_token,
-        })?;
+        let mut ctx: std::collections::BTreeMap<&str, Value> = std::collections::BTreeMap::new();
+        ctx.insert("messages", Value::from_serialize(messages));
+        ctx.insert("add_generation_prompt", Value::from(add_generation_prompt));
+        ctx.insert("bos_token", Value::from(self.bos_token.as_str()));
+        ctx.insert("eos_token", Value::from(self.eos_token.as_str()));
+        for (key, value) in extra {
+            ctx.insert(key, value.clone());
+        }
+        let rendered = template.render(Value::from_serialize(&ctx))?;
         Ok(rendered)
     }
 

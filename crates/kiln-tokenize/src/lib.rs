@@ -35,5 +35,7 @@
 //! later phases.
 
 pub mod chat_template;
+pub mod tokenizer;
 
 pub use chat_template::{ChatMessage, ChatTemplate, TemplateError};
+pub use tokenizer::{Tokenizer, TokenizerError};

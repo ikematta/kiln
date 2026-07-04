@@ -35,6 +35,10 @@ thiserror = "2"
 # compared against WorkerInfo.chat_template_hash.
 minijinja = { version = "2", features = ["json"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+# Gateway-side tokenization for Rust workers (SPEC §3): loads the model's
+# tokenizer.json; HF's Rust crate — the same library lineage the Python
+# worker's tokenizer wraps, so token ids agree across workers. Apache-2.0.
+tokenizers = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_json = "1"
 sha2 = "0.10"
