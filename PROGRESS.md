@@ -395,3 +395,27 @@
   ```
 - Next: Phase 3 — Rust worker v0: single-request Llama (SPEC §12), pending
   PM phase gate.
+
+## [2026-07-04] Phase 2 / Follow-up — worker process-group kill — DONE
+- What: post-acceptance sweep found the supervisor orphaning python workers:
+  it killed its direct child (the `uv run` wrapper) but not the model-loaded
+  python process underneath, leaking ~1 GB RSS per shutdown/recycle. Workers
+  now run in their own process group (pgid == spawned pid) and every exit
+  path SIGKILLs the group via /bin/kill (libc::kill would need unsafe, which
+  is confined to kiln-mlx). e2e teardown now fails the suite on any surviving
+  worker process — regression guard.
+- Decisions: /bin/kill subprocess over adding a libc/nix dependency or
+  relaxing the unsafe-code rule; group-kill also runs in the
+  child-exited-on-its-own arms, where only the wrapper may have died.
+- Deviations: none
+- Acceptance:
+  ```
+  $ uv run --project tests/e2e pytest tests/e2e -v
+  ============ 8 passed in 9.97s ============
+  $ pgrep -fl kiln_worker_py   (after suite)
+  (none)
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+  clean
+  ```
+- Next: Phase 3 — Rust worker v0: single-request Llama (SPEC §12), pending
+  PM phase gate.
