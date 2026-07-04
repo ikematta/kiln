@@ -11,6 +11,30 @@
 //!   BOS contract), receives bare token ids, detokenizes them incrementally
 //!   ([`StreamingDecoder`]), and matches stop strings itself — on a match it
 //!   cancels the worker request and reports `finish_reason: "stop"`.
+//!
+//! # Finish-reason precedence (gateway stop match vs worker terminal event)
+//!
+//! A gateway-side stop-string match ALWAYS wins: the response reports
+//! `finish_reason: "stop"` no matter how the worker's stream terminates
+//! afterwards — CANCELLED (the usual case, from our own Cancel), STOP (an
+//! EOS raced ahead of the Cancel), LENGTH (the worker hit max_tokens before
+//! the Cancel landed), or even ERROR. This is deliberate, not a race bug:
+//! the client-visible completion is defined by the gateway's text pipeline,
+//! which truncated at the match, so by OpenAI semantics the completion
+//! ended at a stop sequence. The worker's terminal reason describes its own
+//! post-match continuation, which the client never saw — and a
+//! tokenizer-owning worker (python) stops at exactly the match point and
+//! reports STOP for the identical request. A worker LENGTH being reported
+//! as "stop" is therefore the *correct* account of the response the client
+//! received, not a silent misreport.
+//!
+//! Usage follows the same boundary: on a gateway-side match,
+//! `completion_tokens` is the number of tokens consumed up to and including
+//! the token whose text completed the stop string
+//! ([`TextPipeline::apply_usage`]) — never the worker's total, which
+//! includes cancel-overshoot tokens. This is the same count the
+//! tokenizer-owning worker reports, so usage is identical across workers
+//! (asserted by the cross-worker parity e2e test).
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -205,7 +229,11 @@ enum TextPipeline {
     Decode {
         decoder: StreamingDecoder,
         matcher: StopStringMatcher,
-        matched: bool,
+        /// Tokens consumed from the worker so far.
+        tokens_seen: u32,
+        /// Frozen at the chunk whose text completed a stop string — the
+        /// client-visible completion length (see the module docs on usage).
+        tokens_at_match: Option<u32>,
     },
 }
 
@@ -215,7 +243,8 @@ impl TextPipeline {
             Some(tokenizer) => TextPipeline::Decode {
                 decoder: StreamingDecoder::new(Arc::clone(tokenizer)),
                 matcher: StopStringMatcher::new(stop_strings),
-                matched: false,
+                tokens_seen: 0,
+                tokens_at_match: None,
             },
             None => TextPipeline::Passthrough,
         }
@@ -229,16 +258,22 @@ impl TextPipeline {
             TextPipeline::Decode {
                 decoder,
                 matcher,
-                matched,
+                tokens_seen,
+                tokens_at_match,
             } => {
-                if *matched {
+                if tokens_at_match.is_some() {
+                    // Post-match chunks are the worker's cancel overshoot;
+                    // they are not part of the client-visible completion.
                     return Ok(String::new());
                 }
+                *tokens_seen += chunk.token_ids.len() as u32;
                 let text = decoder
                     .push(&chunk.token_ids)
                     .map_err(|err| ApiError::internal(format!("detokenization failed: {err}")))?;
                 let (released, hit) = matcher.push(&text);
-                *matched = hit.is_some();
+                if hit.is_some() {
+                    *tokens_at_match = Some(*tokens_seen);
+                }
                 Ok(released)
             }
         }
@@ -252,17 +287,19 @@ impl TextPipeline {
             TextPipeline::Decode {
                 decoder,
                 matcher,
-                matched,
+                tokens_seen,
+                tokens_at_match,
             } => {
-                if *matched {
+                if tokens_at_match.is_some() {
                     return Ok(String::new());
                 }
                 let tail = decoder
                     .finalize()
                     .map_err(|err| ApiError::internal(format!("detokenization failed: {err}")))?;
                 let (mut released, hit) = matcher.push(&tail);
-                *matched = hit.is_some();
-                if hit.is_none() {
+                if hit.is_some() {
+                    *tokens_at_match = Some(*tokens_seen);
+                } else {
                     released.push_str(&matcher.flush());
                 }
                 Ok(released)
@@ -271,7 +308,28 @@ impl TextPipeline {
     }
 
     fn stop_matched(&self) -> bool {
-        matches!(self, TextPipeline::Decode { matched: true, .. })
+        matches!(
+            self,
+            TextPipeline::Decode {
+                tokens_at_match: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// On a gateway-side match, overrides the worker-reported completion
+    /// count with the client-visible one (tokens up to and including the
+    /// match) — the worker's total includes cancel overshoot the client
+    /// never saw, and the tokenizer-owning worker stops (and counts) at
+    /// exactly this point, so usage agrees across workers.
+    fn apply_usage(&self, finished: &mut Finished) {
+        if let TextPipeline::Decode {
+            tokens_at_match: Some(count),
+            ..
+        } = self
+        {
+            finished.completion_tokens = *count;
+        }
     }
 }
 
@@ -399,12 +457,15 @@ async fn collect_response(
                     let was_matched = pipeline.stop_matched();
                     content.push_str(&pipeline.push(chunk)?);
                     if !was_matched && pipeline.stop_matched() {
-                        // Keep draining until Finished so usage stays real.
+                        // Drain until Finished afterwards: prompt_tokens and
+                        // timings come from it (completion_tokens is
+                        // overridden by apply_usage — module docs).
                         ctx.cancel_worker().await;
                     }
                 }
-                Some(token_event::Event::Finished(finished)) => {
+                Some(token_event::Event::Finished(mut finished)) => {
                     content.push_str(&pipeline.finish()?);
+                    pipeline.apply_usage(&mut finished);
                     break classify_finished(finished, pipeline.stop_matched());
                 }
                 // Admitted / PrefixCacheHit are observability-only here.
@@ -512,7 +573,7 @@ fn stream_response(
                         }
                         continue;
                     }
-                    Some(token_event::Event::Finished(finished)) => {
+                    Some(token_event::Event::Finished(mut finished)) => {
                         match pipeline.finish() {
                             Ok(tail) if !tail.is_empty() => {
                                 yield Ok(sse_json(&chunk(
@@ -532,6 +593,7 @@ fn stream_response(
                                 return;
                             }
                         }
+                        pipeline.apply_usage(&mut finished);
                         classify_finished(finished, pipeline.stop_matched())
                     }
                     _ => continue,
