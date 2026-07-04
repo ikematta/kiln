@@ -57,5 +57,8 @@ uuid = { version = "1", features = ["v7"] }
 argon2 = { version = "0.5", features = ["std"] }
 async-stream = "0.3"
 # Intra-workspace crates.
+kiln-engine = { path = "crates/kiln-engine", default-features = false }
+kiln-mlx = { path = "crates/kiln-mlx", default-features = false }
+kiln-models = { path = "crates/kiln-models", default-features = false }
 kiln-proto = { path = "crates/kiln-proto" }
 kiln-tokenize = { path = "crates/kiln-tokenize" }
