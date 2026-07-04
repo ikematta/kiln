@@ -25,6 +25,62 @@ fn wrapper_discipline() {
     clone_aliases_and_frees_independently();
     f16_raw_bytes_round_trip();
     shape_mismatch_is_checked();
+    host_reads_reject_wrong_dtype();
+    host_reads_reject_non_contiguous_views();
+}
+
+/// MLX's item<T>/data<T> are raw reinterpreting accessors; the safe wrappers
+/// must refuse a mismatched T instead of reading the buffer at the wrong
+/// element width (OOB when T is wider — e.g. u32 reads of an f16 buffer).
+fn host_reads_reject_wrong_dtype() {
+    let baseline = debug::live_objects();
+    {
+        let floats = Array::from_f32_slice(&[1.0, 2.0], &[2]).unwrap();
+        let err = floats.data_u32().unwrap_err();
+        assert!(err.message.contains("data_u32"), "got: {}", err.message);
+
+        let scalar_f16 = Array::from_raw_bytes(&[0x00, 0x3C], &[], Dtype::Float16).unwrap();
+        assert!(scalar_f16.item_u32().is_err());
+        assert!(scalar_f16.item_f32().is_err());
+
+        let ids = Array::from_u32_slice(&[7], &[1]).unwrap();
+        assert!(ids.data_f32().is_err());
+        assert_eq!(ids.data_u32().unwrap(), vec![7]);
+    }
+    assert_eq!(debug::live_objects(), baseline);
+}
+
+/// data<T> returns the raw base pointer, so strided views read as size()
+/// consecutive elements would be wrong/out-of-bounds; the wrapper must
+/// refuse them and the ops::contiguous escape hatch must fix them up.
+fn host_reads_reject_non_contiguous_views() {
+    let baseline = debug::live_objects();
+    {
+        let s = gpu_or_cpu();
+        let a = Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]).unwrap();
+        let t = ops::transpose(&a, &[1, 0], &s).unwrap(); // [3, 2], strided
+        t.eval().unwrap();
+        let err = t.data_f32().unwrap_err();
+        assert!(
+            err.message.contains("non-contiguous"),
+            "got: {}",
+            err.message
+        );
+
+        let fixed = ops::contiguous(&t, &s).unwrap();
+        assert_eq!(
+            fixed.data_f32().unwrap(),
+            vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+        );
+
+        // Interior column slice: strided view over a larger parent buffer.
+        let col = ops::slice(&a, &[0, 1], &[2, 2], &s).unwrap(); // [2, 1]
+        col.eval().unwrap();
+        assert!(col.data_f32().is_err());
+        let col = ops::contiguous(&col, &s).unwrap();
+        assert_eq!(col.data_f32().unwrap(), vec![2.0, 5.0]);
+    }
+    assert_eq!(debug::live_objects(), baseline);
 }
 
 fn add_eval_read_and_leak_baseline() {

@@ -220,11 +220,58 @@ impl Array {
         check(unsafe { sys::mlx_array_eval(self.raw) })
     }
 
+    /// The dtype guard every host read goes through. MLX's `item<T>`/`data<T>`
+    /// are raw reinterpreting accessors — no dtype check in C++ — so calling
+    /// them with the wrong T reads the buffer at the wrong element width
+    /// (out of bounds when T is wider). This turns that UB into an error.
+    fn expect_dtype(&self, want: Dtype, caller: &str) -> Result<(), MlxError> {
+        let got = self.dtype();
+        if got != Some(want) {
+            return Err(MlxError {
+                message: format!("{caller} called on a {got:?} array (want {want:?})"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Row-major-contiguity guard for bulk reads: `data<T>()` yields the raw
+    /// base pointer, so a strided view (transpose/slice) read as `size()`
+    /// consecutive elements is wrong data at best and out of bounds at
+    /// worst. Dims of extent <= 1 have don't-care strides.
+    fn expect_contiguous(&self, caller: &str) -> Result<(), MlxError> {
+        let shape = self.shape();
+        let ndim = shape.len();
+        if ndim == 0 || self.size() == 0 {
+            return Ok(());
+        }
+        #[allow(unsafe_code)]
+        // SAFETY: live handle; mlx_array_strides returns a pointer to `ndim`
+        // entries owned by the array, valid while `self` is alive.
+        let strides = unsafe { std::slice::from_raw_parts(sys::mlx_array_strides(self.raw), ndim) };
+        let mut expected: usize = 1;
+        for i in (0..ndim).rev() {
+            let extent = shape[i].max(0) as usize;
+            if extent > 1 && strides[i] != expected {
+                return Err(MlxError {
+                    message: format!(
+                        "{caller} called on a non-contiguous array \
+                         (shape {shape:?}, strides {strides:?}); \
+                         copy through ops::contiguous first"
+                    ),
+                });
+            }
+            expected *= extent.max(1);
+        }
+        Ok(())
+    }
+
     /// Reads a scalar f32 (evaluates first).
     #[allow(unsafe_code)]
     pub fn item_f32(&self) -> Result<f32, MlxError> {
+        self.expect_dtype(Dtype::Float32, "item_f32")?;
         let mut out = 0.0_f32;
-        // SAFETY: live handle; out pointer valid for the call.
+        // SAFETY: live handle of the checked dtype; out pointer valid for
+        // the call; mlx validates size()==1 and evaluates.
         check(unsafe { sys::mlx_array_item_float32(&mut out, self.raw) })?;
         Ok(out)
     }
@@ -232,24 +279,28 @@ impl Array {
     /// Reads a scalar u32 (evaluates first) — the sampled-token read.
     #[allow(unsafe_code)]
     pub fn item_u32(&self) -> Result<u32, MlxError> {
+        self.expect_dtype(Dtype::Uint32, "item_u32")?;
         let mut out = 0_u32;
-        // SAFETY: live handle; out pointer valid for the call.
+        // SAFETY: live handle of the checked dtype; out pointer valid for
+        // the call; mlx validates size()==1 and evaluates.
         check(unsafe { sys::mlx_array_item_uint32(&mut out, self.raw) })?;
         Ok(out)
     }
 
-    /// Copies the evaluated contents out as `u32`. Only valid on
-    /// row-contiguous arrays (all Kiln read-back paths are: freshly
-    /// evaluated op outputs).
+    /// Copies the evaluated contents out as `u32`. Errors on wrong dtype or
+    /// a non-row-contiguous view (use [`crate::ops::contiguous`] first).
     #[allow(unsafe_code)]
     pub fn data_u32(&self) -> Result<Vec<u32>, MlxError> {
+        self.expect_dtype(Dtype::Uint32, "data_u32")?;
         self.eval()?;
-        // SAFETY: live, evaluated handle; pointer checked for null below and
-        // read for exactly `size()` elements.
+        self.expect_contiguous("data_u32")?;
+        // SAFETY: live, evaluated, dtype-checked, row-contiguous handle —
+        // the buffer holds exactly `size()` consecutive u32; null (no
+        // buffer) is still checked defensively.
         let ptr = unsafe { sys::mlx_array_data_uint32(self.raw) };
         if ptr.is_null() {
             return Err(MlxError {
-                message: "mlx_array_data_uint32 returned null (wrong dtype?)".to_owned(),
+                message: "mlx_array_data_uint32 returned null".to_owned(),
             });
         }
         #[allow(unsafe_code)]
@@ -259,12 +310,14 @@ impl Array {
     /// Copies the evaluated contents out as `f32` (see [`Self::data_u32`]).
     #[allow(unsafe_code)]
     pub fn data_f32(&self) -> Result<Vec<f32>, MlxError> {
+        self.expect_dtype(Dtype::Float32, "data_f32")?;
         self.eval()?;
+        self.expect_contiguous("data_f32")?;
         // SAFETY: as in `data_u32`.
         let ptr = unsafe { sys::mlx_array_data_float32(self.raw) };
         if ptr.is_null() {
             return Err(MlxError {
-                message: "mlx_array_data_float32 returned null (wrong dtype?)".to_owned(),
+                message: "mlx_array_data_float32 returned null".to_owned(),
             });
         }
         #[allow(unsafe_code)]

@@ -210,6 +210,14 @@ pub fn astype(a: &Array, dtype: Dtype, s: &Stream) -> Result<Array> {
     Ok(out)
 }
 
+/// Row-contiguous copy of `a` (no-op graph node when already contiguous) —
+/// the escape hatch for `Array::data_*` on strided views.
+pub fn contiguous(a: &Array, s: &Stream) -> Result<Array> {
+    let mut out = Array::new_handle();
+    check(unsafe { sys::mlx_contiguous(out.raw_out(), a.raw(), false, s.raw()) })?;
+    Ok(out)
+}
+
 /// Gather rows/elements of `a` at `indices` along `axis` (embedding lookup).
 pub fn take(a: &Array, indices: &Array, axis: i32, s: &Stream) -> Result<Array> {
     let mut out = Array::new_handle();
