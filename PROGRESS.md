@@ -1268,3 +1268,148 @@
   prefix cache + SSD tier (SPEC §12). Carry-forward for Phase 5: the
   stale-speculative-tail-row invariant above must be part of the radix
   integration review.
+
+## [2026-07-04] Phase 5 — Radix prefix cache + SSD tier — DONE
+- What:
+  - **Step zero (the Phase-4 carry-forward) resolved first**: under radix
+    sharing, "future owners rewrite every row below their length" no
+    longer holds, so the pipeline's discarded speculative row needed a
+    decision. Chosen: **(b), narrowed to the exact hazardous slot** —
+    only settled rows (`processed + fed`, each forced by a token
+    readback or step-boundary eval) are ever keyed by the cache; the
+    discarded in-flight row sits exactly at that boundary and is never
+    served. Its block either returns to the free list (only writers can
+    reacquire it; stale write is stream-ordered before any rewrite) or
+    carries the row beyond the keyed range where request-length trims
+    and COW keep it unreachable. Option (a) (force the readback) was
+    rejected: a pipeline stall at every stop to save at most one
+    cacheable block per pipelined finish, resting on a four-layer
+    laziness argument no reader ever checks. Pinned by
+    `kiln-engine/tests/pipeline_discard.rs`: a mock model whose logits
+    are checksum-tied to gathered KV runs a pipelined stop (in-flight
+    row = last slot of a full block) immediately followed by a prefix
+    match over that region — asserts the exact settled match bound,
+    bit-equality with a cache-cold run, and a cancel variant; the test
+    fails under mutation of the donation bound (verified).
+  - `kiln-engine/src/radix.rs`: block-aligned radix tree (SPEC §6.3) —
+    refcount integration with the Phase-4 block manager, leaf-first LRU
+    eviction of sole-owned blocks ahead of any preemption, sha256 chain
+    hashes, partial leaves for donated settled tails. COW integration:
+    reusing a partial tail leaves the next append to the existing
+    `append_tokens` copy-on-write path (previously unreachable, now the
+    hot containment path). `PrefixCacheHit` events + capability flag +
+    `Finished.cached_prompt_tokens` wired through the worker (existing
+    proto fields only; wire semantics untouched).
+  - `kiln-engine/src/ssd.rs` (SPEC §6.4): fixed-layout slabs, 64 slots
+    per file, header = magic/version/geometry/dtype/model fingerprint;
+    slot = chain hash + token ids (verified on read) + payload sha256
+    (torn slots detectable) + raw K/V bytes. Async flush on a dedicated
+    writer thread with acks (a block is readable only after its write
+    acked); write-behind capture bounded to 2 blocks per synchronous
+    step, never during a pipelined turn; idle worker drains the queue.
+    Startup index scan from headers only; strict fingerprint check =
+    silent skip + counter; LRU byte cap unlinks whole slabs. Restart
+    warm-load is lazy and hash-first during prefix walks.
+  - **Determinism hazard found and fixed mid-phase**: the e2e
+    reproducibility gate caught warm reruns diverging bitwise — a
+    sub-block remainder re-prefilled as one odd-length chunk hits
+    different kernel dispatches than the cold run's chunking, and KV
+    bits are chunk-shape dependent. Rule now enforced: a hit is either
+    **full containment** (every prefill position served, incl. partial
+    tail; nothing recomputed) or **trimmed to canonical prefill_chunk
+    boundaries** (every recomputed chunk has the cold run's exact
+    shape; causality keeps per-row bits independent of later tokens in
+    a chunk). Consequence: sub-2048-token *divergent* overlaps are not
+    served at all — resubmits/reruns (the acceptance case) get 100%
+    containment.
+  - Side task (metrics audit): gateway `/metrics` was gateway-local
+    counters only and the worker's `Stats` RPC was UNIMPLEMENTED.
+    Implemented both ends per SPEC §5/§2.3: worker `Stats` fills every
+    proto field except spec-decode + step-overhead percentiles (zeros;
+    Phase 8 / needs an in-engine reservoir); supervisor polls Stats on
+    the 1s Health cadence and re-exports per-model `kiln_worker_*`
+    gauges; python worker's UNIMPLEMENTED is skipped for that worker
+    lifetime. e2e asserts the labeled gauges appear.
+  - Config flags: engine `EngineConfig{prefix_cache, ssd}`; worker
+    `--no-prefix-cache/--ssd-dir/--ssd-max-gb`; gateway passes
+    `[defaults] ssd_tier/ssd_cache_max_gb` + `server.cache_dir` to rust
+    workers; slabs at `<cache_dir>/<weights_fingerprint>/blocks/`.
+- Decisions:
+  - Preemption suite runs `prefix_cache: false`: it pins exact
+    preemption counts and pool arithmetic that donated-but-evictable
+    blocks would shift; cache-on preemption interplay (resume
+    re-matching) is covered by the cache tests. Not a weakening — the
+    suites' assertions are unchanged.
+  - Partial tails are pool-only (not persisted): a restart therefore
+    serves containment only when the donor's settled stream covers the
+    request's last needed block — the tail chunk is hash-discoverable
+    exactly when `(p-1) % block_size == block_size - 1` or generation
+    crossed the boundary. Persisting partial slots would add slot
+    upgrade churn for a 1-in-32 restart gap; revisit if warm-restart
+    hit rates matter in practice.
+  - Leak gate (batched) now runs cache-on: preemption churn there fell
+    (3 vs 45 events — eviction absorbs pressure), which is the feature
+    working; the preemption suite retains dense preemption coverage.
+- Deviations:
+  - SPEC §6.4 says flushes ride "a dedicated tokio blocking pool";
+    kiln-engine has no tokio (the engine loop is a plain OS thread per
+    SPEC §6.2), so a dedicated writer thread + ack channel implements
+    the same contract.
+  - SPEC §6.4 says reads are "mmap + copy"; used `pread`
+    (`FileExt::read_exact_at`) — mmap requires `unsafe` outside
+    kiln-mlx, forbidden by CLAUDE.md. Same copy semantics, one syscall.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --test prefix_cache -- --nocapture
+  2k resubmit: reused 2047/2048 (100.0% skip), TTFT 1279.2ms -> 20.4ms (62.7x)
+  pipelined stop on real weights: settled 87, containment rerun reused 81,
+    divergent extension unserved, both == cold
+  SSD restart: reused 511 tokens from disk, reads 16, output bit-exact
+  corrupt slab header: ignored (rejects 1), cold run bit-exact
+  test result: ok. 1 passed (live objects back to baseline)
+  $ cargo test -p kiln-engine --test pipeline_discard -- --nocapture
+  pipelined stop: match trimmed to settled blocks; warm == cold
+  pipelined cancel: 3 generated, match 4 <= aligned settled 8
+  test result: ok. 1 passed   (fails under donation-bound mutation: verified)
+  $ cargo test -p kiln-engine   (radix_props + ssd + radix + block units)
+  lib 20 passed; block_props 2 passed; paged/pipeline_discard/radix_props/
+  sampler each ok
+  $ cargo test -p kiln-worker --test rpc -- prefix_cache_stats_and_ssd_restart
+  stats over RPC: requests_total 2, prefix_tokens_reused_total 63,
+  kv_blocks 3+509=512, ssd_writes 2; restart hit: tokens_reused 63, from_ssd
+  test result: ok
+  $ cargo test -p kiln-models --test golden -- --nocapture   (CRITICAL GATE)
+  all 5 fixtures — exact match (batched/paged engine, prefix cache on)
+  all 5 fixtures — exact match at decode width 16
+  $ cargo test -p kiln-models --test batching / preemption / leak_batched
+  all sections ok; preemption exact counts unchanged (cache off there);
+  leak gate: live objects 0 -> 0 (cache on)
+  $ cargo test --workspace -> all test targets ok (exactly as CI runs it)
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+    (incl. test_greedy_is_reproducible[rust] — the gate that caught the
+     chunk-shape divergence — and the new worker-stats re-export test)
+  $ uv run --project python/kiln_worker_py pytest -q -> 28 passed
+  $ cargo test -p kiln-models --release --test throughput -- --ignored
+  single-stream 124.4 (generate) / 124.6 (engine batch 1) tok/s
+  batch-16 aggregate: 416.0 tok/s -> 3.34x   (Phase-4 gate intact)
+  $ cargo bench -p kiln-engine --bench step_overhead
+  engine/step_overhead_batch16 time: [166.70 µs 167.30 µs 167.93 µs]
+  $ cargo run -p kiln-mlx --example smoke -> 3.0 ; proto codegen diff clean
+  $ cargo fmt --all --check -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean
+  $ cargo build --workspace --no-default-features -> clean
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- Next: PM phase gate on Phase 5 (SPEC §13.4: bench + e2e on PM
+  hardware), then Phase 6 — Qwen + Gemma models, quantization matrix,
+  `worker="auto"` routing (SPEC §12). Notes for the gate: (a) the
+  determinism rule trades sub-chunk reuse on *divergent* prefixes for
+  bit-exactness — multi-turn chat reuses nothing until the shared
+  prefix crosses `prefill_chunk` (2048); if that matters before Phase 7,
+  the options are canonical-shape re-prefill of the shared region
+  (costs compute, keeps bits) or an ADR relaxing determinism for
+  partial hits; (b) WorkerStats step-overhead percentiles are zero
+  until an in-engine reservoir exists (criterion covers the gate);
+  (c) partial tails are not persisted (see Decisions) — restart
+  containment holds when generation crossed a block boundary.
