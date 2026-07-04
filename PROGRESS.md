@@ -622,3 +622,44 @@
   ```
 - Next: Phase 4 — paged KV + continuous batching (kiln-engine core), per
   SPEC §12, pending PM phase gate.
+
+## [2026-07-04] Phase 3 / Follow-up — stop-string usage parity — DONE
+- What: closeout verification (PM request) of two properties of the
+  gateway-side stop-string path.
+  1. completion_tokens parity on stop-string matches: NOT identical before
+     this change — the rust path passed the worker's Finished count through,
+     which includes cancel-overshoot tokens (reproduced: python 7 vs rust 8
+     for identical text '1\n2\n3\n', stop=["4"]). The gateway now freezes
+     the token count at the chunk whose text completed the stop string and
+     overrides completion_tokens on matched requests — the client-visible
+     completion length, equal to the tokenizer-owning worker's count. The
+     cross-worker parity test now asserts full (content, finish_reason,
+     prompt_tokens, completion_tokens) equality for greedy AND stop-string
+     cases.
+  2. finish_reason precedence is now documented in kiln-gateway chat.rs
+     module docs (not just ledger prose): a gateway-side match always
+     reports "stop" regardless of the worker's terminal event
+     (CANCELLED/STOP/LENGTH/ERROR). The LENGTH-as-"stop" case is accepted
+     and correct, not a race bug: the client's completion was truncated at
+     the match; the worker's reason describes an uncancelled continuation
+     the client never saw; the python worker reports STOP at the same point
+     for the identical request. Usage guarantee stated alongside.
+- Decisions: usage overridden gateway-side rather than trying to stop the
+  worker synchronously — the ≤2-step cancel bound makes worker-side counts
+  inherently overshooting; the pipeline is the authority on what the client
+  saw.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ pre-fix (chat.rs stashed), strengthened test:
+  AssertionError: stop-string usage/text divergence:
+      python: ('1\n2\n3\n', 'stop', 48, 7)
+      rust:   ('1\n2\n3\n', 'stop', 48, 8)
+  $ post-fix:
+  test_greedy_outputs_identical_across_workers PASSED
+  test_streaming_text_identical_across_workers PASSED
+  test_stop_strings_work_on_both_workers PASSED
+  ============ 3 passed in 9.53s ============
+  $ cargo fmt --check / clippy -D warnings / ruff -> clean
+  ```
+- Next: unchanged — Phase 4 per SPEC §12, pending PM phase gate.
