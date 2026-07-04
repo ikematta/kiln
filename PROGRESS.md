@@ -419,3 +419,95 @@
   ```
 - Next: Phase 3 — Rust worker v0: single-request Llama (SPEC §12), pending
   PM phase gate.
+
+## [2026-07-04] Phase 3 / Rust worker v0: single-request Llama — DONE
+- What:
+  - kiln-tokenize: crate-level BOS/special-token contract doc (written
+    first, per task instruction); tokenizer.json loading + encode/decode
+    over the HF `tokenizers` crate; `ChatTemplate::render_with` for pinned
+    template vars (date_string).
+  - scripts/gen-golden.py + tests/golden/llama-3.2-1b-4bit/ (5 fixtures):
+    generated AFTER verifying the reference stack is mlx.core 0.31.1 /
+    mlx-lm 0.31.2 (ADR 0001 follow-up B1 state — the same core MLX the
+    vendored mlx-c v0.6.0 builds). Script hard-refuses any other mlx.core.
+    Fixtures pin date_string="26 Jul 2024" (Llama templates interpolate
+    strftime_now() otherwise) and compare exactly max_tokens greedy tokens,
+    no EOS stop.
+  - kiln-mlx: bindgen-generated sys bindings from the pinned headers (SPEC
+    §7.1); safe Array/Stream RAII wrappers (!Send/!Sync, Clone via
+    mlx_array_set); recording error handler replacing mlx-c's exit()-ing
+    default; debug live-object leak counter; ops/fast/random/memory wrapper
+    surface incl. quantized_matmul/dequantize, fused rms_norm/rope/SDPA;
+    mmap io module (memmap2 confined here — unsafe stays in kiln-mlx).
+  - kiln-models: Llama config.json parsing (rope_scaling default/linear/
+    llama3), mmap'd safetensors loader (sharded or single-file), Llama
+    forward ported op-for-op from mlx_lm.models.llama (quantized linear/
+    embedding, tied lm_head, Llama3RoPE freqs in the same f32 MLX graph),
+    contiguous per-layer KV cache with mlx-lm's 256-step growth,
+    generate loop with chunked prefill + async_eval pipelining.
+  - kiln-engine: sampler (§6.6) — greedy argmax; temp/top-p/top-k/min-p +
+    seeded per-request categorical (key chain from seed, no global RNG);
+    repetition/presence/frequency penalties as a logits-processor fn.
+  - Tests: golden harness (exact token-id equality, revision-checked),
+    1k-iteration leak gate, sampler behavior suite, tokenizer BOS
+    single/double proof, wrapper FFI discipline suite; release bench
+    example for the tok/s comparison.
+- Decisions:
+  - bindgen as a kiln-mlx build-dependency (SPEC §7.1 names bindgen for
+    sys.rs); generation is metal-gated so the Linux compile-check never
+    needs libclang.
+  - mmap lives in kiln-mlx::io because Mmap::map is unsafe and unsafe is
+    confined to kiln-mlx; kiln-models consumes a safe &[u8].
+  - Fixtures store generated-only token ids and both sides re-derive
+    prompt ids (template render + encode) — tokenization parity is tested
+    together with model parity.
+  - A module is quantized iff its .scales tensor exists (mlx-lm
+    class_predicate semantics); dense f16/bf16 Linear/Embedding also
+    implemented (exercised fully in Phase 6's dtype matrix).
+  - Penalties are a separate apply_penalties on raw logits (mlx-lm
+    logits-processor semantics), wired ahead of the sampler when the
+    Phase 4 per-request pipeline exists; generate() takes a sampler
+    callback on logprobs.
+- Deviations:
+  - Contiguous KvCache lives in kiln-models, not kiln-engine — it is the
+    explicitly temporary v0 cache the Phase 4 paged block manager
+    replaces; the sampler is in kiln-engine per the repo map.
+  - Per-module quantization overrides in config.json (mixed-precision
+    dicts) are not parsed; uniform group_size/bits only. Such checkpoints
+    fail loudly at load. Revisit with the Phase 6 quantization matrix.
+  - SPEC §12 Phase 3 also lists gateway-side pieces (token_ids submit
+    path via the worker protocol, incremental detok in the gateway) and
+    the kiln-worker gRPC binary — not in this task's scope per the prompt;
+    they are the Phase 3 remainder (see Next).
+- Acceptance:
+  ```
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-models --test golden -- --nocapture
+  golden chat-basic:        48 prompt tokens,  64 generated — exact match
+  golden chat-code:         47 prompt tokens, 128 generated — exact match
+  golden chat-multibyte:    51 prompt tokens,  64 generated — exact match
+  golden raw-continuation:   6 prompt tokens,  64 generated — exact match
+  golden raw-long-prefill: 249 prompt tokens,  64 generated — exact match
+  test result: ok. 1 passed (all 5 fixtures exact)
+
+  $ single-stream decode, same model/prompt/256 tokens (3 runs each):
+  mlx-lm generate: 98.2 / 100.0 / 100.2 tok/s   (median 100.0)
+  kiln  (release): 98.3 /  96.6 /  99.4 tok/s   (median 98.3)
+  -> -1.7% median (-0.8% best-vs-best), within the -10% bar.
+     Peak memory: mlx-lm 0.742 GB, kiln 0.752 GB.
+
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-models --test leak -- --nocapture
+  leak gate: 1000 decode iterations at 94.4 tok/s, live objects during run: 389
+  leak gate: mlx active memory 0B -> 0B, live objects 0 -> 0
+  test result: ok. 1 passed
+
+  $ cargo test --workspace          -> all green (incl. 22 gateway, 16 tokenize,
+                                       2 mlx, 1 engine, 5 models targets)
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo build --workspace --no-default-features -> clean (linux compile-check path)
+  $ ruff check/format python/ tests/e2e scripts/gen-golden.py -> clean
+  $ pytest python/kiln_worker_py/tests -> 9 passed, 19 skipped (no-GPU skips unchanged)
+  ```
+- Next: Phase 3 remainder — kiln-worker gRPC binary (Submit/token_ids path
+  over UDS, GetInfo/Health from the loaded model) + gateway routing to the
+  Rust worker with gateway-side tokenization and incremental detok; then
+  Phase 4 per SPEC §12.
