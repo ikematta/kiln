@@ -87,7 +87,7 @@ impl Worker for WorkerService {
             capabilities: Vec::new(),
             worker_kind: "rust".to_owned(),
             worker_version: env!("CARGO_PKG_VERSION").to_owned(),
-            kv_block_size: 0, // contiguous cache until Phase 4
+            kv_block_size: kiln_engine::DEFAULT_BLOCK_SIZE as u32,
             chat_template_hash: info.chat_template_hash.clone(),
         }))
     }
@@ -198,7 +198,7 @@ impl Worker for WorkerService {
                 prompt_tokens: prompt_ids.len() as u32,
                 prefill_chunks_estimated: prompt_ids
                     .len()
-                    .div_ceil(kiln_models::generate::PREFILL_CHUNK)
+                    .div_ceil(kiln_engine::DEFAULT_PREFILL_CHUNK)
                     as u32,
             })),
         };

@@ -1,22 +1,25 @@
-//! Single-request engine (Phase 3): one dedicated OS thread owns every MLX
-//! value — the model, the `Stream`, and all intermediate arrays (they are
-//! `!Send` by construction). gRPC handler tasks only enqueue submissions and
-//! read event channels; the continuous-batching engine replaces this loop in
-//! Phase 4 (SPEC §6.2).
+//! Worker-side engine wiring (Phase 4): one dedicated OS thread owns every
+//! MLX value — the model, the `Stream`, and kiln-engine's continuous
+//! batching loop (SPEC §6.2), which is `!Send` by construction. gRPC
+//! handler tasks only enqueue submissions and read event channels.
 //!
-//! Cancellation: `generate_with`'s per-token callback checks the cancel flag
-//! between engine steps; on the pipelined path one extra step is already
-//! scheduled — within the ≤2-step budget `Cancel` promises (SPEC §5).
+//! Requests stream concurrently now: the loop drains the submission
+//! channel between engine iterations, so new requests join the running
+//! batch at the next step. Cancellation is still flag-based (checked
+//! between steps, well inside the ≤2-step budget `Cancel` promises);
+//! proper Cancel/Drain/preemption semantics land in Phase 4 part 3.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
-use kiln_engine::{PenaltyOptions, Sampler, SamplingOptions, apply_penalties};
-use kiln_mlx::{Array, MlxError, Stream};
+use kiln_engine::{
+    Engine, EngineConfig, EngineRequest, FinishKind, PenaltyOptions, SamplingOptions, SeqEvent,
+};
+use kiln_mlx::Stream;
 use kiln_proto::v1::{
     FinishReason, Finished, MemoryReport, SamplingParams, StoppingParams, Timings, TokenChunk,
     TokenEvent, WorkerErrorCode, WorkerState, token_event,
@@ -40,9 +43,11 @@ pub struct Submission {
 }
 
 /// Cancel/finish flags shared between the gRPC side and the engine thread.
+/// `cancelled` is an `Arc` so it can be handed to the engine loop as the
+/// request's cancel flag directly.
 #[derive(Debug, Default)]
 pub struct RequestHandle {
-    pub cancelled: AtomicBool,
+    pub cancelled: Arc<AtomicBool>,
     pub finished: AtomicBool,
 }
 
@@ -59,6 +64,8 @@ pub struct Shared {
     pub requests_cancelled: AtomicU64,
     pub tokens_prefilled_total: AtomicU64,
     pub tokens_generated_total: AtomicU64,
+    pub kv_pool_allocated_bytes: AtomicU64,
+    pub kv_pool_used_bytes: AtomicU64,
     started_at: Instant,
 }
 
@@ -76,6 +83,8 @@ impl Shared {
             requests_cancelled: AtomicU64::new(0),
             tokens_prefilled_total: AtomicU64::new(0),
             tokens_generated_total: AtomicU64::new(0),
+            kv_pool_allocated_bytes: AtomicU64::new(0),
+            kv_pool_used_bytes: AtomicU64::new(0),
             started_at: Instant::now(),
         }
     }
@@ -103,8 +112,8 @@ impl Shared {
         // engine thread (no Array/Stream involved).
         MemoryReport {
             weights_bytes: self.info.weights_bytes,
-            kv_pool_allocated_bytes: 0, // no paged pool until Phase 4
-            kv_pool_used_bytes: 0,
+            kv_pool_allocated_bytes: self.kv_pool_allocated_bytes.load(Ordering::Acquire),
+            kv_pool_used_bytes: self.kv_pool_used_bytes.load(Ordering::Acquire),
             mlx_active_bytes: kiln_mlx::memory::active_memory().unwrap_or(0) as u64,
             mlx_cache_bytes: kiln_mlx::memory::cache_memory().unwrap_or(0) as u64,
             mlx_peak_bytes: kiln_mlx::memory::peak_memory().unwrap_or(0) as u64,
@@ -125,7 +134,8 @@ impl Shared {
     }
 }
 
-/// Runs on the dedicated engine thread. Owns the model + MLX stream.
+/// Runs on the dedicated engine thread. Owns the model + MLX stream +
+/// batching loop.
 pub fn engine_main(model_dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Submission>) {
     kiln_mlx::init(); // swap out mlx-c's exit()-ing error handler first
     let stream = Stream::gpu();
@@ -145,6 +155,17 @@ pub fn engine_main(model_dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Submiss
             return;
         }
     };
+    let dims = model.kv_dims();
+    // Pool sizing: EngineConfig defaults (512 blocks x 32 tokens) until
+    // memory-budget admission lands (SPEC §6.4 / §2.3, Phase 4 part 3+).
+    let mut engine = match Engine::new(model, dims, EngineConfig::default(), stream) {
+        Ok(engine) => engine,
+        Err(err) => {
+            tracing::error!(error = %err, "engine construction failed");
+            shared.set_state(WorkerState::Unhealthy, format!("engine failed: {err}"));
+            return;
+        }
+    };
     tracing::info!(
         model = %shared.model_id,
         load_ms = load_started.elapsed().as_millis() as u64,
@@ -152,21 +173,51 @@ pub fn engine_main(model_dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Submiss
     );
     shared.set_state(WorkerState::Ready, "");
 
-    while let Ok(submission) = rx.recv() {
-        shared.waiting.fetch_sub(1, Ordering::AcqRel);
-        shared.running.store(1, Ordering::Release);
-        shared.requests_total.fetch_add(1, Ordering::Relaxed);
-        run_request(&model, &eos_ids, &shared, submission, &stream);
-        shared.running.store(0, Ordering::Release);
+    'serve: loop {
+        // Block for work when idle; otherwise drain whatever queued while
+        // the last step ran, so new requests join the next iteration.
+        if engine.is_idle() {
+            match rx.recv() {
+                Ok(submission) => submit(&mut engine, &shared, &eos_ids, submission),
+                Err(_) => break 'serve, // gRPC side is gone
+            }
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(submission) => submit(&mut engine, &shared, &eos_ids, submission),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if engine.is_idle() {
+                        break 'serve;
+                    }
+                    break;
+                }
+            }
+        }
+        if let Err(err) = engine.step() {
+            // Affected requests were already failed with in-band errors and
+            // the engine reset itself; keep serving.
+            tracing::error!(error = %err, "engine step failed");
+        }
+        shared
+            .running
+            .store(engine.num_active() as u32, Ordering::Release);
+        shared
+            .kv_pool_allocated_bytes
+            .store(engine.kv_allocated_bytes(), Ordering::Release);
+        shared
+            .kv_pool_used_bytes
+            .store(engine.kv_used_bytes(), Ordering::Release);
     }
 }
 
-fn run_request(
-    model: &kiln_models::LlamaModel,
+/// Maps a proto submission onto an engine request whose event sink speaks
+/// `TokenEvent`.
+fn submit(
+    engine: &mut Engine<kiln_models::LlamaModel>,
+    shared: &Arc<Shared>,
     eos_ids: &HashSet<u32>,
-    shared: &Shared,
     submission: Submission,
-    stream: &Stream,
 ) {
     let Submission {
         request_id,
@@ -177,41 +228,24 @@ fn run_request(
         handle,
         events,
     } = submission;
-    let started_at = Instant::now();
-    let prompt_tokens = prompt_ids.len() as u32;
+    shared.waiting.fetch_sub(1, Ordering::AcqRel);
+    shared.requests_total.fetch_add(1, Ordering::Relaxed);
 
     let seed_used = if sampling.seed != 0 {
         sampling.seed
     } else {
         random_seed()
     };
-    let mut finished = Finished {
-        prompt_tokens,
-        seed_used,
-        timings: Some(Timings {
-            queued_ms: started_at.duration_since(enqueued_at).as_millis() as u64,
-            ..Timings::default()
-        }),
-        ..Finished::default()
-    };
+    let queued_ms = enqueued_at.elapsed().as_millis() as u64;
+    let prompt_tokens = prompt_ids.len() as u32;
 
-    if handle.cancelled.load(Ordering::Acquire) {
-        finished.set_finish_reason(FinishReason::Cancelled);
-        shared.requests_cancelled.fetch_add(1, Ordering::Relaxed);
-        shared.retire(&request_id);
-        let _ = events.send(TokenEvent {
-            event: Some(token_event::Event::Finished(finished)),
-        });
-        return;
-    }
-
-    let mut sampler = Sampler::new(SamplingOptions {
+    let sampling_options = SamplingOptions {
         temperature: sampling.temperature,
         top_p: sampling.top_p,
         top_k: sampling.top_k,
         min_p: sampling.min_p,
         seed: seed_used,
-    });
+    };
     let penalties = PenaltyOptions {
         // Proto: both 0.0 and 1.0 mean "disabled" for the multiplicative one.
         repetition_penalty: if sampling.repetition_penalty == 0.0 {
@@ -222,105 +256,103 @@ fn run_request(
         presence_penalty: sampling.presence_penalty,
         frequency_penalty: sampling.frequency_penalty,
     };
-    let window = if sampling.repetition_window == 0 {
+    let penalty_window = if sampling.repetition_window == 0 {
         DEFAULT_REPETITION_WINDOW
     } else {
         sampling.repetition_window as usize
     };
-    let processor = (!penalties.is_disabled()).then_some(
-        move |history: &[u32], logits: &Array, s: &Stream| -> Result<Array, MlxError> {
-            let recent = &history[history.len().saturating_sub(window)..];
-            apply_penalties(logits, recent, penalties, s)
-        },
-    );
 
-    let mut stop_ids: HashSet<u32> = stopping.stop_token_ids.iter().copied().collect();
+    let mut stop_tokens: HashSet<u32> = stopping.stop_token_ids.iter().copied().collect();
     if !stopping.ignore_eos {
-        stop_ids.extend(eos_ids);
+        stop_tokens.extend(eos_ids);
     }
 
-    let mut finish_reason = FinishReason::Length;
-    let mut matched_stop = String::new();
-    let result = kiln_models::generate_with(
-        model,
-        &prompt_ids,
-        stopping.max_tokens as usize,
-        processor,
-        |logprobs, s| sampler.sample(logprobs, s),
-        |token| {
-            if handle.cancelled.load(Ordering::Acquire) {
-                finish_reason = FinishReason::Cancelled;
-                return false;
-            }
-            if stop_ids.contains(&token) {
-                // Counted in usage but NOT chunked: the gateway detokenizes
-                // chunks verbatim, and stop text is excluded by contract.
-                finish_reason = FinishReason::Stop;
-                matched_stop = format!("token_id:{token}");
-                return false;
-            }
-            // A dead receiver means the client is gone; stop generating.
-            let sent = events.send(TokenEvent {
-                event: Some(token_event::Event::Tokens(TokenChunk {
-                    token_ids: vec![token],
-                    text: String::new(), // gateway owns detokenization
-                    chosen_logprobs: Vec::new(),
-                    top_logprobs: Vec::new(),
-                })),
-            });
-            if sent.is_err() {
-                finish_reason = FinishReason::Cancelled;
-                return false;
-            }
-            true
-        },
-        stream,
-    );
-
-    match result {
-        Ok(output) => {
-            let completion = output.tokens.len() as u32;
-            shared
-                .tokens_prefilled_total
-                .fetch_add(u64::from(prompt_tokens), Ordering::Relaxed);
-            shared
-                .tokens_generated_total
-                .fetch_add(u64::from(completion), Ordering::Relaxed);
-            if finish_reason == FinishReason::Cancelled {
-                shared.requests_cancelled.fetch_add(1, Ordering::Relaxed);
-            }
-            finished.set_finish_reason(finish_reason);
-            finished.completion_tokens = completion;
-            finished.matched_stop = matched_stop;
-            if let Some(timings) = finished.timings.as_mut() {
-                timings.prefill_ms = (output.prefill_seconds * 1000.0) as u64;
-                timings.decode_ms = (output.decode_seconds * 1000.0) as u64;
-                if output.prefill_seconds > 0.0 {
+    let shared = Arc::clone(shared);
+    let on_event = Box::new(move |event: SeqEvent| -> bool {
+        match event {
+            SeqEvent::Token(token) => events
+                .send(TokenEvent {
+                    event: Some(token_event::Event::Tokens(TokenChunk {
+                        token_ids: vec![token],
+                        text: String::new(), // gateway owns detokenization
+                        chosen_logprobs: Vec::new(),
+                        top_logprobs: Vec::new(),
+                    })),
+                })
+                .is_ok(),
+            SeqEvent::Finished(summary) => {
+                let mut finished = Finished {
+                    prompt_tokens,
+                    completion_tokens: summary.completion_tokens,
+                    seed_used,
+                    ..Finished::default()
+                };
+                match summary.reason {
+                    FinishKind::Stop => {
+                        finished.set_finish_reason(FinishReason::Stop);
+                        if let Some(token) = summary.matched_stop_token {
+                            finished.matched_stop = format!("token_id:{token}");
+                        }
+                    }
+                    FinishKind::Length => finished.set_finish_reason(FinishReason::Length),
+                    FinishKind::Cancelled => {
+                        finished.set_finish_reason(FinishReason::Cancelled);
+                        shared.requests_cancelled.fetch_add(1, Ordering::Relaxed);
+                    }
+                    FinishKind::Error => {
+                        // Malformed input or an engine fault must never kill
+                        // the worker (CLAUDE.md): errors flow in-band. Detail
+                        // stays free of prompt content (shape/op messages).
+                        let detail = summary.error.clone().unwrap_or_default();
+                        tracing::error!(request_id = %request_id, error = %detail,
+                            "generation failed");
+                        finished.set_finish_reason(FinishReason::Error);
+                        finished.set_error_code(WorkerErrorCode::WorkerErrorInternal);
+                        finished.error_detail = detail;
+                        shared.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if summary.reason != FinishKind::Error {
+                    shared
+                        .tokens_prefilled_total
+                        .fetch_add(u64::from(prompt_tokens), Ordering::Relaxed);
+                    shared
+                        .tokens_generated_total
+                        .fetch_add(u64::from(summary.completion_tokens), Ordering::Relaxed);
+                }
+                let mut timings = Timings {
+                    queued_ms,
+                    prefill_ms: (summary.prefill_seconds * 1000.0) as u64,
+                    decode_ms: (summary.decode_seconds * 1000.0) as u64,
+                    ..Timings::default()
+                };
+                if summary.prefill_seconds > 0.0 {
                     timings.prefill_tokens_per_sec =
-                        (f64::from(prompt_tokens) / output.prefill_seconds) as f32;
+                        (f64::from(prompt_tokens) / summary.prefill_seconds) as f32;
                 }
-                if output.decode_seconds > 0.0 && completion > 1 {
+                if summary.decode_seconds > 0.0 && summary.completion_tokens > 1 {
                     timings.decode_tokens_per_sec =
-                        (f64::from(completion - 1) / output.decode_seconds) as f32;
+                        (f64::from(summary.completion_tokens - 1) / summary.decode_seconds) as f32;
                 }
+                finished.timings = Some(timings);
+                shared.retire(&request_id);
+                let _ = events.send(TokenEvent {
+                    event: Some(token_event::Event::Finished(finished)),
+                });
+                true
             }
         }
-        Err(err) => {
-            // Malformed input must never kill the worker (CLAUDE.md): the
-            // installed error handler already turned the MLX fault into an
-            // Err. Full detail goes to worker logs; error_detail stays free
-            // of prompt content (shape/op messages only).
-            tracing::error!(request_id = %request_id, error = %err, "generation failed");
-            shared.requests_failed.fetch_add(1, Ordering::Relaxed);
-            finished.set_finish_reason(FinishReason::Error);
-            finished.set_error_code(WorkerErrorCode::WorkerErrorInternal);
-            finished.error_detail = err.to_string();
-        }
-    }
+    });
 
-    shared.retire(&request_id);
-    let _ = events.send(TokenEvent {
-        event: Some(token_event::Event::Finished(finished)),
+    engine.submit(EngineRequest {
+        prompt: prompt_ids,
+        max_tokens: stopping.max_tokens as usize,
+        sampling: sampling_options,
+        penalties,
+        penalty_window,
+        stop_tokens,
+        cancel: Arc::clone(&handle.cancelled),
+        on_event,
     });
 }
 

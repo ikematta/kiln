@@ -2,6 +2,14 @@
 //! Llama implementation must reproduce the committed mlx-lm reference
 //! fixtures token-for-token, exactly.
 //!
+//! Since Phase 4 the fixtures run through the continuous-batching engine
+//! (paged KV + gather-based paged attention, SPEC §6.2/§7.4 v0) — the
+//! production decode path — with the production chunk size (2048, matching
+//! mlx-lm's `prefill_step_size`). Batching and paging must not change
+//! greedy outputs (CLAUDE.md determinism), so parity here is the Phase 4
+//! acceptance gate; `tests/batching.rs` separately pins engine == Phase-3
+//! contiguous path under concurrency.
+//!
 //! Fixture semantics (mirrored from `scripts/gen-golden.py` — keep in sync):
 //! - `chat_template: true`  -> render the model's template for one user
 //!   message with `add_generation_prompt` and the pinned `date_string`,
@@ -15,11 +23,17 @@
 
 #![cfg(feature = "metal")]
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use kiln_engine::Sampler;
+use kiln_engine::{
+    Engine, EngineConfig, EngineRequest, FinishKind, PenaltyOptions, SamplingOptions, SeqEvent,
+};
 use kiln_mlx::{Stream, debug};
-use kiln_models::{LlamaModel, generate};
+use kiln_models::LlamaModel;
 use kiln_tokenize::{ChatMessage, ChatTemplate, Tokenizer};
 use minijinja::Value;
 
@@ -49,6 +63,48 @@ fn model_dir() -> Option<PathBuf> {
     let root = std::env::var_os("KILN_TEST_MODELS")?;
     let dir = PathBuf::from(root).join(MODEL_NAME);
     dir.join("config.json").is_file().then_some(dir)
+}
+
+/// Runs one greedy request through the batching engine and returns every
+/// generated token (no stop tokens, so the token stream is complete).
+fn engine_generate(
+    engine: &mut Engine<&LlamaModel>,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+) -> Vec<u32> {
+    let tokens = Rc::new(RefCell::new(Vec::new()));
+    let finish = Rc::new(RefCell::new(None));
+    let (t, f) = (Rc::clone(&tokens), Rc::clone(&finish));
+    engine.submit(EngineRequest {
+        prompt: prompt_ids.to_vec(),
+        max_tokens,
+        sampling: SamplingOptions::default(), // greedy
+        penalties: PenaltyOptions {
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+        },
+        penalty_window: 0,
+        stop_tokens: std::collections::HashSet::new(),
+        cancel: Arc::new(AtomicBool::new(false)),
+        on_event: Box::new(move |event| {
+            match event {
+                SeqEvent::Token(token) => t.borrow_mut().push(token),
+                SeqEvent::Finished(summary) => *f.borrow_mut() = Some(summary),
+            }
+            true
+        }),
+    });
+    while !engine.is_idle() {
+        engine.step().expect("engine step");
+    }
+    let summary = finish.borrow().clone().expect("request finished");
+    assert_eq!(
+        summary.reason,
+        FinishKind::Length,
+        "fixtures run to max_tokens: {summary:?}"
+    );
+    tokens.borrow().clone()
 }
 
 #[test]
@@ -82,6 +138,19 @@ fn llama_32_1b_greedy_parity_is_exact() {
         let model = LlamaModel::load(&model_dir, &stream).expect("model loads");
         let tokenizer = Tokenizer::from_model_dir(&model_dir).expect("tokenizer loads");
         let template = ChatTemplate::from_model_dir(&model_dir).expect("template loads");
+        // Production config except pool size: 256 blocks x 32 = 8192 token
+        // slots, ample for every fixture. The engine is reused across
+        // fixtures, exercising block recycling between requests.
+        let mut engine = Engine::new(
+            &model,
+            model.kv_dims(),
+            EngineConfig {
+                num_blocks: 256,
+                ..EngineConfig::default()
+            },
+            Stream::gpu(),
+        )
+        .expect("engine builds");
 
         for path in &fixture_paths {
             let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
@@ -111,25 +180,17 @@ fn llama_32_1b_greedy_parity_is_exact() {
                 tokenizer.encode(&fixture.prompt, true).expect("encodes")
             };
 
-            let mut sampler = Sampler::greedy();
-            let output = generate(
-                &model,
-                &prompt_ids,
-                fixture.max_tokens,
-                |logprobs, s| sampler.sample(logprobs, s),
-                &stream,
-            )
-            .expect("generates");
-
+            let output = engine_generate(&mut engine, &prompt_ids, fixture.max_tokens);
             assert_eq!(
-                output.tokens,
+                output,
                 fixture.expected_token_ids,
                 "greedy token divergence on fixture {name} \
                  (prompt tokens: {})",
                 prompt_ids.len()
             );
             eprintln!(
-                "golden {name}: {} prompt tokens, {} generated — exact match",
+                "golden {name}: {} prompt tokens, {} generated — exact match \
+                 (batched/paged engine)",
                 prompt_ids.len(),
                 fixture.max_tokens
             );

@@ -9,14 +9,17 @@ publish.workspace = true
 default = ["metal"]
 # Model implementations need MLX; config parsing compiles everywhere
 # (the Linux CI compile-check builds with --no-default-features).
-# kiln-engine/metal rides along for the dev-target-only sampler dependency:
-# forwarding it here (instead of forcing it on the dev-dependency) keeps
-# `clippy --all-targets --no-default-features` on the Linux lint runner from
-# feature-unifying MLX into the graph — there is no Metal or vendored
-# submodule there.
+# Forwarding kiln-engine/metal here (instead of enabling it on the
+# dependency edge) keeps `clippy --all-targets --no-default-features` on
+# the Linux lint runner from feature-unifying MLX into the graph — there
+# is no Metal or vendored submodule there.
 metal = ["kiln-mlx/metal", "kiln-engine/metal"]
 
 [dependencies]
+# Paged-KV step contract (SPEC §7.2): the model impls implement
+# kiln-engine's StepModel against PagedKv/StepBatch since Phase 4
+# (previously a dev-dependency only). Intra-workspace, no new external code.
+kiln-engine = { workspace = true, default-features = false }
 kiln-mlx = { workspace = true, default-features = false }
 serde.workspace = true
 serde_json.workspace = true
@@ -27,9 +30,6 @@ thiserror.workspace = true
 safetensors = "0.8"
 
 [dev-dependencies]
-# Tests/examples exercise the full generate path; they are gated on this
-# crate's `metal` feature, which forwards kiln-engine/metal (see [features]).
-kiln-engine.workspace = true
 kiln-tokenize.workspace = true
 minijinja.workspace = true
 serde.workspace = true
