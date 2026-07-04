@@ -48,3 +48,20 @@ for greedy decoding. Golden-parity fixtures (SPEC §11.2) are generated from
 mlx-lm as the reference — if patch-level drift ever surfaces as a fixture
 mismatch, reconcile the pins (quarterly mlx-c bump task) rather than relaxing
 the parity bar.
+
+## Follow-up (2026-07-03, later): drift resolved via option B1
+
+Appended at explicit PM instruction. The drift recorded in the addendum above
+is resolved: `kiln_worker_py` now pins `mlx-lm==0.31.2` plus an explicit
+`mlx==0.31.1`, so **both workers share core MLX v0.31.1** (verified:
+`import mlx.core` in the worker venv prints `0.31.1`; full worker test suite
+green on the downgraded stack; no worker code depended on 0.31.3-only
+mlx-lm APIs). The addendum's cross-worker parity caveat no longer applies
+while these pins hold.
+
+Standing plan (option C1 from the 2026-07-03 PROGRESS.md investigation):
+when mlx-c tags its next release (its main branch already regenerates
+bindings for MLX 0.31.2), bump the submodule via the quarterly process above
+and return mlx-lm/mlx to current — as one change, with a full golden re-run.
+Revisit these pins before any future golden-fixture regeneration; fixtures
+must always be generated on the same core MLX version kiln-mlx builds.
