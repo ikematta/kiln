@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import pathlib
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -185,7 +186,16 @@ key_hash = "{key_hash}"
         except subprocess.TimeoutExpired:
             gateway.kill()
             gateway.wait(timeout=10)
+        time.sleep(0.5)  # let the supervisor's group-kill land
+        leaked = stack.worker_pids()
+        for pid in leaked:  # never leave strays behind, even when failing
+            os.kill(pid, signal.SIGKILL)
         shutil.rmtree(runtime_dir, ignore_errors=True)
+        if leaked:
+            pytest.fail(
+                f"gateway shutdown leaked worker processes {leaked}; the "
+                "supervisor must kill the whole worker process group"
+            )
 
 
 @pytest.fixture(scope="session")

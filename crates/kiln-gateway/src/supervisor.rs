@@ -160,7 +160,10 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
     };
     forward_output(child.stdout.take(), &entry.id, "stdout");
     forward_output(child.stderr.take(), &entry.id, "stderr");
-    tracing::info!(model = %entry.id, pid = child.id(),
+    // Saved up front: after child.wait() reaps, child.id() is None, but the
+    // process group (wrapper + python) may still need sweeping.
+    let pgid = child.id();
+    tracing::info!(model = %entry.id, pid = pgid,
         socket = %entry.socket_path.display(), "worker spawned");
 
     let mut client = WorkerClient::new(entry.channel.clone());
@@ -174,16 +177,17 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
             status = child.wait() => {
                 tracing::error!(model = %entry.id, status = ?status.ok(),
                     "worker exited while loading");
+                kill_group(pgid, &entry.id).await;
                 return RunExit::Crashed { ready_for: None };
             }
             _ = wait_shutdown(&mut ctx.shutdown) => {
-                kill_and_reap(&mut child, &entry.id).await;
+                kill_and_reap(&mut child, pgid, &entry.id).await;
                 return RunExit::Shutdown;
             }
             _ = poll.tick() => {
                 if Instant::now() > load_deadline {
                     tracing::error!(model = %entry.id, "worker never reached READY; recycling");
-                    kill_and_reap(&mut child, &entry.id).await;
+                    kill_and_reap(&mut child, pgid, &entry.id).await;
                     return RunExit::Crashed { ready_for: None };
                 }
                 // A failed call means the socket is not up yet (or timed
@@ -195,7 +199,7 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
                         WorkerState::Unhealthy => {
                             tracing::error!(model = %entry.id,
                                 "worker reported UNHEALTHY during load (model load failed?); recycling");
-                            kill_and_reap(&mut child, &entry.id).await;
+                            kill_and_reap(&mut child, pgid, &entry.id).await;
                             return RunExit::Crashed { ready_for: None };
                         }
                         _ => {} // Loading — keep waiting.
@@ -221,10 +225,11 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
         tokio::select! {
             status = child.wait() => {
                 tracing::error!(model = %entry.id, status = ?status.ok(), "worker process exited");
+                kill_group(pgid, &entry.id).await;
                 return RunExit::Crashed { ready_for: Some(ready_at.elapsed()) };
             }
             _ = wait_shutdown(&mut ctx.shutdown) => {
-                kill_and_reap(&mut child, &entry.id).await;
+                kill_and_reap(&mut child, pgid, &entry.id).await;
                 return RunExit::Shutdown;
             }
             _ = poll.tick() => {
@@ -234,7 +239,7 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
                         if status.state() == WorkerState::Unhealthy {
                             tracing::error!(model = %entry.id, detail = %status.detail,
                                 "worker self-reported UNHEALTHY; recycling");
-                            kill_and_reap(&mut child, &entry.id).await;
+                            kill_and_reap(&mut child, pgid, &entry.id).await;
                             return RunExit::Crashed { ready_for: Some(ready_at.elapsed()) };
                         }
                         last_ok = Instant::now();
@@ -244,7 +249,7 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
                             tracing::error!(model = %entry.id,
                                 silent_ms = last_ok.elapsed().as_millis() as u64,
                                 "worker missed health deadline; recycling");
-                            kill_and_reap(&mut child, &entry.id).await;
+                            kill_and_reap(&mut child, pgid, &entry.id).await;
                             return RunExit::Crashed { ready_for: Some(ready_at.elapsed()) };
                         }
                     }
@@ -267,6 +272,10 @@ fn spawn_worker(ctx: &SuperviseCtx) -> std::io::Result<Child> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Own process group (pgid = child pid): the configured argv may be a
+        // wrapper (the default `uv run` is), so kills must target the whole
+        // group or the actual python worker survives as an orphan.
+        .process_group(0)
         // Safety net: never leave an orphaned worker if the gateway dies.
         .kill_on_drop(true);
     cmd.spawn()
@@ -314,15 +323,38 @@ async fn refresh_info(ctx: &SuperviseCtx, client: &mut WorkerClient<tonic::trans
     }
 }
 
-async fn kill_and_reap(child: &mut Child, model: &str) {
+async fn kill_and_reap(child: &mut Child, pgid: Option<u32>, model: &str) {
     // Phase 2 shutdown is SIGKILL; graceful Drain+SIGTERM arrives with
     // eviction in Phase 9 (SPEC §2.2). The worker holds no durable state yet.
+    kill_group(pgid, model).await;
     if let Err(err) = child.start_kill()
         && err.kind() != std::io::ErrorKind::InvalidInput
     {
         tracing::warn!(model = %model, error = %err, "failed to kill worker");
     }
     let _ = child.wait().await;
+}
+
+/// SIGKILLs the worker's whole process group (pgid == spawned pid, via
+/// `process_group(0)`). The configured argv may be a wrapper — the default
+/// `uv run` is — so killing only the direct child would orphan the
+/// model-loaded python process underneath. `/bin/kill` is shelled out to
+/// because signaling a pgid needs `libc::kill`, and unsafe code is confined
+/// to kiln-mlx (CLAUDE.md).
+async fn kill_group(pgid: Option<u32>, model: &str) {
+    let Some(pgid) = pgid else { return };
+    match Command::new("/bin/kill")
+        .args(["-9", "--", &format!("-{pgid}")])
+        .status()
+        .await
+    {
+        Ok(status) if status.success() => {}
+        // Non-zero usually means the group is already fully dead — the
+        // normal case after a clean worker crash.
+        Ok(_) => tracing::debug!(model = %model, pgid, "process group already gone"),
+        Err(err) => tracing::warn!(model = %model, pgid, error = %err,
+            "failed to run /bin/kill for process group"),
+    }
 }
 
 async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
