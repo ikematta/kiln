@@ -6,9 +6,24 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+argon2.workspace = true
+async-stream.workspace = true
+axum.workspace = true
 figment.workspace = true
+hyper-util.workspace = true
+kiln-proto.workspace = true
+kiln-tokenize.workspace = true
+prometheus.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 figment = { workspace = true, features = ["test"] }

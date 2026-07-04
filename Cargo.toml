@@ -38,3 +38,20 @@ minijinja-contrib = { version = "2", default-features = false, features = ["pyco
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_json = "1"
 sha2 = "0.10"
+# Gateway (SPEC §3, §8): axum/tower/tokio HTTP+async stack, hyper-util for the
+# tokio<->hyper IO bridge in the UDS gRPC connector, tracing(+subscriber) for
+# structured JSON logs, prometheus for /metrics, uuid v7 request ids, argon2
+# for API keys hashed at rest, async-stream for SSE translation streams.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "time", "io-util", "sync", "fs"] }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus = { version = "0.14", default-features = false }
+uuid = { version = "1", features = ["v7"] }
+argon2 = "0.5"
+async-stream = "0.3"
+# Intra-workspace crates.
+kiln-proto = { path = "crates/kiln-proto" }
+kiln-tokenize = { path = "crates/kiln-tokenize" }
