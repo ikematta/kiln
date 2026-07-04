@@ -698,3 +698,59 @@
   ```
 - Next: unchanged — Phase 4 pending PM phase gate; PR #1 merge is the PM's
   call after this review.
+
+## [2026-07-04] Phase 4 / part 1/4 — block manager (§6.3) — DONE
+- What:
+  - crates/kiln-engine/src/block.rs: paged-KV block manager as a standalone
+    unit — fixed block pool (power-of-two block size) with LIFO free list,
+    per-block refcounts, allocate/retain/release, and copy_on_write: sole
+    owner → write in place; shared → caller's ownership moves to a fresh
+    block plus a (src, dst) copy instruction; a shared block is never
+    handed out writable. BlockTable maps request token positions → block
+    indices: append_tokens (allocates fresh blocks, COWs a shared partial
+    tail, atomic on OutOfBlocks), fork (retain-all with rollback on
+    failure), explicit release. No MLX types, no model/worker wiring; the
+    module is feature-ungated so the Linux --no-default-features check
+    compiles and lints it.
+  - tests: inline unit tests (constructor validation, allocation order and
+    exhaustion, refcount lifecycle, foreign-id rejection, COW edge cases,
+    table append/fork/release incl. atomicity); model-based proptest suite
+    in tests/block_props.rs — a manager model and a table model run random
+    op sequences against shadow state, asserting after every op: a block is
+    never double-issued while owned, refcounts equal owner counts and hit 0
+    exactly at the last release, and COW never mutates a shared block
+    (every owner's content view survives sibling writes; read-back through
+    each table stays exact). 4096-case extended variants are #[ignore]d per
+    the CLAUDE.md `-- --ignored` convention for slow property tests.
+  - deps: proptest 1 added as a workspace-managed dev-dependency of
+    kiln-engine (rationale in commit message).
+- Decisions:
+  - The manager holds no KV data: COW returns a copy instruction for the
+    engine's physical per-layer pools (arriving later in Phase 4), keeping
+    this unit MLX-free and exhaustively testable.
+  - BlockTable does not auto-release on Drop (it holds no manager handle);
+    request teardown owns the release. #[must_use] flags accidental drops.
+  - Refcount 0 puts a block straight on the free list; §6.2's "return to
+    prefix cache, not freed" is Phase 5's radix tree holding its own
+    refcount — no cached/evictable state belongs in the manager.
+  - LIFO free list, deterministic issue order — block placement is
+    reproducible run-to-run, in line with the greedy determinism gate.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-engine                       (default features)
+  block::tests ......... 11 passed (unit suite)
+  block_props .......... manager_model ok, table_model ok; 2 passed,
+                         2 ignored (extended) in 1.19s
+  sampler_behavior ..... ok (unchanged)
+  $ cargo test -p kiln-engine --test block_props -- --ignored
+  manager_model_extended ok, table_model_extended ok   (4096 cases each,
+  2 passed in 17.99s)
+  $ cargo test -p kiln-engine --no-default-features -> same block suite green
+  $ cargo fmt --check -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean
+  ```
+- Next: Phase 4 part 2/4 (await prompt) — per SPEC §12 presumably the
+  gather-based paged attention v0 (§7.4) wiring block tables to per-layer
+  K/V pools.
