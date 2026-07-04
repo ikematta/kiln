@@ -274,6 +274,17 @@ fn batched_greedy_matches_single_stream() {
             let (second, (second_tokens, second_finish)) = request_pair(filler, 24);
             engine.submit(first);
             engine.submit(second);
+            // Direct successor of the pre-preemption "loser should fail
+            // mid-decode, not at submit" check: the pressure event must
+            // land mid-stream, after the loser already emitted tokens.
+            while engine.preemptions() == 0 {
+                assert!(!engine.is_idle(), "drained without any preemption");
+                engine.step().expect("engine step");
+            }
+            assert!(
+                !second_tokens.borrow().is_empty(),
+                "loser should be preempted mid-decode, not before streaming"
+            );
             drain(&mut engine);
             let first_summary = first_finish.borrow().clone().expect("finished");
             let second_summary = second_finish.borrow().clone().expect("finished");

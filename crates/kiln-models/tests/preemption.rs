@@ -154,7 +154,7 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
 
         let text = "Paged attention splits the key-value cache into fixed-size blocks. ".repeat(24);
         let ids = tokenizer.encode(&text, true).expect("encodes");
-        assert!(ids.len() >= 133, "need enough tokens to slice prompts");
+        assert!(ids.len() >= 283, "need enough tokens to slice prompts");
         // Senior request: 100-token prompt growing to 160 slots (5 blocks).
         let senior = &ids[..100];
         // Junior request: 33-token prompt growing to 81 slots (3 blocks).
@@ -363,6 +363,151 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
             );
         }
         eprintln!("golden chat-code under preemption: exact match after resume");
+
+        // 5) Sustained pressure: a BATCH request outcompeted by a stream
+        //    of younger INTERACTIVE arrivals is preempted on every cycle
+        //    but never starved — arrivals are finite, seniority is stable,
+        //    and it resumes onto its solo stream (drain()'s MAX_STEPS
+        //    guard is the liveness bound).
+        {
+            let mut engine = new_engine(&model, squeeze);
+            let (b, b_out) = request(senior, 60, Priority::Batch);
+            let (i1, i1_out) = request(junior, 48, Priority::Interactive);
+            engine.submit(b);
+            engine.submit(i1);
+            let mut steps = 0;
+            while engine.preemptions() == 0 {
+                assert!(steps < MAX_STEPS, "scenario never preempted");
+                engine.step().expect("engine step");
+                steps += 1;
+            }
+            assert!(
+                b_out.finish.borrow().is_none(),
+                "BATCH request finished instead of yielding"
+            );
+            // Second younger INTERACTIVE arrival while the BATCH request
+            // sits preempted: it forces a second cycle after the resume.
+            let (i2, i2_out) = request(junior, 48, Priority::Interactive);
+            engine.submit(i2);
+            drain(&mut engine);
+            let b_summary = b_out.summary();
+            assert_eq!(b_summary.reason, FinishKind::Length);
+            assert!(
+                b_summary.preemptions >= 2,
+                "sustained pressure should preempt the BATCH request on \
+                 every cycle: {b_summary:?}"
+            );
+            assert_eq!(
+                b_out.tokens(),
+                solo_senior,
+                "twice-preempted request did not resume onto its solo stream"
+            );
+            for (name, out) in [("i1", &i1_out), ("i2", &i2_out)] {
+                let summary = out.summary();
+                assert_eq!(summary.reason, FinishKind::Length, "{name}");
+                assert_eq!(summary.preemptions, 0, "{name} must not be preempted");
+                assert_eq!(out.tokens(), solo_junior, "{name} stream diverged");
+            }
+        }
+        eprintln!("double preemption under sustained pressure: resumed bit-exact both times");
+
+        // 6) Arrival seniority is stable across preemption: after J is
+        //    preempted and resumes, a younger equal-priority K must be
+        //    the next victim — a (buggy) arrival renewed on re-admission
+        //    would mark J newest and victimize it again.
+        {
+            let kprompt = &ids[133..198]; // 65 tokens; grows to 113 slots (4 blocks)
+            let solo_k = solo(&model, squeeze, kprompt, 48);
+            let mut engine = new_engine(&model, squeeze);
+            let (a, a_out) = request(senior, 60, Priority::Interactive);
+            let (j, j_out) = request(junior, 48, Priority::Interactive);
+            engine.submit(a);
+            engine.submit(j);
+            // Cycle 1: A's growth preempts J (most recent). Run A out.
+            let mut steps = 0;
+            while a_out.finish.borrow().is_none() {
+                assert!(steps < MAX_STEPS, "senior never finished");
+                engine.step().expect("engine step");
+                steps += 1;
+            }
+            assert!(engine.preemptions() >= 1, "cycle 1 never preempted J");
+            assert!(j_out.finish.borrow().is_none(), "J finished prematurely");
+            // J resumes now; K arrives younger. When the pool fills again
+            // the victim must be K, not the once-preempted J.
+            let (k, k_out) = request(kprompt, 48, Priority::Interactive);
+            engine.submit(k);
+            drain(&mut engine);
+            let (j_summary, k_summary) = (j_out.summary(), k_out.summary());
+            assert_eq!(j_summary.reason, FinishKind::Length);
+            assert_eq!(k_summary.reason, FinishKind::Length);
+            assert_eq!(
+                j_summary.preemptions, 1,
+                "J's seniority must survive its resume — the younger K is \
+                 the next victim: {j_summary:?}"
+            );
+            assert!(
+                k_summary.preemptions >= 1,
+                "pressure between J and K never landed (resize the scenario): {k_summary:?}"
+            );
+            assert_eq!(a_out.tokens(), solo_senior, "senior stream diverged");
+            assert_eq!(j_out.tokens(), solo_junior, "J stream diverged");
+            assert_eq!(k_out.tokens(), solo_k, "K stream diverged");
+        }
+        eprintln!("arrival seniority stable across resume: younger K preempted, J untouched");
+
+        // 7) Preemption mid-prefill: with a small prefill chunk the junior
+        //    is still PREFILLING (zero tokens streamed) when the pool
+        //    fills; it must rewind to WAITING and later re-prefill from
+        //    scratch onto its solo stream.
+        {
+            // Pool 9 = 288 slots; chunk 8 stretches the junior's 149-token
+            // prefill across 19 iterations. The 120-token senior needs its
+            // 5th block 10 decode steps in — inside that window — so the
+            // junior's own chunk 17 (slot 129, its 5th block) finds the
+            // pool full at 128/149 prompt tokens processed.
+            let chunked = EngineConfig {
+                num_blocks: 9,
+                prefill_chunk: 8,
+                ..EngineConfig::default()
+            };
+            let a7prompt = &ids[..120]; // 120 tokens -> 180 slots total
+            let jprompt = &ids[133..283]; // 150 tokens -> 174 slots total
+            let solo_chunk_senior = solo(&model, chunked, a7prompt, 60);
+            let solo_chunk_j = solo(&model, chunked, jprompt, 24);
+            let mut engine = new_engine(&model, chunked);
+            let (a, a_out) = request(a7prompt, 60, Priority::Interactive);
+            let (j, j_out) = request(jprompt, 24, Priority::Interactive);
+            engine.submit(a);
+            engine.submit(j);
+            let mut steps = 0;
+            while engine.preemptions() == 0 {
+                assert!(steps < MAX_STEPS, "scenario never preempted");
+                assert!(!engine.is_idle(), "drained without preempting");
+                engine.step().expect("engine step");
+                steps += 1;
+            }
+            assert!(
+                j_out.tokens.borrow().is_empty(),
+                "junior should be preempted mid-prefill, before any token"
+            );
+            drain(&mut engine);
+            let (a_summary, j_summary) = (a_out.summary(), j_out.summary());
+            assert_eq!(a_summary.reason, FinishKind::Length);
+            assert_eq!(j_summary.reason, FinishKind::Length);
+            assert_eq!(a_summary.preemptions, 0, "senior must not be preempted");
+            assert!(j_summary.preemptions >= 1, "junior was never preempted");
+            assert_eq!(
+                a_out.tokens(),
+                solo_chunk_senior,
+                "senior stream diverged under mid-prefill preemption"
+            );
+            assert_eq!(
+                j_out.tokens(),
+                solo_chunk_j,
+                "mid-prefill preempted request did not re-prefill onto its solo stream"
+            );
+        }
+        eprintln!("mid-prefill preemption: junior re-prefilled from scratch, bit-exact");
     }
     assert_eq!(
         debug::live_objects(),
