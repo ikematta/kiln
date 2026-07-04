@@ -24,8 +24,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --project python/kiln_worker_py
-      - run: uv run --project python/kiln_worker_py ruff check python/
-      - run: uv run --project python/kiln_worker_py ruff format --check python/
+      - run: uv run --project python/kiln_worker_py ruff check python/ tests/e2e
+      - run: uv run --project python/kiln_worker_py ruff format --check python/ tests/e2e
 
   # Linux compile-check without Metal (SPEC §3): no mlx-c build.
   compile-linux:
@@ -88,3 +88,8 @@ jobs:
         run: |
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
           uv run --project python/kiln_worker_py pytest python/kiln_worker_py/tests -v
+      - run: uv sync --project tests/e2e
+      - name: E2E suite (gateway + python worker, openai SDK)
+        run: |
+          export KILN_TEST_MODELS="$HOME/.kiln/test-models"
+          uv run --project tests/e2e pytest tests/e2e -v

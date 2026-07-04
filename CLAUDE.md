@@ -51,7 +51,7 @@ file and SPEC.md conflict, SPEC.md wins; flag the conflict in PROGRESS.md.
   outputs — several tests assert exactly this; treat a violation as a correctness
   bug in your change, not in the test.
 - Formatting/lint gates: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`,
-  `ruff check python/`, `ruff format --check python/`. Run before every commit.
+  `ruff check python/ tests/e2e`, `ruff format --check python/ tests/e2e`. Run before every commit.
 - Commits: small, one logical change, imperative subject, body explains why.
   Reference the phase/task, e.g. `P4: block manager COW path (task 4.2)`.
 
@@ -77,7 +77,7 @@ cargo test --workspace                           # unit + integration (Metal tes
 cargo test -p kiln-engine -- --ignored           # property tests (slow)
 cargo test -p kiln-models --test golden          # golden-token parity harness
 pytest python/kiln_worker_py/tests               # python worker unit tests
-pytest tests/e2e                                 # black-box HTTP tests (starts a full stack)
+uv run --project tests/e2e pytest tests/e2e     # black-box HTTP tests (full stack; `uv sync --project tests/e2e` once)
 
 # Benchmarks & soak
 cargo bench -p kiln-engine                       # criterion: step overhead, block mgr
