@@ -32,8 +32,25 @@
 //! streamed before the preemption; `tests/preemption.rs` in kiln-models
 //! asserts a preempted request resumes onto the identical token stream.
 //!
-//! Out of scope until Phase 4 part 4: the async_eval decode pipeline and
-//! the step-overhead criterion bench.
+//! Decode pipelining (SPEC §6.2, the async_eval pipeline of
+//! `generate.rs` lifted to the batch): a steady-state pure-decode step
+//! defers its token readback — the next step's forward is built feeding
+//! the previous step's *still-lazy* sampled arrays and scheduled with
+//! `async_eval` before the previous tokens are read, so host-side graph
+//! construction overlaps GPU execution. The pipeline engages only when
+//! every running sequence is sampling with penalties off, nothing is
+//! waiting, no cancel flag is up, and the next single-token appends
+//! provably fit the pool — prefill, replay, admission, preemption, and
+//! capacity decisions always run on the synchronous path with fully
+//! applied state, so scheduling semantics (victim choice, seniority,
+//! admission projection) are identical to the unpipelined engine. A
+//! sequence that stops mid-pipeline has one speculative row in flight;
+//! its readback is discarded and its KV write lands in blocks the
+//! sequence owned at build time — releasing them is safe because a
+//! future owner rewrites every row below its own length and gathers are
+//! trimmed to that length (see `PagedKv::gather`), but NOTE for Phase 5:
+//! radix sharing must re-review this invariant before blocks with a
+//! stale speculative tail row can enter the prefix cache.
 
 use std::cmp::Reverse;
 use std::collections::{HashSet, VecDeque};
@@ -41,13 +58,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use kiln_mlx::{Array, MlxError, Stream, eval, memory, ops};
+use kiln_mlx::{Array, MlxError, Stream, async_eval, eval, memory, ops};
 use thiserror::Error;
 
 use crate::block::{BlockError, BlockManager, BlockTable};
 use crate::paged::{KvSpec, PagedKv, WriteRun};
 use crate::sampler::{PenaltyOptions, Sampler, SamplingOptions, apply_penalties};
-use crate::step::{SeqStep, StepBatch, StepModel};
+use crate::step::{SeqStep, StepBatch, StepInput, StepModel};
 
 /// SPEC §10 `[defaults]` block_size.
 pub const DEFAULT_BLOCK_SIZE: usize = 32;
@@ -289,6 +306,66 @@ struct DecodePlan {
     step: SeqStep,
 }
 
+/// One scheduled-but-unread decode step: forward and sampling graphs are
+/// queued on the stream via `async_eval`; the sampled token values are
+/// not host-visible yet, and all per-sequence bookkeeping (history push,
+/// emission, stop checks) is deferred to the apply at the start of the
+/// next `step()` call.
+struct InFlight {
+    /// `(arrival, sampled token [1] u32)` in plan order. Arrival ids are
+    /// unique and survive `running` mutations between build and apply.
+    rows: Vec<(u64, Array)>,
+}
+
+/// Last-position logits row -> sampled token `[1]` u32 (the SPEC §6.2
+/// step-3 tail: penalties over the recent window, logprob-normalize,
+/// sample). Shared by the synchronous and pipelined paths; the pipelined
+/// path only ever calls it with penalties disabled, so both build the
+/// identical op graph.
+fn sample_from_row(
+    seq: &mut Seq,
+    logits: &Array,
+    row: i32,
+    s: &Stream,
+) -> Result<Array, EngineError> {
+    let vocab = logits.dim(2);
+    let last = ops::slice(logits, &[0, row, 0], &[1, row + 1, vocab], s)?;
+    let mut last = ops::reshape(&last, &[1, vocab], s)?;
+    if !seq.penalties.is_disabled() {
+        let window = seq.history.len().saturating_sub(seq.penalty_window);
+        last = apply_penalties(&last, &seq.history[window..], seq.penalties, s)?;
+    }
+    let logprobs = ops::subtract(&last, &ops::logsumexp(&last, true, s)?, s)?;
+    Ok(seq.sampler.sample(&logprobs, s)?)
+}
+
+/// Applies one read-back sampled token to its sequence: cursor advance,
+/// then the cancel/stop/emission/length checks (SPEC §6.2 steps 3-4).
+/// Identical on the synchronous and pipelined paths — only *when* it
+/// runs differs (immediately vs at the next `step()` call).
+fn settle_sampled(seq: &mut Seq, mgr: &mut BlockManager, token: u32) {
+    if seq.finished {
+        return;
+    }
+    if seq.first_token_at.is_none() {
+        seq.first_token_at = Some(Instant::now());
+    }
+    seq.generated += 1;
+    seq.history.push(token);
+    seq.fed += 1;
+    if seq.cancel.load(Ordering::Acquire) {
+        finish(seq, mgr, FinishKind::Cancelled, None, None);
+    } else if seq.stop_tokens.contains(&token) {
+        // Counted in usage but not emitted: stop text is excluded from
+        // the stream by contract.
+        finish(seq, mgr, FinishKind::Stop, Some(token), None);
+    } else if !(seq.on_event)(SeqEvent::Token(token)) {
+        finish(seq, mgr, FinishKind::Cancelled, None, None);
+    } else if seq.generated as usize >= seq.max_tokens {
+        finish(seq, mgr, FinishKind::Length, None, None);
+    }
+}
+
 /// The continuous-batching engine. Single-threaded by construction: it
 /// owns the `Stream` (`!Send`), so the whole engine is confined to the
 /// thread that created it (SPEC §6.2).
@@ -302,6 +379,9 @@ pub struct Engine<M> {
     /// numbers and preempted requests re-insert in order.
     waiting: VecDeque<Seq>,
     running: Vec<Seq>,
+    /// The scheduled-but-unread decode step, when pipelining (never
+    /// `Some` while the synchronous path plans/preempts/admits).
+    inflight: Option<InFlight>,
     next_arrival: u64,
     preemptions_total: u64,
     iterations: u64,
@@ -348,6 +428,7 @@ impl<M: StepModel> Engine<M> {
             kv,
             waiting: VecDeque::new(),
             running: Vec::new(),
+            inflight: None,
             next_arrival: 0,
             preemptions_total: 0,
             iterations: 0,
@@ -471,6 +552,19 @@ impl<M: StepModel> Engine<M> {
     /// One SPEC §6.2 iteration. On `Err` every in-flight request has been
     /// failed and the pools reset; the engine stays usable.
     pub fn step(&mut self) -> Result<(), EngineError> {
+        if let Some(prev) = self.inflight.take() {
+            match self.pipelined_turn(prev) {
+                // A new step is in flight; the turn is complete.
+                Ok(true) => return Ok(()),
+                // Pipeline drained (readback applied); fall through to
+                // the synchronous path on fully-applied state.
+                Ok(false) => {}
+                Err(err) => {
+                    self.fail_all(&err.to_string());
+                    return Err(err);
+                }
+            }
+        }
         self.sweep_cancelled();
         self.admit();
         if self.running.is_empty() {
@@ -483,6 +577,146 @@ impl<M: StepModel> Engine<M> {
                 Err(err)
             }
         }
+    }
+
+    /// One pipelined turn: schedule the next pure-decode step from the
+    /// still-unread sampled tokens (the pipeline win — graph build
+    /// overlaps the GPU executing `prev`), then read `prev` back and
+    /// settle it. Returns whether a new step is now in flight; `false`
+    /// hands control back to the synchronous path, where admission,
+    /// prefill, replay, and preemption live.
+    fn pipelined_turn(&mut self, prev: InFlight) -> Result<bool, EngineError> {
+        let next = if self.pipeline_ok() {
+            self.build_pipelined(&prev)?
+        } else {
+            None
+        };
+        self.apply_inflight(prev)?;
+        let Some(mut next) = next else {
+            return Ok(false);
+        };
+        // Sequences that stopped or were cancelled at the apply have one
+        // speculative row in flight: drop it unread. Its compute is dead
+        // graph and its KV write went to blocks the sequence owned at
+        // build time (safe to release, see the module docs).
+        next.rows
+            .retain(|(arrival, _)| self.running.iter().any(|seq| seq.arrival == *arrival));
+        self.inflight = (!next.rows.is_empty()).then_some(next);
+        Ok(true)
+    }
+
+    /// The async_eval pipeline may only span steady-state decode: every
+    /// running sequence sampling, penalties off (their windows need the
+    /// previous token host-side), nothing waiting (admission and prefill
+    /// want fresh pool state), no cancel pending (the sweep runs on the
+    /// synchronous path). Capacity is checked exactly in
+    /// `build_pipelined`.
+    fn pipeline_ok(&self) -> bool {
+        self.waiting.is_empty()
+            && self.running.iter().all(|seq| {
+                seq.decoding() && seq.penalties.is_disabled() && !seq.cancel.load(Ordering::Acquire)
+            })
+    }
+
+    /// Builds and schedules the next decode step feeding `prev`'s
+    /// still-lazy sampled tokens. Returns `None` (no table slot touched)
+    /// when the step should run synchronously instead: a sequence
+    /// vanished, everyone is finishing, or the appends would not fit —
+    /// preemption stays a synchronous-path decision.
+    fn build_pipelined(&mut self, prev: &InFlight) -> Result<Option<InFlight>, EngineError> {
+        // Pass 1 (read-only): which rows continue, and do their appends
+        // provably fit? Never append a slot the step might not execute —
+        // an unexecuted slot would desync `table` from the KV it claims.
+        let block_size = self.mgr.block_size();
+        let mut included: Vec<(usize, &Array)> = Vec::with_capacity(prev.rows.len());
+        let mut new_blocks = 0;
+        for (arrival, pending) in &prev.rows {
+            let Some(i) = self.running.iter().position(|seq| seq.arrival == *arrival) else {
+                return Ok(None);
+            };
+            let seq = &self.running[i];
+            if seq.generated as usize + 1 >= seq.max_tokens {
+                // Its final token is in `prev`; it finishes at the apply
+                // (mirrors generate.rs's `i + 1 < max_tokens` guard).
+                continue;
+            }
+            if seq.table.num_tokens() == seq.table.blocks().len() * block_size {
+                new_blocks += 1;
+            }
+            included.push((i, pending));
+        }
+        if included.is_empty() || self.mgr.num_free() < new_blocks {
+            return Ok(None);
+        }
+
+        // Pass 2: append the slots and build the step. Inputs are the
+        // pending `[1]` arrays reshaped and concatenated to `[1, n]`.
+        self.iterations += 1;
+        let mut seqs = Vec::with_capacity(included.len());
+        let mut inputs = Vec::with_capacity(included.len());
+        for &(i, pending) in &included {
+            let step = build_seq_step(
+                &mut self.running[i],
+                &mut self.mgr,
+                &mut self.kv,
+                1,
+                true,
+                &self.stream,
+            )?
+            .ok_or_else(|| MlxError {
+                message: "pipelined append exceeded the precounted pool".to_owned(),
+            })?;
+            seqs.push(step);
+            inputs.push(ops::reshape(pending, &[1, 1], &self.stream)?);
+        }
+        let refs: Vec<&Array> = inputs.iter().collect();
+        let input = ops::concatenate(&refs, 1, &self.stream)?;
+        let batch = StepBatch {
+            input: StepInput::Lazy(input),
+            seqs,
+        };
+        let logits = self
+            .model
+            .forward_step(&batch, &mut self.kv, &self.stream)?
+            .ok_or_else(|| MlxError {
+                message: "pipelined decode returned no logits".to_owned(),
+            })?;
+        let mut rows = Vec::with_capacity(included.len());
+        for (row, &(i, _)) in included.iter().enumerate() {
+            let seq = &mut self.running[i];
+            debug_assert!(
+                seq.penalties.is_disabled(),
+                "pipeline_ok admitted penalties"
+            );
+            let token = sample_from_row(seq, &logits, row as i32, &self.stream)?;
+            rows.push((seq.arrival, token));
+        }
+        {
+            let outputs: Vec<&Array> = rows.iter().map(|(_, token)| token).collect();
+            // Sampled tokens only: every row samples, so each sequence's
+            // KV write is an ancestor of its token; the pool handles stay
+            // solely on the write chain and keep their donation.
+            async_eval(&outputs)?;
+        }
+        Ok(Some(InFlight { rows }))
+    }
+
+    /// Reads back a scheduled step and settles it: emission, stop/cancel
+    /// checks, finishes, and the maintenance cadence.
+    fn apply_inflight(&mut self, prev: InFlight) -> Result<(), EngineError> {
+        for (arrival, token) in &prev.rows {
+            let Some(i) = self.running.iter().position(|seq| seq.arrival == *arrival) else {
+                debug_assert!(false, "in-flight row for a departed sequence");
+                continue;
+            };
+            let token = token.item_u32()?;
+            settle_sampled(&mut self.running[i], &mut self.mgr, token);
+        }
+        self.running.retain(|seq| !seq.finished);
+        if self.iterations.is_multiple_of(MAINTENANCE_INTERVAL) {
+            memory::clear_cache()?;
+        }
+        Ok(())
     }
 
     /// Cancels flagged requests between steps (proto `Cancel`: the flag is
@@ -577,29 +811,31 @@ impl<M: StepModel> Engine<M> {
                 prefill = Some((
                     i,
                     StepBatch {
-                        tokens,
+                        input: StepInput::Ids(tokens),
                         seqs: vec![step],
                     },
                 ));
             }
         }
 
-        let mut decode_batch = StepBatch {
-            tokens: Vec::with_capacity(decode_plans.len()),
-            seqs: Vec::with_capacity(decode_plans.len()),
-        };
+        let mut decode_tokens: Vec<u32> = Vec::with_capacity(decode_plans.len());
+        let mut decode_seqs: Vec<SeqStep> = Vec::with_capacity(decode_plans.len());
         let mut sampled_ids: Vec<usize> = Vec::new();
         let mut replay_ids: Vec<usize> = Vec::new();
         for plan in decode_plans {
             let seq = &self.running[plan.seq];
-            decode_batch.tokens.push(seq.history[seq.fed]);
-            decode_batch.seqs.push(plan.step);
+            decode_tokens.push(seq.history[seq.fed]);
+            decode_seqs.push(plan.step);
             if plan.sample {
                 sampled_ids.push(plan.seq);
             } else {
                 replay_ids.push(plan.seq);
             }
         }
+        let decode_batch = StepBatch {
+            input: StepInput::Ids(decode_tokens),
+            seqs: decode_seqs,
+        };
 
         // --- Forward (SPEC §6.2 step 3). Prefill first so its KV writes
         // sit earliest on the pools' functional-update chain.
@@ -618,31 +854,36 @@ impl<M: StepModel> Engine<M> {
                 let logits = logits.ok_or_else(|| MlxError {
                     message: "model returned no logits for a decode step".to_owned(),
                 })?;
-                let vocab = logits.dim(2);
                 for (row, &i) in sampled_ids.iter().enumerate() {
-                    let seq = &mut self.running[i];
-                    let row = row as i32;
-                    let last =
-                        ops::slice(&logits, &[0, row, 0], &[1, row + 1, vocab], &self.stream)?;
-                    let mut last = ops::reshape(&last, &[1, vocab], &self.stream)?;
-                    if !seq.penalties.is_disabled() {
-                        let window = seq.history.len().saturating_sub(seq.penalty_window);
-                        last = apply_penalties(
-                            &last,
-                            &seq.history[window..],
-                            seq.penalties,
-                            &self.stream,
-                        )?;
-                    }
-                    let logprobs = ops::subtract(
-                        &last,
-                        &ops::logsumexp(&last, true, &self.stream)?,
-                        &self.stream,
-                    )?;
-                    let token = seq.sampler.sample(&logprobs, &self.stream)?;
+                    let token =
+                        sample_from_row(&mut self.running[i], &logits, row as i32, &self.stream)?;
                     sampled.push((i, token));
                 }
             }
+        }
+
+        // --- Pipeline entry (module docs): a steady-state pure-decode
+        // step defers its readback with async_eval; the next step's
+        // graph is built from these still-lazy tokens at the start of
+        // the next step() call, overlapping this step's GPU execution.
+        // Every row samples, so each sequence's KV write is an ancestor
+        // of its token — no pool-state eval needed.
+        if prefill.is_none()
+            && replay_ids.is_empty()
+            && sampled.len() == self.running.len()
+            && self.pipeline_ok()
+        {
+            {
+                let outputs: Vec<&Array> = sampled.iter().map(|(_, token)| token).collect();
+                async_eval(&outputs)?;
+            }
+            self.inflight = Some(InFlight {
+                rows: sampled
+                    .into_iter()
+                    .map(|(i, token)| (self.running[i].arrival, token))
+                    .collect(),
+            });
+            return Ok(());
         }
 
         // --- Evaluate the step: sampled tokens + pool state together
@@ -657,25 +898,8 @@ impl<M: StepModel> Engine<M> {
 
         // --- Emit, check stops, release finished (SPEC §6.2 steps 3-4).
         for (i, token) in &sampled {
-            let seq = &mut self.running[*i];
             let token = token.item_u32()?;
-            if seq.first_token_at.is_none() {
-                seq.first_token_at = Some(Instant::now());
-            }
-            seq.generated += 1;
-            seq.history.push(token);
-            seq.fed += 1;
-            if seq.cancel.load(Ordering::Acquire) {
-                finish(seq, &mut self.mgr, FinishKind::Cancelled, None, None);
-            } else if seq.stop_tokens.contains(&token) {
-                // Counted in usage but not emitted: stop text is excluded
-                // from the stream by contract.
-                finish(seq, &mut self.mgr, FinishKind::Stop, Some(token), None);
-            } else if !(seq.on_event)(SeqEvent::Token(token)) {
-                finish(seq, &mut self.mgr, FinishKind::Cancelled, None, None);
-            } else if seq.generated as usize >= seq.max_tokens {
-                finish(seq, &mut self.mgr, FinishKind::Length, None, None);
-            }
+            settle_sampled(&mut self.running[*i], &mut self.mgr, token);
         }
         // Replay segments advance silently: their tokens were emitted
         // before the preemption.
@@ -687,7 +911,7 @@ impl<M: StepModel> Engine<M> {
         // (or, after a preemption, resumes) feeding its history.
         if let Some((i, batch)) = &prefill {
             let seq = &mut self.running[*i];
-            seq.processed += batch.tokens.len();
+            seq.processed += batch.num_tokens();
             if seq.processed + 1 == seq.prompt.len() && seq.history.is_empty() {
                 seq.history.push(seq.prompt[seq.processed]);
             }
@@ -808,6 +1032,8 @@ impl<M: StepModel> Engine<M> {
     /// for step-level MLX errors, which cannot be attributed to a single
     /// request.
     fn fail_all(&mut self, error: &str) {
+        // Any scheduled-but-unread step dies with the pools it wrote to.
+        self.inflight = None;
         let mgr = &mut self.mgr;
         for seq in self.running.iter_mut().chain(self.waiting.iter_mut()) {
             finish(

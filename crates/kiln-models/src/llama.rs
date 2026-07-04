@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use kiln_engine::{KvDims, PagedKv, SeqStep, StepBatch, StepModel};
+use kiln_engine::{KvDims, PagedKv, SeqStep, StepBatch, StepInput, StepModel};
 use kiln_mlx::fast::{self, SdpaMask};
 use kiln_mlx::{Array, Dtype, MlxError, Stream, ops};
 
@@ -611,14 +611,20 @@ impl StepModel for LlamaModel {
         kv: &mut PagedKv,
         s: &Stream,
     ) -> Result<Option<Array>, MlxError> {
-        let n = batch.tokens.len();
+        let n = batch.num_tokens();
         let total: i32 = batch.seqs.iter().map(|seq| seq.len).sum();
         if n == 0 || total != n as i32 {
             return Err(MlxError {
                 message: format!("step batch of {n} token(s) for {total} sequence position(s)"),
             });
         }
-        let tokens = Array::from_u32_slice(&batch.tokens, &[1, n as i32])?;
+        let tokens = match &batch.input {
+            StepInput::Ids(ids) => Array::from_u32_slice(ids, &[1, n as i32])?,
+            // Pipelined decode: the previous step's sampled tokens, still
+            // unevaluated — identical u32 values reach the embedding
+            // lookup either way.
+            StepInput::Lazy(tokens) => tokens.clone(),
+        };
         let mut h = self.embed_tokens.lookup(&tokens, s)?;
         for (layer, block) in self.blocks.iter().enumerate() {
             h = block.forward_step(&h, &batch.seqs, kv, layer, s)?;

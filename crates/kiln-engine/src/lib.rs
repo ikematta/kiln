@@ -30,4 +30,4 @@ pub use paged::{KvSpec, PagedKv, WriteRun};
 #[cfg(feature = "metal")]
 pub use sampler::{PenaltyOptions, Sampler, SamplingOptions, apply_penalties};
 #[cfg(feature = "metal")]
-pub use step::{SeqStep, StepBatch, StepModel};
+pub use step::{SeqStep, StepBatch, StepInput, StepModel};
