@@ -698,3 +698,170 @@
   ```
 - Next: unchanged — Phase 4 pending PM phase gate; PR #1 merge is the PM's
   call after this review.
+
+## [2026-07-04] Phase 4 / part 1/4 — block manager (§6.3) — DONE
+- What:
+  - crates/kiln-engine/src/block.rs: paged-KV block manager as a standalone
+    unit — fixed block pool (power-of-two block size) with LIFO free list,
+    per-block refcounts, allocate/retain/release, and copy_on_write: sole
+    owner → write in place; shared → caller's ownership moves to a fresh
+    block plus a (src, dst) copy instruction; a shared block is never
+    handed out writable. BlockTable maps request token positions → block
+    indices: append_tokens (allocates fresh blocks, COWs a shared partial
+    tail, atomic on OutOfBlocks), fork (retain-all with rollback on
+    failure), explicit release. No MLX types, no model/worker wiring; the
+    module is feature-ungated so the Linux --no-default-features check
+    compiles and lints it.
+  - tests: inline unit tests (constructor validation, allocation order and
+    exhaustion, refcount lifecycle, foreign-id rejection, COW edge cases,
+    table append/fork/release incl. atomicity); model-based proptest suite
+    in tests/block_props.rs — a manager model and a table model run random
+    op sequences against shadow state, asserting after every op: a block is
+    never double-issued while owned, refcounts equal owner counts and hit 0
+    exactly at the last release, and COW never mutates a shared block
+    (every owner's content view survives sibling writes; read-back through
+    each table stays exact). 4096-case extended variants are #[ignore]d per
+    the CLAUDE.md `-- --ignored` convention for slow property tests.
+  - deps: proptest 1 added as a workspace-managed dev-dependency of
+    kiln-engine (rationale in commit message).
+- Decisions:
+  - The manager holds no KV data: COW returns a copy instruction for the
+    engine's physical per-layer pools (arriving later in Phase 4), keeping
+    this unit MLX-free and exhaustively testable.
+  - BlockTable does not auto-release on Drop (it holds no manager handle);
+    request teardown owns the release. #[must_use] flags accidental drops.
+  - Refcount 0 puts a block straight on the free list; §6.2's "return to
+    prefix cache, not freed" is Phase 5's radix tree holding its own
+    refcount — no cached/evictable state belongs in the manager.
+  - LIFO free list, deterministic issue order — block placement is
+    reproducible run-to-run, in line with the greedy determinism gate.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-engine                       (default features)
+  block::tests ......... 11 passed (unit suite)
+  block_props .......... manager_model ok, table_model ok; 2 passed,
+                         2 ignored (extended) in 1.19s
+  sampler_behavior ..... ok (unchanged)
+  $ cargo test -p kiln-engine --test block_props -- --ignored
+  manager_model_extended ok, table_model_extended ok   (4096 cases each,
+  2 passed in 17.99s)
+  $ cargo test -p kiln-engine --no-default-features -> same block suite green
+  $ cargo fmt --check -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean
+  ```
+- Next: Phase 4 part 2/4 (await prompt) — per SPEC §12 presumably the
+  gather-based paged attention v0 (§7.4) wiring block tables to per-layer
+  K/V pools.
+
+## [2026-07-04] Phase 4 / part 2/4 — batching loop + paged attention v0 (§6.2, §7.4) — DONE
+- What:
+  - crates/kiln-engine/src/paged.rs: PagedKv — per-layer K/V pools as
+    preallocated MLX arrays `[num_blocks, kv_heads, block_size, head_dim]`
+    (lazy dtype on first write), functional slice_update writes per
+    WriteRun, gather-based paged attention v0 (take → reshape → slice into
+    a contiguous per-request `[1, H, T, D]` view whose stride pattern
+    matches what the Phase-3 contiguous cache fed fused SDPA), COW block
+    copies, state()/byte accounting, fault reset.
+  - crates/kiln-engine/src/step.rs: the engine↔model step contract —
+    StepBatch/SeqStep (len, offset, sample flag, gather blocks, write
+    runs) and the StepModel trait (blanket impl for &M).
+  - crates/kiln-engine/src/engine.rs: the §6.2 loop — per iteration:
+    cancel sweep, admit while budget allows (one prefill in flight at a
+    time), build (block-table appends + write-run derivation, OutOfBlocks
+    → in-band request error), forward, per-request penalties → logprobs →
+    sample, single eval at the step boundary, emit/stop-check/release,
+    clear_cache maintenance (after chunks + every 256 iterations).
+    Chunked prefill mirrors mlx-lm/Phase-3 exactly: chunks of
+    prefill_chunk (default 2048) over prompt[..n-1], last prompt token fed
+    by the first sampled step. Step-level MLX faults fail all in-flight
+    requests in-band and rebuild manager+pools; the engine stays serving.
+  - crates/kiln-models: llama.rs implements StepModel (forward_step per
+    Attention/Block; lm_head only over sampled positions — prefill chunks
+    skip it, as the Phase-3 dead-graph did numerically) + kv_dims();
+    kiln-engine promoted from dev-dependency to dependency (intra-
+    workspace; metal forwarding unchanged).
+  - crates/kiln-worker: engine.rs rewired from the single-request loop to
+    Engine<LlamaModel> — drains the submission channel between steps so
+    requests join the running batch; event sink translates SeqEvent →
+    TokenChunk/Finished with the same reason/counter/timing semantics;
+    RequestHandle.cancelled is now Arc<AtomicBool> handed to the engine;
+    heartbeat now reports kv_pool_allocated/used bytes; GetInfo reports
+    kv_block_size=32; prefill estimate reads kiln_engine::DEFAULT_PREFILL_CHUNK.
+  - tests: kiln-engine/tests/paged.rs (write/gather round-trips across
+    block boundaries, COW isolation, accounting, error paths);
+    kiln-models/tests/batching.rs (paged engine ≡ Phase-3 contiguous path
+    solo; 4-way concurrent greedy ≡ solo bit-exact across 2 rounds with
+    chunked prefill interleaving decode at chunk=48; late join; stop-token
+    semantics; submit-time and mid-flight pool exhaustion with survivor
+    stream untouched); golden harness rewired to drive fixtures through
+    the batching engine (production chunk size, engine reused across
+    fixtures, leak-checked).
+- Decisions:
+  - Each iteration issues TWO forward calls sharing the KV pools: the
+    prefill chunk alone (op shapes/chunk boundaries identical to the
+    solo path — prefill numerics can never depend on batch composition),
+    plus the concatenated decode tokens (§6.2 step 2). Batched-decode
+    bit-parity at 2-4 concurrency is asserted empirically in
+    tests/batching.rs; part 4 must re-verify at batch 16 (row-count-
+    dependent matmul kernel dispatch is the risk).
+  - Pool layout `[blocks, H, bs, D]` (head-major in-block): writes need no
+    transpose; gathers land in the same per-head row-contiguous stride
+    pattern SDPA saw from the Phase-3 cache, avoiding kernel-path drift.
+  - forward_step returns logits only for sampled positions (Option<Array>)
+    rather than SPEC §7.2's sketched `[n_positions, vocab]` — evaluating a
+    step would otherwise force the lm_head over whole prefill chunks that
+    mlx-lm (and Phase 3) never computed. Trait takes &self (model weights
+    are immutable during forward).
+  - No async_eval decode pipelining this session (Phase-3's one-step
+    pipeline): correctness scope only. Expect single-stream throughput
+    below the Phase-3 recorded number until part 4, which owns the
+    benches (<200µs step overhead, batch-16 ≥3×) and re-pipelining; not
+    measured this session.
+  - Pool exhaustion mid-request → in-band Finished{error} (preemption is
+    part 3); submit rejects requests that can never fit. Worker pool
+    fixed at EngineConfig defaults (512×32 tokens) until §6.4 admission.
+  - Phase-3 generate/kv_cache stay (leak gate + example + the reference
+    the batching tests pin against); retire when a later phase supersedes.
+- Deviations: forward signature vs SPEC §7.2 sketch as above (returns
+  sampled-position logits, &self, split StepBatch/PagedKv types); §6.2
+  step 4 "return to prefix cache" remains free-list release until Phase 5
+  (per part 1's decision). Otherwise none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --test golden -- --nocapture   (CRITICAL GATE)
+  golden chat-basic:        48 prompt tokens,  64 generated — exact match (batched/paged engine)
+  golden chat-code:         47 prompt tokens, 128 generated — exact match (batched/paged engine)
+  golden chat-multibyte:    51 prompt tokens,  64 generated — exact match (batched/paged engine)
+  golden raw-continuation:   6 prompt tokens,  64 generated — exact match (batched/paged engine)
+  golden raw-long-prefill: 249 prompt tokens,  64 generated — exact match (batched/paged engine)
+  test result: ok. 1 passed (no leaked mlx handles)
+  $ cargo test -p kiln-models --test batching
+  solo engine == contiguous path for 4 jobs
+  4-way batched == solo (2 rounds, chunk=48)
+  late-join batching matches solo / stop-token semantics ok / pool-exhaustion ok
+  test result: ok. 1 passed in 7.45s
+  $ cargo test --workspace -> all targets ok (incl. paged.rs unit suite,
+    block_props, sampler, leak gate 1k-iteration loop)
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 19 passed in 30.42s
+    (full stack; incl. greedy/streaming parity across rust+python workers)
+  $ cargo fmt --all --check -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean  (exact CI lint shape)
+  $ cargo build --workspace --no-default-features -> clean                (exact CI compile-linux shape)
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- Next: Phase 4 part 3/4 (await prompt) — preemption under memory
+  pressure (§6.1), proper Cancel/Drain semantics, per-worker admission;
+  then part 4/4 owns the batch-16 ≥3× throughput gate, golden re-run,
+  criterion step-overhead bench (<200µs), and the leak/soak acceptance.
+- Addendum (2026-07-04, PM instruction, cross-reference only): the batch-16
+  decode-parity risk flagged under Decisions above is the same mechanism the
+  2026-07-03 drift investigation (feeding ADR 0001's B1 follow-up) pinned on
+  mlx#3120 — Metal split-K quantized matmul for small M, a reduction-order
+  change in exactly our 4-bit matmul path. Same dependency, M-dependent
+  kernel/reduction dispatch; note #3120 landed in core 0.31.2, so it is not
+  in our pinned 0.31.1 build today but arrives with any quarterly mlx-c bump.
+  If part 4's batch-16 golden re-verification diverges, check first which
+  quantized-matmul kernel variant dispatches at the batched M vs M=1.

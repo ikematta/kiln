@@ -7,10 +7,14 @@ publish.workspace = true
 
 [features]
 default = ["metal"]
-# The sampler (and everything else in this crate) runs on MLX; off for the
-# Linux CI compile-check (--no-default-features).
+# The sampler runs on MLX; off for the Linux CI compile-check
+# (--no-default-features). The block manager (src/block.rs) is pure
+# bookkeeping and builds either way.
 metal = ["kiln-mlx/metal"]
 
 [dependencies]
 kiln-mlx = { workspace = true, default-features = false }
 thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

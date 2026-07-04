@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use kiln_engine::{KvDims, PagedKv, SeqStep, StepBatch, StepModel};
 use kiln_mlx::fast::{self, SdpaMask};
 use kiln_mlx::{Array, Dtype, MlxError, Stream, ops};
 
@@ -329,6 +330,83 @@ impl Attention {
         let out = ops::reshape(&out, &[b, l, self.n_heads * self.head_dim], s)?;
         self.o_proj.forward(&out, s)
     }
+
+    /// Paged-attention step (SPEC §7.4 v0): per sequence, RoPE at its own
+    /// offset, write this step's K/V into the pools, then gather the
+    /// sequence's blocks into a contiguous view for fused SDPA. All writes
+    /// chain onto the pools before any gather references them, so MLX
+    /// donates the pool buffers instead of copying.
+    ///
+    /// For a single sequence the op sequence (shapes, masks, kernel input
+    /// layouts) is identical to [`Self::forward`] over a contiguous cache —
+    /// that equivalence is what keeps golden parity under paging.
+    fn forward_step(
+        &self,
+        x: &Array,
+        seqs: &[SeqStep],
+        kv: &mut PagedKv,
+        layer: usize,
+        s: &Stream,
+    ) -> Result<Array, MlxError> {
+        let queries = self.q_proj.forward(x, s)?;
+        let keys = self.k_proj.forward(x, s)?;
+        let values = self.v_proj.forward(x, s)?;
+
+        // Phase 1: per-sequence RoPE + pool writes.
+        let single = seqs.len() == 1;
+        let mut roped: Vec<Array> = Vec::with_capacity(seqs.len());
+        let mut start = 0;
+        for seq in seqs {
+            let l = seq.len;
+            let segment = |a: &Array, heads: i32| -> Result<Array, MlxError> {
+                let seg = if single {
+                    a.clone()
+                } else {
+                    ops::slice(a, &[0, start, 0], &[1, start + l, heads * self.head_dim], s)?
+                };
+                let seg = ops::reshape(&seg, &[1, l, heads, self.head_dim], s)?;
+                ops::transpose(&seg, &[0, 2, 1, 3], s)
+            };
+            let q = segment(&queries, self.n_heads)?;
+            let k = segment(&keys, self.n_kv_heads)?;
+            let v = segment(&values, self.n_kv_heads)?;
+            let q = self
+                .rope
+                .apply(&q, self.head_dim, self.traditional_rope, seq.offset, s)?;
+            let k = self
+                .rope
+                .apply(&k, self.head_dim, self.traditional_rope, seq.offset, s)?;
+            kv.write(layer, &seq.writes, &k, &v, s)?;
+            roped.push(q);
+            start += l;
+        }
+
+        // Phase 2: per-sequence gather + SDPA over the full history.
+        let mut outs: Vec<Array> = Vec::with_capacity(seqs.len());
+        for (seq, q) in seqs.iter().zip(&roped) {
+            let (k, v) = kv.gather(layer, &seq.blocks, seq.offset + seq.len, s)?;
+            let mask = if seq.len > 1 {
+                SdpaMask::Causal
+            } else {
+                SdpaMask::None
+            };
+            let o = fast::scaled_dot_product_attention(q, &k, &v, self.scale, mask, s)?;
+            let o = ops::transpose(&o, &[0, 2, 1, 3], s)?;
+            outs.push(ops::reshape(
+                &o,
+                &[1, seq.len, self.n_heads * self.head_dim],
+                s,
+            )?);
+        }
+        let out = match outs.as_slice() {
+            [only] => only.clone(),
+            many => {
+                let refs: Vec<&Array> = many.iter().collect();
+                ops::concatenate(&refs, 1, s)?
+            }
+        };
+        self.o_proj.forward(&out, s)
+    }
 }
 
 #[derive(Debug)]
@@ -367,6 +445,22 @@ impl Block {
     ) -> Result<Array, MlxError> {
         let normed = fast::rms_norm(x, &self.input_layernorm, self.rms_eps, s)?;
         let attn = self.self_attn.forward(&normed, cache, mask, s)?;
+        let h = ops::add(x, &attn, s)?;
+        let normed = fast::rms_norm(&h, &self.post_attention_layernorm, self.rms_eps, s)?;
+        let mlp = self.mlp.forward(&normed, s)?;
+        ops::add(&h, &mlp, s)
+    }
+
+    fn forward_step(
+        &self,
+        x: &Array,
+        seqs: &[SeqStep],
+        kv: &mut PagedKv,
+        layer: usize,
+        s: &Stream,
+    ) -> Result<Array, MlxError> {
+        let normed = fast::rms_norm(x, &self.input_layernorm, self.rms_eps, s)?;
+        let attn = self.self_attn.forward_step(&normed, seqs, kv, layer, s)?;
         let h = ops::add(x, &attn, s)?;
         let normed = fast::rms_norm(&h, &self.post_attention_layernorm, self.rms_eps, s)?;
         let mlp = self.mlp.forward(&normed, s)?;
@@ -459,6 +553,15 @@ impl LlamaModel {
         &self.config
     }
 
+    /// KV geometry for the engine's paged pools.
+    pub fn kv_dims(&self) -> KvDims {
+        KvDims {
+            layers: self.blocks.len(),
+            kv_heads: self.config.num_kv_heads() as i32,
+            head_dim: self.config.head_dim() as i32,
+        }
+    }
+
     /// One fresh contiguous cache per layer.
     pub fn make_cache(&self) -> Vec<KvCache> {
         (0..self.blocks.len()).map(|_| KvCache::new()).collect()
@@ -495,5 +598,55 @@ impl LlamaModel {
             None => self.embed_tokens.as_linear(&h, s)?,
         };
         Ok(logits)
+    }
+}
+
+/// The batched/paged forward pass (SPEC §6.2 step 2 / §7.2). The lm_head
+/// runs only over sampled positions — for prefill chunks it is skipped
+/// entirely, matching the Phase-3 path where chunk logits were dead graph.
+impl StepModel for LlamaModel {
+    fn forward_step(
+        &self,
+        batch: &StepBatch,
+        kv: &mut PagedKv,
+        s: &Stream,
+    ) -> Result<Option<Array>, MlxError> {
+        let n = batch.tokens.len();
+        let total: i32 = batch.seqs.iter().map(|seq| seq.len).sum();
+        if n == 0 || total != n as i32 {
+            return Err(MlxError {
+                message: format!("step batch of {n} token(s) for {total} sequence position(s)"),
+            });
+        }
+        let tokens = Array::from_u32_slice(&batch.tokens, &[1, n as i32])?;
+        let mut h = self.embed_tokens.lookup(&tokens, s)?;
+        for (layer, block) in self.blocks.iter().enumerate() {
+            h = block.forward_step(&h, &batch.seqs, kv, layer, s)?;
+        }
+
+        // Sampled positions: the last position of each sampling sequence.
+        let mut sampled: Vec<u32> = Vec::new();
+        let mut pos: u32 = 0;
+        for seq in &batch.seqs {
+            pos += seq.len as u32;
+            if seq.sample {
+                sampled.push(pos - 1);
+            }
+        }
+        if sampled.is_empty() {
+            return Ok(None);
+        }
+        let h = if sampled.len() == n {
+            h
+        } else {
+            let ids = Array::from_u32_slice(&sampled, &[sampled.len() as i32])?;
+            ops::take(&h, &ids, 1, s)?
+        };
+        let h = fast::rms_norm(&h, &self.norm, self.config.rms_norm_eps, s)?;
+        let logits = match &self.lm_head {
+            Some(head) => head.forward(&h, s)?,
+            None => self.embed_tokens.as_linear(&h, s)?,
+        };
+        Ok(Some(logits))
     }
 }

@@ -1,9 +1,8 @@
 #![deny(unsafe_code)]
 //! `kiln-worker`: the native Rust model worker (SPEC §2.1) — a tonic gRPC
 //! server over a Unix domain socket, wiring kiln-models' Llama
-//! implementation and kiln-engine's sampler behind the frozen
-//! `worker.proto`. Single request at a time (Phase 3); continuous batching
-//! arrives with Phase 4.
+//! implementation and kiln-engine's continuous batching loop (paged KV,
+//! SPEC §6.2) behind the frozen `worker.proto`.
 //!
 //! Spawned by the gateway supervisor with the same argv contract as the
 //! Python worker: `--model <dir> --socket <path> --model-id <id>`.

@@ -56,6 +56,9 @@ prometheus = { version = "0.14", default-features = false }
 uuid = { version = "1", features = ["v7"] }
 argon2 = { version = "0.5", features = ["std"] }
 async-stream = "0.3"
+# Property-based testing (dev-only): model-based invariant suites for the
+# engine's block manager (SPEC §12 Phase 4, "block manager (+proptests)").
+proptest = "1"
 # Intra-workspace crates.
 kiln-engine = { path = "crates/kiln-engine", default-features = false }
 kiln-mlx = { path = "crates/kiln-mlx", default-features = false }
