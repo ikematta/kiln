@@ -267,6 +267,8 @@ parse → validate → resolve model → apply chat template (minijinja, templat
 ### 8.3 Cross-cutting
 API keys in config (hashed at rest, `argon2`); per-key rate limits (token bucket: requests/min and tokens/min) via `tower` middleware; request size limits; timeouts (TTFT timeout and total). Structured request logs with request_id propagated to worker spans.
 
+> **BACKLOG:** per-key rate limits (rpm/tpm) and TTFT/total timeouts are parsed from kiln.toml since Phase 2 but UNENFORCED — implement in Phase 9 alongside priority/admission control (PROGRESS.md 2026-07-04).
+
 ---
 
 ## 9. `kiln-jobs` and Python worker
