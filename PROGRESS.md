@@ -267,3 +267,40 @@
     FetchContent override (#114 exists precisely because bindings needed regenerating —
     that's the "silent semantic change under the bindings" ADR 0001 guards against).
 - Next: PM decision on the above; then Phase 2 — Gateway v0 (SPEC §12), pending phase gate.
+
+## [2026-07-03] Phase 1 / Follow-up — core MLX alignment via option B1 — DONE
+- What:
+  - Implements the PM-approved option B1 from this date's DECISION NEEDED entry (commit
+    061e399): `kiln_worker_py` now pins `mlx-lm==0.31.2` + explicit `mlx==0.31.1`, so
+    both workers share core MLX v0.31.1 — the version vendored mlx-c v0.6.0 builds.
+    **The DECISION NEEDED flag from commit 061e399 is CLOSED** (this session).
+  - Lockfile delta is only mlx/mlx-metal/mlx-lm (re-locked conservatively;
+    transformers 5.12.1 etc. unchanged).
+  - ADR 0001 gains a follow-up note (appended after the drift addendum, at explicit PM
+    instruction) recording the resolution and the standing C1 plan: when mlx-c tags its
+    next release, bump submodule + return mlx-lm/mlx to current as one change with a
+    full golden re-run; revisit pins before any golden-fixture regeneration.
+- Decisions:
+  - Verified before downgrading that no worker code depends on 0.31.3-only mlx-lm APIs:
+    make_sampler / make_logits_processors (incl. presence/frequency penalties) /
+    generate_step (evaluated-token yield) / fresh detokenizer / eos_token_ids are
+    identical at 0.31.2. Nothing to report as blocked.
+  - `mlx==0.31.1` added as an explicit direct dependency (already transitive): pins the
+    exact core so the resolver can't drift it independently of the submodule pin.
+- Deviations: none
+- Acceptance:
+  ```
+  $ uv sync --project python/kiln_worker_py && uv run --project python/kiln_worker_py \
+      python -c "import mlx.core as mx; print(mx.__version__)"
+  0.31.1
+
+  $ KILN_TEST_MODELS=~/.kiln/test-models uv run --project python/kiln_worker_py \
+      pytest python/kiln_worker_py/tests -v
+  ============ 28 passed in 8.34s ============   (all Submit/Cancel/Health/Tokenize green)
+
+  push 568369b → run 28691082336: all jobs green, test-macos 1m35s
+    uv sync:  + mlx==0.31.1 / + mlx-lm==0.31.2
+    Cache restored from key: test-models-e57549323c60...   (- Fetch pinned: skipped)
+    Python worker tests: ============ 28 passed in 11.03s ============
+  ```
+- Next: Phase 2 — Gateway v0 (SPEC §12), pending PM phase gate.
