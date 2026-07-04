@@ -5,4 +5,27 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = ["metal"]
+# Model implementations need MLX; config parsing compiles everywhere
+# (the Linux CI compile-check builds with --no-default-features).
+metal = ["kiln-mlx/metal"]
+
 [dependencies]
+kiln-mlx = { workspace = true, default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Weight-file parsing per the mlx-lm conventions (SPEC §3 tech stack:
+# "safetensors crate, mmap loading"; the mmap itself lives in kiln-mlx::io).
+# Zero-copy views over the mapped bytes. Apache-2.0.
+safetensors = "0.8"
+
+[dev-dependencies]
+# Tests/examples exercise the full generate path; they are all gated on this
+# crate's `metal` feature, so the sampler's metal feature is safe to force.
+kiln-engine = { workspace = true, features = ["metal"] }
+kiln-tokenize.workspace = true
+minijinja.workspace = true
+serde.workspace = true
+serde_json.workspace = true
