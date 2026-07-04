@@ -542,3 +542,83 @@
   ```
 - Next: unchanged — Phase 3 remainder (kiln-worker gRPC binary + gateway
   token_ids path + incremental detok), pending PM phase gate.
+
+## [2026-07-04] Phase 3 / Closeout — Rust worker wired end-to-end — DONE
+- What:
+  - kiln-tokenize: StreamingDecoder (TGI-style two-offset incremental
+    detokenization; U+FFFD holdback so partial code points never reach SSE;
+    fuzzed against full decode — 300 random id sequences + ZWJ-emoji/CJK
+    corpora at multiple chunk schedules) and StopStringMatcher (port of the
+    python worker's stops.py; gateway-side for rust workers).
+  - kiln-models: generate_with (logits-processor slot pre-normalization with
+    mlx-lm history semantics + per-token callback whose false return stops
+    generation — the ≤2-step cancel bound); eos_token_ids() from config.json
+    (int|list — same set mlx-lm stops on). Golden parity + leak gate re-run
+    green after the refactor.
+  - kiln-mlx: os module (RLIMIT_NOFILE raise per the CLAUDE.md sharp edge;
+    process RSS via proc_pidinfo for MemoryReport). New dep libc, confined
+    to the unsafe crate.
+  - kiln-worker: the Rust worker binary — tonic gRPC over UDS behind the
+    frozen proto, same argv contract as the python worker; one engine
+    thread owns model+Stream (!Send), single request at a time;
+    GetInfo/Health (fingerprint + template-hash schemes byte-identical to
+    modelinfo.py), Submit (python-parity validation as in-band
+    Finished{ERROR}; bare-id TokenChunks — text empty by design; stop token
+    counted but never chunked), Cancel (flag between steps), Drain/Stats/
+    Tokenize UNIMPLEMENTED per phase/design. UNHEALTHY-with-detail on load
+    failure so the supervisor recycles.
+  - kiln-gateway: worker="rust" spawns kiln-worker (rust_worker_argv,
+    default = sibling binary of the gateway); startup validation of rust-
+    servable models via kiln-models config parsing (no-MLX dep); gateway
+    tokenizes locally (BOS contract) and detokenizes incrementally;
+    stop strings matched gateway-side with Cancel-on-match and honest
+    usage (drain to Finished); auto still resolves to python until the
+    Phase 6 routing matrix.
+  - tests/e2e: stack fixture parametrized over both workers (same Phase 2
+    suite gates the rust worker forever); new cross-worker parity tests.
+- Decisions:
+  - The rust worker REJECTS stop_strings/raw_text (INVALID_REQUEST) instead
+    of silently ignoring them — the gateway owns text; a misconfigured
+    caller stays loud.
+  - The stop-triggering token is counted in usage but not chunked: the
+    gateway decodes chunks verbatim and stop text is excluded by contract.
+  - Penalty-enabled requests forfeit one step of async_eval pipelining
+    (host-side penalty window needs the token value); the default path is
+    unchanged.
+  - Gateway-side stop-string match ends the request as finish_reason
+    "stop" regardless of the worker's terminal event (usually our own
+    CANCELLED).
+- Deviations: none against the task; worker="auto"→python note stands
+  (Phase 6).
+- Acceptance:
+  ```
+  $ uv run --project tests/e2e pytest tests/e2e -v     (full stack, real model)
+  test_chat.py (6 tests)                  [python] PASSED   [rust] PASSED
+  test_crash_recovery.py::kill9...        [python] PASSED   [rust] PASSED
+  test_metrics.py::counters               [python] PASSED   [rust] PASSED
+  test_cross_worker_parity.py::greedy_outputs_identical_across_workers PASSED
+  test_cross_worker_parity.py::streaming_text_identical_across_workers PASSED
+  test_cross_worker_parity.py::stop_strings_work_on_both_workers       PASSED
+  ============ 19 passed in 36.69s ============
+
+  $ side-by-side, same prompt, temperature=0 (one gateway, both workers):
+  llama-py [stop] usage=48+39: 'A kiln is a type of furnace or oven used for
+    various industrial and commercial applications, such as firing ceramics,
+    baking materials, and testing materials, to achieve specific physical or
+    chemical properties.'
+  llama-rs [stop] usage=48+39: <byte-identical text, identical usage>
+
+  $ standalone worker smoke (python grpc client over UDS): READY health with
+    memory report (rss 0.72GB), GetInfo (q4_g64, template hash matches),
+    48-token greedy chat streamed at 101.5 tok/s decode, STOP on <|eot_id|>,
+    in-band INVALID_REQUEST for malformed input, Tokenize UNIMPLEMENTED.
+
+  $ cargo test --workspace            -> 22 test targets, all ok
+    (incl. golden parity exact + 1k-iteration leak gate re-run post-refactor)
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo build --workspace --no-default-features -> clean
+  $ ruff check/format python/ tests/e2e scripts/gen-golden.py -> clean
+  $ pytest python/kiln_worker_py/tests -> 28 passed
+  ```
+- Next: Phase 4 — paged KV + continuous batching (kiln-engine core), per
+  SPEC §12, pending PM phase gate.
