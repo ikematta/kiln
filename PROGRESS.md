@@ -673,3 +673,28 @@
 - Acceptance: exact CI lint command locally → zero mlx-c builds, clippy
   clean; full-featured clippy + golden parity + leak gate still green.
 - Next: unchanged — Phase 4 pending PM phase gate.
+
+## [2026-07-04] Phase 3 / Follow-up — unsafe-surface review findings — DONE
+- What: pre-merge manual review of the kiln-mlx unsafe surface (SPEC §14 /
+  CLAUDE.md: reviewed regardless of green tests) found the safe host-read
+  APIs unsound: MLX's item<T>/data<T> are raw reinterpreting accessors
+  (verified in the vendored sources), so wrong-dtype or non-contiguous
+  reads through the safe wrappers were UB (incl. out-of-bounds reads for
+  wider-T dtype mismatches). Latent only — every call site reads fresh
+  typed contiguous op outputs. Fixed with dtype guards on item_*/data_*,
+  a strides-based row-contiguity guard on data_*, and an ops::contiguous
+  escape hatch; wrapper tests pin all failure modes. Also re-audited the
+  metal feature graph after the CI fix: cargo tree shows [] for every kiln
+  crate under --no-default-features (dev-deps included) and no dependency
+  edge anywhere enables metal unconditionally; the Linux lint job is the
+  standing tripwire.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-mlx --test wrappers -> ok (incl. new guard cases)
+  $ cargo clippy --workspace --all-targets [-D warnings] and
+    --no-default-features variant -> both clean
+  $ cargo test --workspace -> 22 targets ok (golden parity + leak gate green)
+  ```
+- Next: unchanged — Phase 4 pending PM phase gate; PR #1 merge is the PM's
+  call after this review.
