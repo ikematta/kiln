@@ -929,6 +929,7 @@ dependencies = [
  "axum",
  "figment",
  "hyper-util",
+ "kiln-models",
  "kiln-proto",
  "kiln-tokenize",
  "prometheus",

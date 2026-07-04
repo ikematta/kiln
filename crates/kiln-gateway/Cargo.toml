@@ -11,6 +11,10 @@ async-stream.workspace = true
 axum.workspace = true
 figment.workspace = true
 hyper-util.workspace = true
+# Config-parsing surface only (no default features = no MLX): validates that
+# a worker="rust" model is an architecture the Rust worker can serve, at
+# gateway startup instead of first request.
+kiln-models = { workspace = true, default-features = false }
 kiln-proto.workspace = true
 kiln-tokenize.workspace = true
 prometheus.workspace = true

@@ -1,7 +1,16 @@
 //! `POST /v1/chat/completions` (SPEC §8.2): validate → render chat template →
-//! tokenize via the worker (`add_special_tokens=false`; the template supplies
-//! BOS) → `Submit` → translate the worker's `TokenEvent` stream into an
+//! tokenize → `Submit` → translate the worker's `TokenEvent` stream into an
 //! OpenAI response (JSON or SSE).
+//!
+//! Tokenization/detokenization ownership depends on the worker kind:
+//! - **Python worker**: owns its tokenizer. The gateway tokenizes via the
+//!   `Tokenize` RPC (`add_special_tokens=false`; the template supplies BOS)
+//!   and passes `TokenChunk.text` through; stop strings are matched in the
+//!   worker.
+//! - **Rust worker**: the gateway tokenizes locally with kiln-tokenize (same
+//!   BOS contract), receives bare token ids, detokenizes them incrementally
+//!   ([`StreamingDecoder`]), and matches stop strings itself — on a match it
+//!   cancels the worker request and reports `finish_reason: "stop"`.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -12,10 +21,12 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use kiln_proto::v1::worker_client::WorkerClient;
 use kiln_proto::v1::{
-    FinishReason, Finished, Priority, StoppingParams, SubmitRequest, TokenEvent, TokenIds,
-    TokenizeRequest, submit_request, token_event,
+    CancelRequest, FinishReason, Finished, Priority, StoppingParams, SubmitRequest, TokenChunk,
+    TokenEvent, TokenIds, TokenizeRequest, submit_request, token_event,
 };
+use kiln_tokenize::{StopStringMatcher, StreamingDecoder};
 use tonic::Streaming;
+use tonic::transport::Channel;
 
 use crate::app::{AppState, RequestId};
 use crate::error::ApiError;
@@ -100,19 +111,29 @@ async fn handle(
     let prompt = render_prompt(&entry, &validated)?;
 
     let mut client = WorkerClient::new(entry.channel.clone());
-    let tokenized = client
-        .tokenize(TokenizeRequest {
-            text: prompt,
-            // The chat template already includes BOS/special tokens.
-            add_special_tokens: false,
-        })
-        .await
-        .map_err(|status| ApiError::from_worker_status(&status))?
-        .into_inner();
-    if tokenized.token_ids.is_empty() {
+    // BOS contract (kiln-tokenize crate docs): the rendered template already
+    // contains BOS, so both paths encode WITHOUT special tokens — locally
+    // for Rust workers, via the Tokenize RPC for tokenizer-owning workers.
+    let token_ids = match &entry.tokenizer {
+        Some(tokenizer) => tokenizer
+            .encode(&prompt, false)
+            .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?,
+        None => {
+            client
+                .tokenize(TokenizeRequest {
+                    text: prompt,
+                    add_special_tokens: false,
+                })
+                .await
+                .map_err(|status| ApiError::from_worker_status(&status))?
+                .into_inner()
+                .token_ids
+        }
+    };
+    if token_ids.is_empty() {
         return Err(ApiError::invalid_request("rendered prompt is empty"));
     }
-    let prompt_tokens = tokenized.token_ids.len() as u32;
+    let prompt_tokens = token_ids.len() as u32;
 
     let max_context_len = entry
         .info
@@ -123,16 +144,22 @@ async fn handle(
         .unwrap_or(0);
     let max_tokens = validated.effective_max_tokens(prompt_tokens, max_context_len)?;
 
+    // Stop strings: matched in the worker when it detokenizes (python), in
+    // the gateway when it does (rust — the worker rejects stop_strings).
+    let pipeline = TextPipeline::for_entry(&entry, &validated.stop_strings);
+    let worker_stop_strings = match pipeline {
+        TextPipeline::Passthrough => validated.stop_strings.clone(),
+        TextPipeline::Decode { .. } => Vec::new(),
+    };
+
     let submit = SubmitRequest {
         request_id: request_id.0.clone(),
-        input: Some(submit_request::Input::TokenIds(TokenIds {
-            ids: tokenized.token_ids,
-        })),
+        input: Some(submit_request::Input::TokenIds(TokenIds { ids: token_ids })),
         sampling: Some(validated.sampling),
         stopping: Some(StoppingParams {
             max_tokens,
             stop_token_ids: Vec::new(),
-            stop_strings: validated.stop_strings.clone(),
+            stop_strings: worker_stop_strings,
             ignore_eos: false,
         }),
         grammar: None,
@@ -151,13 +178,100 @@ async fn handle(
         model: entry.id.clone(),
         completion_id: format!("chatcmpl-{}", request_id.0.replace('-', "")),
         created: unix_now(),
+        request_id: request_id.0.clone(),
+        channel: entry.channel.clone(),
     };
     if validated.stream {
-        Ok(stream_response(ctx, events, validated.include_usage))
+        Ok(stream_response(
+            ctx,
+            events,
+            pipeline,
+            validated.include_usage,
+        ))
     } else {
-        collect_response(ctx, events)
+        collect_response(ctx, events, pipeline)
             .await
             .map(IntoResponse::into_response)
+    }
+}
+
+/// Turns worker `TokenChunk`s into client-visible text.
+enum TextPipeline {
+    /// Tokenizer-owning worker: chunks carry final text (stops already
+    /// applied worker-side).
+    Passthrough,
+    /// Rust worker: chunks carry bare ids; the gateway detokenizes and
+    /// matches stop strings.
+    Decode {
+        decoder: StreamingDecoder,
+        matcher: StopStringMatcher,
+        matched: bool,
+    },
+}
+
+impl TextPipeline {
+    fn for_entry(entry: &ModelEntry, stop_strings: &[String]) -> Self {
+        match &entry.tokenizer {
+            Some(tokenizer) => TextPipeline::Decode {
+                decoder: StreamingDecoder::new(Arc::clone(tokenizer)),
+                matcher: StopStringMatcher::new(stop_strings),
+                matched: false,
+            },
+            None => TextPipeline::Passthrough,
+        }
+    }
+
+    /// Text safe to emit for this chunk. Flips [`Self::stop_matched`] when a
+    /// stop string fires; everything after the match is dropped.
+    fn push(&mut self, chunk: TokenChunk) -> Result<String, ApiError> {
+        match self {
+            TextPipeline::Passthrough => Ok(chunk.text),
+            TextPipeline::Decode {
+                decoder,
+                matcher,
+                matched,
+            } => {
+                if *matched {
+                    return Ok(String::new());
+                }
+                let text = decoder
+                    .push(&chunk.token_ids)
+                    .map_err(|err| ApiError::internal(format!("detokenization failed: {err}")))?;
+                let (released, hit) = matcher.push(&text);
+                *matched = hit.is_some();
+                Ok(released)
+            }
+        }
+    }
+
+    /// Final text at natural end-of-stream: decoder tail + held stop-string
+    /// prefix (a tokenizer-owning worker already flushed on its side).
+    fn finish(&mut self) -> Result<String, ApiError> {
+        match self {
+            TextPipeline::Passthrough => Ok(String::new()),
+            TextPipeline::Decode {
+                decoder,
+                matcher,
+                matched,
+            } => {
+                if *matched {
+                    return Ok(String::new());
+                }
+                let tail = decoder
+                    .finalize()
+                    .map_err(|err| ApiError::internal(format!("detokenization failed: {err}")))?;
+                let (mut released, hit) = matcher.push(&tail);
+                *matched = hit.is_some();
+                if hit.is_none() {
+                    released.push_str(&matcher.flush());
+                }
+                Ok(released)
+            }
+        }
+    }
+
+    fn stop_matched(&self) -> bool {
+        matches!(self, TextPipeline::Decode { matched: true, .. })
     }
 }
 
@@ -178,6 +292,27 @@ struct CompletionCtx {
     model: String,
     completion_id: String,
     created: u64,
+    request_id: String,
+    channel: Channel,
+}
+
+impl CompletionCtx {
+    /// Best-effort worker-side cancellation after a gateway-side stop-string
+    /// match; generation past the match is wasted work, not a correctness
+    /// problem, so failures only log.
+    async fn cancel_worker(&self) {
+        let mut client = WorkerClient::new(self.channel.clone());
+        if let Err(status) = client
+            .cancel(CancelRequest {
+                request_id: self.request_id.clone(),
+            })
+            .await
+        {
+            tracing::debug!(target: "kiln::chat", model = %self.model,
+                request_id = %self.request_id, code = ?status.code(),
+                "cancel after stop-string match failed");
+        }
+    }
 }
 
 impl CompletionCtx {
@@ -215,7 +350,17 @@ enum StreamEnd {
     Failed(ApiError),
 }
 
-fn classify_finished(finished: Finished) -> StreamEnd {
+fn classify_finished(finished: Finished, stop_matched: bool) -> StreamEnd {
+    // A gateway-side stop-string match ends the request as a normal "stop"
+    // regardless of how the worker's stream terminates afterwards (usually
+    // CANCELLED, from our own Cancel; racily STOP/LENGTH). The client's
+    // completion was already correct when the match fired.
+    if stop_matched {
+        return StreamEnd::Done {
+            finish_reason: "stop",
+            finished,
+        };
+    }
     match finished.finish_reason() {
         FinishReason::Stop => StreamEnd::Done {
             finish_reason: "stop",
@@ -226,8 +371,8 @@ fn classify_finished(finished: Finished) -> StreamEnd {
             finished,
         },
         FinishReason::Error => StreamEnd::Failed(ApiError::from_worker_finished(&finished)),
-        // The gateway only cancels when the client is gone; nobody reads
-        // this response, but keep the accounting honest.
+        // Otherwise the gateway only cancels when the client is gone; nobody
+        // reads this response, but keep the accounting honest.
         FinishReason::Cancelled => {
             StreamEnd::Failed(ApiError::worker_crashed("request was cancelled"))
         }
@@ -244,13 +389,24 @@ fn classify_finished(finished: Finished) -> StreamEnd {
 async fn collect_response(
     ctx: CompletionCtx,
     mut events: Streaming<TokenEvent>,
+    mut pipeline: TextPipeline,
 ) -> Result<axum::Json<ChatCompletion>, ApiError> {
     let mut content = String::new();
     let end = loop {
         match events.message().await {
             Ok(Some(event)) => match event.event {
-                Some(token_event::Event::Tokens(chunk)) => content.push_str(&chunk.text),
-                Some(token_event::Event::Finished(finished)) => break classify_finished(finished),
+                Some(token_event::Event::Tokens(chunk)) => {
+                    let was_matched = pipeline.stop_matched();
+                    content.push_str(&pipeline.push(chunk)?);
+                    if !was_matched && pipeline.stop_matched() {
+                        // Keep draining until Finished so usage stays real.
+                        ctx.cancel_worker().await;
+                    }
+                }
+                Some(token_event::Event::Finished(finished)) => {
+                    content.push_str(&pipeline.finish()?);
+                    break classify_finished(finished, pipeline.stop_matched());
+                }
                 // Admitted / PrefixCacheHit are observability-only here.
                 _ => {}
             },
@@ -297,6 +453,7 @@ async fn collect_response(
 fn stream_response(
     ctx: CompletionCtx,
     mut events: Streaming<TokenEvent>,
+    mut pipeline: TextPipeline,
     include_usage: bool,
 ) -> Response {
     // With include_usage, data chunks carry `"usage": null` and a final
@@ -328,11 +485,25 @@ fn stream_response(
             let end = match events.message().await {
                 Ok(Some(event)) => match event.event {
                     Some(token_event::Event::Tokens(tc)) => {
-                        if !tc.text.is_empty() {
+                        let was_matched = pipeline.stop_matched();
+                        let text = match pipeline.push(tc) {
+                            Ok(text) => text,
+                            Err(err) => {
+                                // Detok failure is a gateway bug; surface it
+                                // as the terminal error event.
+                                ctx.record_err(&err);
+                                yield Ok(sse_json(&err.body()));
+                                return;
+                            }
+                        };
+                        if !was_matched && pipeline.stop_matched() {
+                            ctx.cancel_worker().await;
+                        }
+                        if !text.is_empty() {
                             yield Ok(sse_json(&chunk(
                                 vec![ChunkChoice {
                                     index: 0,
-                                    delta: Delta { role: None, content: Some(tc.text) },
+                                    delta: Delta { role: None, content: Some(text) },
                                     logprobs: None,
                                     finish_reason: None,
                                 }],
@@ -341,7 +512,28 @@ fn stream_response(
                         }
                         continue;
                     }
-                    Some(token_event::Event::Finished(finished)) => classify_finished(finished),
+                    Some(token_event::Event::Finished(finished)) => {
+                        match pipeline.finish() {
+                            Ok(tail) if !tail.is_empty() => {
+                                yield Ok(sse_json(&chunk(
+                                    vec![ChunkChoice {
+                                        index: 0,
+                                        delta: Delta { role: None, content: Some(tail) },
+                                        logprobs: None,
+                                        finish_reason: None,
+                                    }],
+                                    usage_null,
+                                )));
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                ctx.record_err(&err);
+                                yield Ok(sse_json(&err.body()));
+                                return;
+                            }
+                        }
+                        classify_finished(finished, pipeline.stop_matched())
+                    }
                     _ => continue,
                 },
                 Ok(None) => StreamEnd::Failed(ApiError::worker_crashed(

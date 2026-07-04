@@ -64,9 +64,13 @@ impl Supervisor {
 
         let mut tasks = Vec::new();
         for (entry, status_tx) in registry.iter().zip(senders) {
+            let argv = match entry.worker_kind {
+                crate::config::WorkerKind::Rust => config.server.rust_worker_argv.clone(),
+                _ => config.server.python_worker_argv.clone(),
+            };
             let ctx = SuperviseCtx {
                 entry: Arc::clone(entry),
-                argv: config.server.python_worker_argv.clone(),
+                argv,
                 status_tx,
                 metrics: Arc::clone(&metrics),
                 shutdown: shutdown.subscribe(),
