@@ -54,6 +54,7 @@ fn request(prompt: &[u32], max_tokens: usize, stop: &[u32]) -> (EngineRequest, C
         on_event: Box::new(move |event| {
             match event {
                 SeqEvent::Token(token) => t.borrow_mut().push(token),
+                SeqEvent::PrefixHit { .. } => {}
                 SeqEvent::Finished(summary) => *f.borrow_mut() = Some(summary),
             }
             true
@@ -166,7 +167,7 @@ fn batched_greedy_matches_single_stream() {
             .map(|&(prompt, max_tokens)| reference(prompt, max_tokens))
             .collect();
         for (i, &(prompt, max_tokens)) in jobs.iter().enumerate() {
-            let solo = run_batch(&model, config, &[(prompt, max_tokens)]);
+            let solo = run_batch(&model, config.clone(), &[(prompt, max_tokens)]);
             assert_eq!(
                 solo[0], contiguous[i],
                 "paged engine diverged from the contiguous path on job {i}"
@@ -179,10 +180,10 @@ fn batched_greedy_matches_single_stream() {
         //    determinism).
         let solo_chunked: Vec<Vec<u32>> = jobs
             .iter()
-            .map(|&job| run_batch(&model, chunked, &[job]).remove(0))
+            .map(|&job| run_batch(&model, chunked.clone(), &[job]).remove(0))
             .collect();
         for round in 0..2 {
-            let batched = run_batch(&model, chunked, &jobs);
+            let batched = run_batch(&model, chunked.clone(), &jobs);
             assert_eq!(
                 batched, solo_chunked,
                 "batched greedy outputs diverged from single-stream (round {round})"
@@ -193,7 +194,7 @@ fn batched_greedy_matches_single_stream() {
         // 3) Late join: requests arriving mid-decode must not disturb the
         //    stream already in flight.
         {
-            let mut engine = Engine::new(&model, model.kv_dims(), chunked, Stream::gpu())
+            let mut engine = Engine::new(&model, model.kv_dims(), chunked.clone(), Stream::gpu())
                 .expect("engine builds");
             let (first, first_out) = request_pair(&short, 40);
             engine.submit(first);
@@ -217,8 +218,8 @@ fn batched_greedy_matches_single_stream() {
         {
             let reference = &contiguous[0];
             let stop = reference[2];
-            let mut engine =
-                Engine::new(&model, model.kv_dims(), config, Stream::gpu()).expect("engine builds");
+            let mut engine = Engine::new(&model, model.kv_dims(), config.clone(), Stream::gpu())
+                .expect("engine builds");
             let (request, (tokens, finish)) = request(&short, 40, &[stop]);
             engine.submit(request);
             drain(&mut engine);

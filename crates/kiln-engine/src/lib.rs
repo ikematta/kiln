@@ -25,7 +25,7 @@ pub use block::{AppendPlan, BlockError, BlockId, BlockManager, BlockTable, CowCo
 pub use engine::{
     DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_TOKENS, DEFAULT_NUM_BLOCKS, DEFAULT_PREFILL_CHUNK,
     Engine, EngineConfig, EngineError, EngineRequest, ErrorCause, EventSink, FinishKind,
-    FinishSummary, KvDims, Priority, SeqEvent,
+    FinishSummary, KvDims, PrefixCacheStats, Priority, SeqEvent, SsdParams,
 };
 #[cfg(feature = "metal")]
 pub use paged::{KvSpec, PagedKv, WriteRun};

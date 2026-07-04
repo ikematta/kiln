@@ -20,7 +20,7 @@
 //! have exactly one consumer each and MLX's donation turns the chain into
 //! in-place writes at eval.
 
-use kiln_mlx::{Array, MlxError, Stream, ops};
+use kiln_mlx::{Array, Dtype, MlxError, Stream, ops};
 
 use crate::block::{BlockId, CowCopy};
 
@@ -179,6 +179,101 @@ impl PagedKv {
                     ops::slice_update(&v_pool, &v_rows, &start, &stop, s)?,
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// The pools' element dtype, once fixed by the first write (or by
+    /// [`Self::ensure_pools`]).
+    pub fn dtype(&self) -> Option<Dtype> {
+        self.pools
+            .iter()
+            .flatten()
+            .next()
+            .and_then(|(k, _)| k.dtype())
+    }
+
+    /// Materializes every layer's pools at `dtype` — the SSD warm-load
+    /// path, where a block may be uploaded before any step has written
+    /// (and therefore before the dtype would be discovered).
+    pub fn ensure_pools(&mut self, dtype: Dtype, s: &Stream) -> Result<(), MlxError> {
+        let shape = [
+            self.spec.num_blocks as i32,
+            self.spec.kv_heads,
+            self.spec.block_size as i32,
+            self.spec.head_dim,
+        ];
+        for slot in &mut self.pools {
+            if slot.is_none() {
+                *slot = Some((ops::zeros(&shape, dtype, s)?, ops::zeros(&shape, dtype, s)?));
+            }
+        }
+        Ok(())
+    }
+
+    /// Serializes one block: for each layer, the K rows then the V rows
+    /// (`kv_heads * block_size * head_dim` elements each) as raw bytes —
+    /// the SSD slab payload (see `crate::ssd` for the layout). Forces
+    /// evaluation of the pool chain, so callers only capture settled
+    /// blocks outside the pipelined fast path.
+    pub fn read_block_bytes(&self, block: BlockId, s: &Stream) -> Result<Vec<u8>, MlxError> {
+        let (h, d, bs) = (
+            self.spec.kv_heads,
+            self.spec.head_dim,
+            self.spec.block_size as i32,
+        );
+        let b = block.index() as i32;
+        let mut bytes = Vec::new();
+        for (layer, slot) in self.pools.iter().enumerate() {
+            let (k_pool, v_pool) = slot.as_ref().ok_or_else(|| MlxError {
+                message: format!("block capture from unwritten layer {layer}"),
+            })?;
+            for pool in [k_pool, v_pool] {
+                let rows = ops::slice(pool, &[b, 0, 0, 0], &[b + 1, h, bs, d], s)?;
+                let rows = ops::contiguous(&rows, s)?;
+                bytes.extend_from_slice(&rows.data_raw_bytes()?);
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Uploads one serialized block (the inverse of
+    /// [`Self::read_block_bytes`]) into the pools at `dtype`.
+    pub fn write_block_bytes(
+        &mut self,
+        block: BlockId,
+        bytes: &[u8],
+        dtype: Dtype,
+        s: &Stream,
+    ) -> Result<(), MlxError> {
+        self.ensure_pools(dtype, s)?;
+        let (h, d, bs) = (
+            self.spec.kv_heads,
+            self.spec.head_dim,
+            self.spec.block_size as i32,
+        );
+        let plane = (h * bs * d) as usize * dtype.size();
+        if bytes.len() != plane * 2 * self.spec.layers {
+            return Err(MlxError {
+                message: format!(
+                    "block payload of {} bytes does not match the pool geometry ({} expected)",
+                    bytes.len(),
+                    plane * 2 * self.spec.layers
+                ),
+            });
+        }
+        let run = [WriteRun {
+            block,
+            row_start: 0,
+            src_start: 0,
+            len: bs,
+        }];
+        for layer in 0..self.spec.layers {
+            let at = layer * 2 * plane;
+            let keys = Array::from_raw_bytes(&bytes[at..at + plane], &[1, h, bs, d], dtype)?;
+            let values =
+                Array::from_raw_bytes(&bytes[at + plane..at + 2 * plane], &[1, h, bs, d], dtype)?;
+            self.write(layer, &run, &keys, &values, s)?;
         }
         Ok(())
     }
