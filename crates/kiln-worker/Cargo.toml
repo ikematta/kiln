@@ -5,4 +5,22 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = ["metal"]
+# The whole worker needs MLX; without it (Linux CI compile-check) main is a
+# stub that exits.
+metal = ["kiln-mlx/metal", "kiln-models/metal", "kiln-engine/metal"]
+
 [dependencies]
+kiln-engine = { workspace = true, default-features = false }
+kiln-mlx = { workspace = true, default-features = false }
+kiln-models = { workspace = true, default-features = false }
+kiln-proto.workspace = true
+async-stream.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

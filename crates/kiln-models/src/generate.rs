@@ -120,11 +120,11 @@ where
 
     // One sampled step: forward -> last-position logits -> [processor] ->
     // logprobs -> token.
-    let mut step = |tokens: &Array,
-                    caches: &mut Vec<KvCache>,
-                    history: &[u32],
-                    process_logits: &mut Option<P>,
-                    sample: &mut S|
+    let step = |tokens: &Array,
+                caches: &mut Vec<KvCache>,
+                history: &[u32],
+                process_logits: &mut Option<P>,
+                sample: &mut S|
      -> Result<Array, ModelError> {
         let logits = model.forward(tokens, caches, s)?;
         let (l, vocab) = (logits.dim(1), logits.dim(2));

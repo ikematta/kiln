@@ -1,8 +1,121 @@
 #![deny(unsafe_code)]
-//! `kiln-worker`: the native Rust model worker (SPEC §2.1). Implemented from
-//! Phase 3 onward; stub until then.
+//! `kiln-worker`: the native Rust model worker (SPEC §2.1) — a tonic gRPC
+//! server over a Unix domain socket, wiring kiln-models' Llama
+//! implementation and kiln-engine's sampler behind the frozen
+//! `worker.proto`. Single request at a time (Phase 3); continuous batching
+//! arrives with Phase 4.
+//!
+//! Spawned by the gateway supervisor with the same argv contract as the
+//! Python worker: `--model <dir> --socket <path> --model-id <id>`.
 
+#[cfg(feature = "metal")]
+mod engine;
+#[cfg(feature = "metal")]
+mod modelinfo;
+#[cfg(feature = "metal")]
+mod service;
+
+#[cfg(feature = "metal")]
+fn main() -> std::process::ExitCode {
+    use std::path::PathBuf;
+
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
+
+    let mut model: Option<PathBuf> = None;
+    let mut socket: Option<PathBuf> = None;
+    let mut model_id: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
+        let result = match arg.as_str() {
+            "--model" => value("--model").map(|v| model = Some(PathBuf::from(v))),
+            "--socket" => value("--socket").map(|v| socket = Some(PathBuf::from(v))),
+            "--model-id" => value("--model-id").map(|v| model_id = Some(v)),
+            other => Err(format!("unknown argument {other:?}")),
+        };
+        if let Err(err) = result {
+            eprintln!("kiln-worker: {err}");
+            eprintln!("usage: kiln-worker --model <dir> --socket <path> [--model-id <id>]");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    let (Some(model), Some(socket)) = (model, socket) else {
+        eprintln!("usage: kiln-worker --model <dir> --socket <path> [--model-id <id>]");
+        return std::process::ExitCode::FAILURE;
+    };
+    let model_id = model_id.unwrap_or_else(|| {
+        model
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_owned())
+    });
+
+    match run(model, socket, model_id) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("kiln-worker: {err}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+fn run(
+    model: std::path::PathBuf,
+    socket: std::path::PathBuf,
+    model_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+
+    use kiln_proto::v1::worker_server::WorkerServer;
+
+    // Startup order per CLAUDE.md: error handler before any MLX work (the
+    // engine thread calls init() again — idempotent), fd headroom for
+    // sockets and the future mmap'd slab tier.
+    kiln_mlx::init();
+    match kiln_mlx::os::raise_nofile_limit(4096) {
+        Ok(limit) => tracing::debug!(limit, "RLIMIT_NOFILE"),
+        Err(err) => tracing::warn!(error = %err, "failed to raise RLIMIT_NOFILE"),
+    }
+
+    // Static info is filesystem-only, so GetInfo/Health answer correctly
+    // while (and even if) the model load fails on the engine thread.
+    let info = modelinfo::read_static_info(&model)?;
+    tracing::info!(model = %model_id, path = %model.display(),
+        dtype = %info.dtype, "starting worker");
+
+    let shared = Arc::new(engine::Shared::new(model_id, info));
+    let submissions = engine::spawn(model.clone(), Arc::clone(&shared))?;
+    let service = service::WorkerService::new(shared, submissions);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        // A stale socket from a crashed predecessor would fail the bind.
+        if socket.exists() {
+            std::fs::remove_file(&socket)?;
+        }
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        tracing::info!(socket = %socket.display(), "listening");
+        let incoming = async_stream::stream! {
+            loop {
+                yield listener.accept().await.map(|(stream, _addr)| stream);
+            }
+        };
+        tonic::transport::Server::builder()
+            .add_service(WorkerServer::new(service))
+            .serve_with_incoming(incoming)
+            .await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+}
+
+#[cfg(not(feature = "metal"))]
 fn main() {
-    eprintln!("kiln-worker is not implemented yet (Phase 3, see docs/SPEC.md §12)");
+    eprintln!("kiln-worker was built without the `metal` feature; it needs MLX to serve.");
     std::process::exit(1);
 }

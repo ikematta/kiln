@@ -1000,6 +1000,20 @@ dependencies = [
 [[package]]
 name = "kiln-worker"
 version = "0.0.1"
+dependencies = [
+ "async-stream",
+ "kiln-engine",
+ "kiln-mlx",
+ "kiln-models",
+ "kiln-proto",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "lazy_static"
