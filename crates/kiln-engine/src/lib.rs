@@ -13,8 +13,10 @@ pub mod block;
 pub mod engine;
 #[cfg(feature = "metal")]
 pub mod paged;
+pub mod radix;
 #[cfg(feature = "metal")]
 pub mod sampler;
+pub mod ssd;
 #[cfg(feature = "metal")]
 pub mod step;
 
@@ -27,7 +29,9 @@ pub use engine::{
 };
 #[cfg(feature = "metal")]
 pub use paged::{KvSpec, PagedKv, WriteRun};
+pub use radix::{ChainHash, RadixCache};
 #[cfg(feature = "metal")]
 pub use sampler::{PenaltyOptions, Sampler, SamplingOptions, apply_penalties};
+pub use ssd::{SlabGeometry, SsdStore};
 #[cfg(feature = "metal")]
 pub use step::{SeqStep, StepBatch, StepInput, StepModel};

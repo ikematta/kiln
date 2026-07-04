@@ -1063,6 +1063,7 @@ dependencies = [
  "criterion",
  "kiln-mlx",
  "proptest",
+ "sha2",
  "thiserror",
 ]
 

@@ -14,6 +14,11 @@ metal = ["kiln-mlx/metal"]
 
 [dependencies]
 kiln-mlx = { workspace = true, default-features = false }
+# Chained prefix digests for the radix tree + persisted SSD index (SPEC
+# §6.3/§6.4): keys must be collision-resistant because a collision would
+# serve another prompt's KV; already a workspace dependency (kiln-worker
+# uses it for model fingerprints). BSD/MIT-Apache dual licensed.
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

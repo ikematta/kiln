@@ -57,6 +57,10 @@ pub enum BlockError {
     /// A table's token count overflowed `usize`.
     #[error("token count overflow")]
     TokenCountOverflow,
+    /// Full-block adoption requires a block-aligned table (see
+    /// [`BlockTable::push_full_block`]).
+    #[error("table is not block-aligned for full-block adoption")]
+    MisalignedAdoption,
 }
 
 /// Physical copy the engine must perform: block `src`'s rows into `dst`,
@@ -305,6 +309,56 @@ impl BlockTable {
         }
         self.num_tokens = new_total;
         Ok(AppendPlan { cow, appended })
+    }
+
+    /// Appends one *full* block of tokens backed by `id` — the prefix-cache
+    /// reuse path (SPEC §6.3): the caller has already taken an owner
+    /// reference on `id` (e.g. `BlockManager::retain`) and this table
+    /// assumes it. Only valid while the table is block-aligned; reused
+    /// blocks always precede any partially filled tail.
+    pub fn push_full_block(&mut self, id: BlockId, block_size: usize) -> Result<(), BlockError> {
+        if !self.num_tokens.is_multiple_of(block_size) {
+            // A partial tail means this table already diverged from the
+            // shared prefix; adopting a full block behind it would misalign
+            // every later position.
+            return Err(BlockError::MisalignedAdoption);
+        }
+        self.num_tokens = self
+            .num_tokens
+            .checked_add(block_size)
+            .ok_or(BlockError::TokenCountOverflow)?;
+        self.blocks.push(id);
+        Ok(())
+    }
+
+    /// Appends a *partially used* shared block carrying `rows` tokens —
+    /// the prefix-cache containment path, where the reused region ends
+    /// mid-block. Must be the table's final reuse: the table is no longer
+    /// block-aligned afterwards, and the next `append_tokens` write into
+    /// the shared tail resolves through copy-on-write.
+    pub fn push_partial_block(
+        &mut self,
+        id: BlockId,
+        rows: usize,
+        block_size: usize,
+    ) -> Result<(), BlockError> {
+        if rows == 0 || rows >= block_size || !self.num_tokens.is_multiple_of(block_size) {
+            return Err(BlockError::MisalignedAdoption);
+        }
+        self.num_tokens = self
+            .num_tokens
+            .checked_add(rows)
+            .ok_or(BlockError::TokenCountOverflow)?;
+        self.blocks.push(id);
+        Ok(())
+    }
+
+    /// Dismantles the table into its blocks *without* releasing ownership —
+    /// the finish-time donation path, where full prefix blocks move into
+    /// the radix cache and the remainder is released individually. The
+    /// caller inherits one owner reference per returned block.
+    pub fn into_blocks(self) -> Vec<BlockId> {
+        self.blocks
     }
 
     /// Clones the table, adding an owner to every block (prefix sharing).
