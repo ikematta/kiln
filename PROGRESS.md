@@ -1413,3 +1413,92 @@
   until an in-engine reservoir exists (criterion covers the gate);
   (c) partial tails are not persisted (see Decisions) — restart
   containment holds when generation crossed a block boundary.
+
+## [2026-07-04] Phase 5 / Gate follow-up — multi-turn reuse quantification — DONE
+- What:
+  - PM asked for the real-world impact of the trim-to-canonical-chunk
+    rule before merging. Added
+    `crates/kiln-models/tests/prefix_multiturn.rs`: a realistic 8-turn
+    conversation (600-token opening prompt; each turn appends the
+    64-token reply plus a 90-200-token user increment) run sequentially
+    against the warm cache, with a cache-cold reference per turn. The
+    test asserts only correctness (warm == cold bit-exact every turn —
+    holds — and that any served hit obeys the canonical-boundary rule);
+    the skip percentages are measurements, not gates.
+  - Measured (debug build, M-series, llama-3.2-1b-4bit):
+    ```
+    turn | prompt | reused | skip%  | F=32 would | warm TTFT | cold TTFT
+       0 |    600 |      0 |   0.0% |          0 |   384.7ms |   369.9ms
+       1 |    844 |      0 |   0.0% |        640 |   518.7ms |   520.2ms
+       2 |   1028 |      0 |   0.0% |        896 |   624.7ms |   634.5ms
+       3 |   1252 |      0 |   0.0% |       1088 |   769.8ms |   771.8ms
+       4 |   1406 |      0 |   0.0% |       1312 |   838.3ms |   840.5ms
+       5 |   1670 |      0 |   0.0% |       1440 |  1014.1ms |  1019.6ms
+       6 |   1884 |      0 |   0.0% |       1728 |  1135.7ms |  1152.4ms
+       7 |   2088 |      0 |   0.0% |       1920 |  1362.7ms |  1288.7ms
+    ```
+    Every turn: 0% skip; warm TTFT == cold TTFT, growing linearly with
+    conversation length. Turn 7's donor overlap was 1947 tokens and
+    still trimmed to zero (floor(1947/2048)·2048). A block-granular
+    (F=32) trim would have served 76-93% per turn; F=256 within ~7% of
+    that. The cache currently pays only for exact resubmits/retries
+    (containment: 100% skip, 62x TTFT) and shared prefixes >= 2048.
+- Direct answer: **2048-token granularity is not acceptable if
+  multi-turn conversations are part of the caching value proposition.**
+  For the entire realistic conversation window (< ~2k accumulated
+  tokens) the prefix cache does nothing, and per-turn TTFT grows
+  linearly exactly where prefix caching is supposed to flatten it.
+- DECISION NEEDED: how to narrow reuse granularity without reopening
+  the chunk-shape bit-divergence bug that e2e caught (KV bits depend on
+  prefill chunk shapes; a warm remainder recomputed in a shape the cold
+  run never uses can flip greedy outputs).
+  - **Option A — keep 2048 (status quo).** Zero risk, zero work. The
+    cache remains a resubmit/retry and long-RAG-prefix feature until
+    revisited (e.g., alongside Phase 7 kernel work). Multi-turn gets
+    nothing.
+  - **Option B — hybrid canonical schedule with a fine absolute grid in
+    the tail (recommended, pending approval).** Keep 2048-token bulk
+    chunks; process the *final partial 2048 super-chunk* of every
+    prefill on an absolute F-token grid (chunks split at absolute
+    multiples of F, plus the final sub-F remainder). Warm resumes may
+    then start at any F boundary: every recomputed segment is a
+    (offset, length) pair the cold path uses *for that same prompt* —
+    the fixed-set-of-shapes requirement — so bit-exactness holds by
+    construction rather than by kernel-dispatch luck. Expected
+    multi-turn skip from the measured overlaps: 76-93% per turn at
+    F=32; F=64 within one block of that while halving the added
+    dispatches. Costs/risks, and why this needs a PM decision:
+    (1) it changes the canonical schedule for every prompt whose tail
+    is < 2048 — cold KV bits shift for all sub-2k prompts — so the
+    golden suite must be re-validated against the mlx-lm reference,
+    whose own schedule stays one 2048 chunk; if any fixture's token ids
+    diverge, proceeding requires the SPEC §11.2 relaxed bar + ADR
+    (human approval), else fall back to A. This is the gating risk.
+    (2) Cold prefill gains up to 2048/F extra small forwards for the
+    tail region (~32 at F=64); needs a before/after TTFT bench as part
+    of acceptance. (3) Containment/partial-tail behavior (exact
+    resubmits at 100%) is unaffected.
+  - **Option C — ADR relaxing bit-determinism for divergent-prefix hits
+    only (vLLM-style).** Serve block-granular reuse and accept low-bit
+    KV drift on extended prompts (exact resubmits stay bit-exact via
+    containment). Maximum reuse, no schedule change, but it repeals the
+    CLAUDE.md/SPEC determinism clause for a whole request class and
+    requires carving exceptions into the tests that assert it — not
+    recommended while B is untried.
+  - Recommendation if forced to pick: **B at F=64**, gated on the
+    golden suite staying exact after the schedule change and a
+    cold-TTFT bench delta within noise; escalate to A-vs-C only if a
+    golden fixture diverges. Not implemented — no caching-logic changes
+    in this session per instruction.
+- Deviations: none (investigation + one test only).
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --test prefix_multiturn -- --nocapture
+  (table above) ... warm == cold bit-exact on all 8 turns; served hits
+  obey the canonical-boundary rule; live objects back to baseline
+  test result: ok. 1 passed in 25.58s
+  $ cargo fmt --all --check -> clean
+  $ cargo clippy -p kiln-models --all-targets -- -D warnings -> clean
+  ```
+- Next: PM decision on the granularity options above; Phase 5 merge
+  gate otherwise unchanged (previous entry).
