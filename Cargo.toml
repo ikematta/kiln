@@ -50,7 +50,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 prometheus = { version = "0.14", default-features = false }
 uuid = { version = "1", features = ["v7"] }
-argon2 = "0.5"
+argon2 = { version = "0.5", features = ["std"] }
 async-stream = "0.3"
 # Intra-workspace crates.
 kiln-proto = { path = "crates/kiln-proto" }
