@@ -511,3 +511,34 @@
   over UDS, GetInfo/Health from the loaded model) + gateway routing to the
   Rust worker with gateway-side tokenization and incremental detok; then
   Phase 4 per SPEC §12.
+
+## [2026-07-04] Phase 3 / Follow-up — per-module quantization overrides — DONE
+- What: closeout review found the "Deviations" claim in the previous entry
+  ("mixed-precision checkpoints fail loudly at load") was WRONG and untested:
+  Quantization's derived Deserialize silently ignored unknown keys, so a
+  config.json with per-module override entries loaded as plain uniform
+  quantization and would have failed at the first forward pass with an
+  opaque MLX shape error — or quietly misread a module. Verified by probe
+  (loader returned Ok on an override-carrying config), then fixed:
+  LlamaConfig::from_json_str now validates the raw quantization object —
+  per-module keys are rejected at load with UnsupportedQuantization naming
+  the offending modules and the python-worker route; non-affine modes
+  rejected by name; "mode": "affine" accepted. Unit tests cover both
+  override forms (dict and false), the error variant, message contents,
+  and that the uniform golden-model block still loads.
+- Decisions: manual raw-JSON validation over serde deny_unknown_fields —
+  the latter would return a generic Parse error, reject the legitimate
+  "mode": "affine" key, and not name the route-to-python remedy.
+- Deviations: none (this corrects the record of the previous entry).
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models   (KILN_TEST_MODELS set)
+  test config::tests::per_module_quantization_overrides_are_a_named_load_error ... ok
+  test config::tests::quantization_mode_affine_accepted_others_named ... ok
+  test config::tests::uniform_quantization_still_loads ... ok
+  (+ 3 prior config tests, golden parity, 1k-iteration leak gate: all ok)
+  $ cargo fmt --check && cargo clippy -p kiln-models --all-targets -- -D warnings
+  clean
+  ```
+- Next: unchanged — Phase 3 remainder (kiln-worker gRPC binary + gateway
+  token_ids path + incremental detok), pending PM phase gate.
