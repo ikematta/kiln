@@ -13,6 +13,10 @@ metal = []
 
 [dependencies]
 thiserror.workspace = true
+# Read-only weight-file mapping (SPEC §3: safetensors mmap loading). Lives in
+# kiln-mlx because Mmap::map is unsafe and unsafe is confined to this crate;
+# std has no mmap. MIT/Apache-2.0.
+memmap2 = "0.9"
 
 [build-dependencies]
 cmake.workspace = true

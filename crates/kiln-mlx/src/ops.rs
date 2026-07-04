@@ -56,6 +56,10 @@ unary_op!(
     /// Elementwise e^x.
     exp, mlx_exp
 );
+unary_op!(
+    /// Elementwise -x.
+    negative, mlx_negative
+);
 
 binary_op!(
     /// Elementwise a + b (with broadcasting).
@@ -256,6 +260,14 @@ pub fn argmax(a: &Array, axis: i32, keepdims: bool, s: &Stream) -> Result<Array>
 pub fn max(a: &Array, axis: i32, keepdims: bool, s: &Stream) -> Result<Array> {
     let mut out = Array::new_handle();
     check(unsafe { sys::mlx_max_axis(out.raw_out(), a.raw(), axis, keepdims, s.raw()) })?;
+    Ok(out)
+}
+
+/// Partition indices along `axis`: indices of elements `<=` the `kth`
+/// element come first (order within partitions undefined).
+pub fn argpartition(a: &Array, kth: i32, axis: i32, s: &Stream) -> Result<Array> {
+    let mut out = Array::new_handle();
+    check(unsafe { sys::mlx_argpartition_axis(out.raw_out(), a.raw(), kth, axis, s.raw()) })?;
     Ok(out)
 }
 

@@ -22,6 +22,8 @@ pub mod error;
 #[cfg(feature = "metal")]
 pub mod fast;
 #[cfg(feature = "metal")]
+pub mod io;
+#[cfg(feature = "metal")]
 pub mod memory;
 #[cfg(feature = "metal")]
 pub mod ops;
