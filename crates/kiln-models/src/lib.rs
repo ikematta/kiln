@@ -19,7 +19,7 @@ pub mod weights;
 
 pub use config::{ConfigError, LlamaConfig, Quantization, RopeScaling};
 #[cfg(feature = "metal")]
-pub use generate::{GenerateOutput, generate};
+pub use generate::{GenerateOutput, generate, generate_with};
 #[cfg(feature = "metal")]
 pub use kv_cache::KvCache;
 #[cfg(feature = "metal")]

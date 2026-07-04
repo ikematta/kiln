@@ -53,9 +53,48 @@ pub fn generate(
     model: &LlamaModel,
     prompt: &[u32],
     max_tokens: usize,
-    mut sample: impl FnMut(&Array, &Stream) -> Result<Array, MlxError>,
+    sample: impl FnMut(&Array, &Stream) -> Result<Array, MlxError>,
     s: &Stream,
 ) -> Result<GenerateOutput, ModelError> {
+    generate_with(
+        model,
+        prompt,
+        max_tokens,
+        None::<fn(&[u32], &Array, &Stream) -> Result<Array, MlxError>>,
+        sample,
+        |_| true,
+        s,
+    )
+}
+
+/// [`generate`] with the worker-facing hooks:
+///
+/// - `process_logits(history, logits)` runs on the last-position logits
+///   BEFORE logprob normalization (mlx-lm's logits-processor slot — where
+///   penalties live). `history` follows mlx-lm's semantics: the last prompt
+///   token plus everything generated so far, including the token being fed
+///   this step. Because Kiln's penalties compute their token window
+///   host-side, a `Some` processor forfeits the one-step async_eval
+///   pipeline: each token is read back before the next step's graph is
+///   built. `None` keeps the fully pipelined greedy/sampling path.
+/// - `on_token(token)` fires per generated token (the worker streams a
+///   `TokenChunk` and checks stop conditions here); returning `false` stops
+///   generation. On the pipelined path one extra step is already scheduled
+///   when it returns `false` — the ≤2-step cancel bound the proto promises.
+pub fn generate_with<P, S, T>(
+    model: &LlamaModel,
+    prompt: &[u32],
+    max_tokens: usize,
+    mut process_logits: Option<P>,
+    mut sample: S,
+    mut on_token: T,
+    s: &Stream,
+) -> Result<GenerateOutput, ModelError>
+where
+    P: FnMut(&[u32], &Array, &Stream) -> Result<Array, MlxError>,
+    S: FnMut(&Array, &Stream) -> Result<Array, MlxError>,
+    T: FnMut(u32) -> bool,
+{
     if prompt.is_empty() {
         return Err(ModelError::Mismatch("empty prompt".to_owned()));
     }
@@ -79,45 +118,103 @@ pub fn generate(
         memory::clear_cache()?;
     }
 
-    // One sampled step: forward -> last-position logits -> logprobs -> token.
-    let mut step = |tokens: &Array, caches: &mut Vec<KvCache>| -> Result<Array, ModelError> {
+    // One sampled step: forward -> last-position logits -> [processor] ->
+    // logprobs -> token.
+    let mut step = |tokens: &Array,
+                    caches: &mut Vec<KvCache>,
+                    history: &[u32],
+                    process_logits: &mut Option<P>,
+                    sample: &mut S|
+     -> Result<Array, ModelError> {
         let logits = model.forward(tokens, caches, s)?;
         let (l, vocab) = (logits.dim(1), logits.dim(2));
         let last = ops::slice(&logits, &[0, l - 1, 0], &[1, l, vocab], s)?;
-        let last = ops::reshape(&last, &[1, vocab], s)?;
+        let mut last = ops::reshape(&last, &[1, vocab], s)?;
+        if let Some(process) = process_logits.as_mut() {
+            last = process(history, &last, s)?;
+        }
         // mlx-lm: logprobs = logits - logsumexp(logits, keepdims=True)
         let logprobs = ops::subtract(&last, &ops::logsumexp(&last, true, s)?, s)?;
         Ok(sample(&logprobs, s)?)
     };
 
+    // mlx-lm processor history: the sampled steps' inputs — last prompt
+    // token, then each generated token as it is fed back.
+    let mut history: Vec<u32> = vec![prompt[total - 1]];
     let tail = Array::from_u32_slice(&prompt[total - 1..], &[1, 1])?;
-    let mut y = step(&tail, &mut caches)?;
+    let mut y = step(
+        &tail,
+        &mut caches,
+        &history,
+        &mut process_logits,
+        &mut sample,
+    )?;
     async_eval(&[&y])?;
 
     let mut tokens = Vec::with_capacity(max_tokens);
     let mut prefill_seconds = 0.0;
     let mut decode_start = Instant::now();
-    for i in 0..max_tokens {
-        // Build + schedule the next step before blocking on this token.
-        let next = if i + 1 < max_tokens {
+
+    if process_logits.is_none() {
+        // Pipelined: step i+1's graph is built and scheduled before token i
+        // is read back.
+        for i in 0..max_tokens {
+            let next = if i + 1 < max_tokens {
+                let y_in = ops::reshape(&y, &[1, 1], s)?;
+                let next = step(
+                    &y_in,
+                    &mut caches,
+                    &history,
+                    &mut process_logits,
+                    &mut sample,
+                )?;
+                async_eval(&[&next])?;
+                Some(next)
+            } else {
+                None
+            };
+            let token = y.item_u32()?;
+            if i == 0 {
+                prefill_seconds = start.elapsed().as_secs_f64();
+                decode_start = Instant::now();
+            }
+            tokens.push(token);
+            if i.is_multiple_of(256) {
+                memory::clear_cache()?;
+            }
+            if !on_token(token) {
+                break;
+            }
+            match next {
+                Some(next) => y = next,
+                None => break,
+            }
+        }
+    } else {
+        // Sequential: the host-side penalty window needs token i's value
+        // before step i+1's graph exists.
+        for i in 0..max_tokens {
+            let token = y.item_u32()?;
+            if i == 0 {
+                prefill_seconds = start.elapsed().as_secs_f64();
+                decode_start = Instant::now();
+            }
+            tokens.push(token);
+            history.push(token);
+            if i.is_multiple_of(256) {
+                memory::clear_cache()?;
+            }
+            if !on_token(token) || i + 1 == max_tokens {
+                break;
+            }
             let y_in = ops::reshape(&y, &[1, 1], s)?;
-            let next = step(&y_in, &mut caches)?;
-            async_eval(&[&next])?;
-            Some(next)
-        } else {
-            None
-        };
-        let token = y.item_u32()?;
-        if i == 0 {
-            prefill_seconds = start.elapsed().as_secs_f64();
-            decode_start = Instant::now();
-        }
-        tokens.push(token);
-        if i.is_multiple_of(256) {
-            memory::clear_cache()?;
-        }
-        if let Some(next) = next {
-            y = next;
+            y = step(
+                &y_in,
+                &mut caches,
+                &history,
+                &mut process_logits,
+                &mut sample,
+            )?;
         }
     }
     let decode_seconds = decode_start.elapsed().as_secs_f64();

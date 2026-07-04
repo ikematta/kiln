@@ -78,6 +78,10 @@ pub struct LlamaConfig {
     pub tie_word_embeddings: bool,
     #[serde(default)]
     pub quantization: Option<Quantization>,
+    /// `config.json` allows a single id or a list (Llama 3.x ships a list);
+    /// resolved via [`Self::eos_token_ids`].
+    #[serde(default)]
+    pub eos_token_id: Option<serde_json::Value>,
 }
 
 fn default_rope_theta() -> f32 {
@@ -130,6 +134,18 @@ impl LlamaConfig {
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// EOS token ids the worker stops on — the same set mlx-lm derives from
+    /// `config.json` (verified against the pinned reference: Llama-3.2's
+    /// `[128001, 128008, 128009]`). Empty when the config declares none.
+    pub fn eos_token_ids(&self) -> Vec<u32> {
+        let as_u32 = |v: &serde_json::Value| v.as_u64().and_then(|n| u32::try_from(n).ok());
+        match &self.eos_token_id {
+            Some(serde_json::Value::Array(ids)) => ids.iter().filter_map(as_u32).collect(),
+            Some(single) => as_u32(single).into_iter().collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Resolves `rope_scaling` with mlx-lm's key fallbacks and defaults
@@ -349,6 +365,22 @@ mod tests {
                 bits: 4
             })
         );
+    }
+
+    #[test]
+    fn eos_token_id_single_or_list() {
+        let mut json = llama32_json();
+        json["eos_token_id"] = serde_json::json!([128001, 128008, 128009]);
+        let config: LlamaConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(config.eos_token_ids(), vec![128001, 128008, 128009]);
+
+        json["eos_token_id"] = serde_json::json!(2);
+        let config: LlamaConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(config.eos_token_ids(), vec![2]);
+
+        json.as_object_mut().unwrap().remove("eos_token_id");
+        let config: LlamaConfig = serde_json::from_value(json).unwrap();
+        assert!(config.eos_token_ids().is_empty());
     }
 
     #[test]
