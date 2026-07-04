@@ -663,3 +663,13 @@
   $ cargo fmt --check / clippy -D warnings / ruff -> clean
   ```
 - Next: unchanged — Phase 4 per SPEC §12, pending PM phase gate.
+
+## [2026-07-04] Phase 3 / Follow-up — Linux lint CI fix — DONE
+- What: PR #1's lint job (clippy --all-targets --no-default-features,
+  Linux, no submodules) failed: kiln-models' dev-dependency forced
+  kiln-engine/metal unconditionally, feature-unifying MLX into a graph
+  that cannot build there. The metal enable now forwards through
+  kiln-models' own metal feature; dev-dep default-features off.
+- Acceptance: exact CI lint command locally → zero mlx-c builds, clippy
+  clean; full-featured clippy + golden parity + leak gate still green.
+- Next: unchanged — Phase 4 pending PM phase gate.
