@@ -11,6 +11,9 @@ default = ["metal"]
 # Disabled for the Linux CI compile-check: `cargo build --workspace --no-default-features`.
 metal = []
 
+[dependencies]
+thiserror.workspace = true
+
 [build-dependencies]
 cmake.workspace = true
 # Generates the raw FFI surface from the vendored mlx-c headers at the pin —
