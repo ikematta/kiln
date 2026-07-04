@@ -107,9 +107,15 @@ def resolve_model_dir(model: str) -> pathlib.Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="local name under $KILN_TEST_MODELS (or a path)")
-    parser.add_argument("--out", required=True, help="output dir, e.g. tests/golden/<model>/")
-    parser.add_argument("--weights-revision", help="override; default reads <model>/.kiln-revision")
+    parser.add_argument(
+        "--model", required=True, help="local name under $KILN_TEST_MODELS (or a path)"
+    )
+    parser.add_argument(
+        "--out", required=True, help="output dir, e.g. tests/golden/<model>/"
+    )
+    parser.add_argument(
+        "--weights-revision", help="override; default reads <model>/.kiln-revision"
+    )
     args = parser.parse_args()
 
     import mlx.core as mx
@@ -132,7 +138,10 @@ def main() -> None:
             sys.exit(f"{marker} missing; pass --weights-revision explicitly")
         revision = marker.read_text().strip()
 
-    print(f"reference: mlx.core {mx.__version__}, mlx-lm {mlx_lm.__version__}", file=sys.stderr)
+    print(
+        f"reference: mlx.core {mx.__version__}, mlx-lm {mlx_lm.__version__}",
+        file=sys.stderr,
+    )
     print(f"model: {model_dir} ({revision})", file=sys.stderr)
 
     model, tokenizer = mlx_lm.load(str(model_dir))
@@ -167,7 +176,10 @@ def main() -> None:
         path = out_dir / f"{name}.json"
         path.write_text(json.dumps(fixture, indent=2, ensure_ascii=True) + "\n")
         preview = tokenizer.decode(generated[:24]).replace("\n", "\\n")
-        print(f"  {path}  ({len(prompt_ids)} prompt tok) -> {preview!r}...", file=sys.stderr)
+        print(
+            f"  {path}  ({len(prompt_ids)} prompt tok) -> {preview!r}...",
+            file=sys.stderr,
+        )
 
     print(f"wrote {len(CASES)} fixtures to {out_dir}", file=sys.stderr)
 
