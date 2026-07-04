@@ -1019,6 +1019,7 @@ name = "kiln-worker"
 version = "0.0.1"
 dependencies = [
  "async-stream",
+ "hyper-util",
  "kiln-engine",
  "kiln-mlx",
  "kiln-models",
@@ -1028,6 +1029,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

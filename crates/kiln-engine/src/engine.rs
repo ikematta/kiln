@@ -18,12 +18,24 @@
 //!
 //! Both calls are evaluated together at the step boundary.
 //!
-//! Out of scope until Phase 4 parts 3/4: preemption (pool exhaustion
-//! mid-request fails the request instead), Drain, the async_eval decode
-//! pipeline, and the step-overhead criterion bench. Cancellation via the
-//! request's flag is honored between steps to preserve the worker's
-//! existing `Cancel` behavior.
+//! Preemption (SPEC §6.1): when the block pool cannot cover a planned
+//! segment, the planner frees a victim — lowest priority first, then most
+//! recently admitted — which returns to WAITING with its generated tokens
+//! retained. A resumed request re-prefills its prompt with the original
+//! chunk boundaries and then **replays** its generated tokens as
+//! single-token, non-sampled steps. Replaying them as one prefill-style
+//! chunk would move the trunk matmuls to a different M and the attention
+//! to a multi-token query length — kernel dispatches this codebase has not
+//! validated for bit-parity (see the mlx#3120 note in PROGRESS.md) —
+//! while single-token steps are exactly the shapes the batching tests
+//! already pin against solo runs. Replay emits nothing: those tokens were
+//! streamed before the preemption; `tests/preemption.rs` in kiln-models
+//! asserts a preempted request resumes onto the identical token stream.
+//!
+//! Out of scope until Phase 4 part 4: the async_eval decode pipeline and
+//! the step-overhead criterion bench.
 
+use std::cmp::Reverse;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,6 +101,17 @@ pub enum EngineError {
     Config(String),
 }
 
+/// Request priority (proto `Priority`). Variant order is the preemption
+/// order: `Batch` sorts below `Interactive`, so it is preempted first
+/// under memory pressure (SPEC §6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Priority {
+    /// Proto `PRIORITY_BATCH`: preempted first.
+    Batch,
+    /// Proto `PRIORITY_INTERACTIVE` (and `UNSPECIFIED`): the default.
+    Interactive,
+}
+
 /// Why a sequence finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishKind {
@@ -99,8 +122,19 @@ pub enum FinishKind {
     Length,
     /// Cancel flag set, or the event sink reported the receiver gone.
     Cancelled,
-    /// The request failed; see `error`.
+    /// The request failed; see `error`/`error_cause`.
     Error,
+}
+
+/// What class of failure produced `FinishKind::Error` — drives the proto
+/// `WorkerErrorCode` in the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCause {
+    /// The request can never fit the KV pool (admission refusal; proto
+    /// `WORKER_ERROR_OOM_REJECTED`).
+    Capacity,
+    /// Engine/MLX fault (proto `WORKER_ERROR_INTERNAL`).
+    Internal,
 }
 
 /// Terminal report for one request.
@@ -111,6 +145,11 @@ pub struct FinishSummary {
     pub completion_tokens: u32,
     pub matched_stop_token: Option<u32>,
     pub error: Option<String>,
+    /// Set iff `reason == Error`.
+    pub error_cause: Option<ErrorCause>,
+    /// Times this request was preempted (and later resumed) under memory
+    /// pressure (SPEC §6.1).
+    pub preemptions: u32,
     /// Submit → first sampled token readable.
     pub prefill_seconds: f64,
     /// First sampled token → finish.
@@ -129,8 +168,8 @@ pub type EventSink = Box<dyn FnMut(SeqEvent) -> bool>;
 
 /// One generation request, engine-facing (the worker maps proto
 /// `SubmitRequest` fields onto this; the caller correlates events through
-/// its `on_event` sink, so no id crosses this boundary until Cancel-by-id
-/// lands in part 3).
+/// its `on_event` sink and cancels through the shared flag, so no id
+/// crosses this boundary).
 pub struct EngineRequest {
     pub prompt: Vec<u32>,
     pub max_tokens: usize,
@@ -139,11 +178,20 @@ pub struct EngineRequest {
     /// Recent-token window for the penalties (ignored when disabled).
     pub penalty_window: usize,
     pub stop_tokens: HashSet<u32>,
+    /// Preemption class (SPEC §6.1).
+    pub priority: Priority,
     pub cancel: Arc<AtomicBool>,
     pub on_event: EventSink,
 }
 
 /// Internal per-request state.
+///
+/// Lifecycle (SPEC §6.1): WAITING (in `Engine::waiting`) → PREFILLING
+/// (`processed < prompt.len()-1`) → DECODING (feeding `history[fed]`,
+/// sampling when it is the newest history entry, replaying it silently
+/// when a preemption discarded its KV) → FINISHED. PREEMPTED = blocks
+/// released, `processed`/`fed` rewound to 0, back into `waiting` with
+/// `history` (the generated tokens) intact.
 struct Seq {
     prompt: Vec<u32>,
     max_tokens: usize,
@@ -151,25 +199,53 @@ struct Seq {
     sampler: Sampler,
     penalties: PenaltyOptions,
     penalty_window: usize,
+    priority: Priority,
+    /// Submit-order sequence number; stable across preemption, so a
+    /// resumed request keeps its seniority ("most-recently-admitted"
+    /// victims are picked by the highest `arrival`).
+    arrival: u64,
     cancel: Arc<AtomicBool>,
     on_event: EventSink,
     table: BlockTable,
-    /// Prompt tokens whose KV has been written (prefill progress).
+    /// Prompt tokens whose KV has been written (prefill progress over
+    /// `prompt[..n-1]`).
     processed: usize,
-    /// `Some(tok)` once the sequence is decoding: the next input token
-    /// (initially the last prompt token, then each sampled token).
-    next_input: Option<u32>,
     /// mlx-lm logits-processor history: last prompt token + generated.
     history: Vec<u32>,
+    /// `history` tokens fed to the model (KV written). Steady state keeps
+    /// `fed == history.len() - 1` — feed the newest entry, sample, push;
+    /// after a preemption `fed` rewinds to 0 and the gap is replayed
+    /// without sampling or emitting.
+    fed: usize,
     generated: u32,
+    preemptions: u32,
+    /// Preempted during the current iteration; moved back to `waiting`
+    /// (and reset) once the step completes.
+    preempted: bool,
     submitted_at: Instant,
     first_token_at: Option<Instant>,
     finished: bool,
 }
 
 impl Seq {
+    /// Prefill is complete: the sequence feeds decode/replay tokens.
     fn decoding(&self) -> bool {
-        self.next_input.is_some()
+        self.processed + 1 >= self.prompt.len()
+    }
+
+    /// SPEC §6.1 preemption order, as a key where the *minimum* is the
+    /// first victim: lowest priority first, then most recently admitted.
+    fn deservingness(&self) -> (Priority, Reverse<u64>) {
+        (self.priority, Reverse(self.arrival))
+    }
+
+    /// Pool blocks this request needs to reach its next sampled token:
+    /// full prefill plus (after a preemption) the replay of everything
+    /// generated so far. The §6.4 admission projection — a request is
+    /// admitted only once this fits in free blocks, so admission cannot
+    /// thrash straight back into preemption.
+    fn admission_blocks(&self, block_size: usize) -> usize {
+        (self.prompt.len() - 1 + self.history.len().max(1)).div_ceil(block_size)
     }
 }
 
@@ -179,7 +255,7 @@ fn finish(
     mgr: &mut BlockManager,
     reason: FinishKind,
     matched_stop_token: Option<u32>,
-    error: Option<String>,
+    error: Option<(ErrorCause, String)>,
 ) {
     if seq.finished {
         return;
@@ -187,17 +263,30 @@ fn finish(
     seq.finished = true;
     let now = Instant::now();
     let first = seq.first_token_at.unwrap_or(now);
+    let (error_cause, error) = match error {
+        Some((cause, detail)) => (Some(cause), Some(detail)),
+        None => (None, None),
+    };
     let summary = FinishSummary {
         reason,
         completion_tokens: seq.generated,
         matched_stop_token,
         error,
+        error_cause,
+        preemptions: seq.preemptions,
         prefill_seconds: first.duration_since(seq.submitted_at).as_secs_f64(),
         decode_seconds: now.duration_since(first).as_secs_f64(),
     };
     let _ = (seq.on_event)(SeqEvent::Finished(summary));
     let released = std::mem::take(&mut seq.table).release(mgr);
     debug_assert!(released.is_ok(), "finish released a foreign block");
+}
+
+/// One planned decode/replay segment (index into `running` + its step).
+struct DecodePlan {
+    seq: usize,
+    sample: bool,
+    step: SeqStep,
 }
 
 /// The continuous-batching engine. Single-threaded by construction: it
@@ -209,8 +298,12 @@ pub struct Engine<M> {
     config: EngineConfig,
     mgr: BlockManager,
     kv: PagedKv,
+    /// Sorted by `arrival` ascending: fresh submits append with increasing
+    /// numbers and preempted requests re-insert in order.
     waiting: VecDeque<Seq>,
     running: Vec<Seq>,
+    next_arrival: u64,
+    preemptions_total: u64,
     iterations: u64,
 }
 
@@ -255,6 +348,8 @@ impl<M: StepModel> Engine<M> {
             kv,
             waiting: VecDeque::new(),
             running: Vec::new(),
+            next_arrival: 0,
+            preemptions_total: 0,
             iterations: 0,
         })
     }
@@ -266,6 +361,22 @@ impl<M: StepModel> Engine<M> {
     /// Requests currently admitted or queued.
     pub fn num_active(&self) -> usize {
         self.waiting.len() + self.running.len()
+    }
+
+    /// Requests queued (or preempted back) to WAITING.
+    pub fn num_waiting(&self) -> usize {
+        self.waiting.len()
+    }
+
+    /// Requests currently prefilling or decoding.
+    pub fn num_running(&self) -> usize {
+        self.running.len()
+    }
+
+    /// Total preemptions since engine start (proto
+    /// `WorkerStats.requests_preempted` counts events, not requests).
+    pub fn preemptions(&self) -> u64 {
+        self.preemptions_total
     }
 
     pub fn is_idle(&self) -> bool {
@@ -294,9 +405,12 @@ impl<M: StepModel> Engine<M> {
             penalties,
             penalty_window,
             stop_tokens,
+            priority,
             cancel,
             on_event,
         } = request;
+        let arrival = self.next_arrival;
+        self.next_arrival += 1;
         let mut seq = Seq {
             prompt,
             max_tokens,
@@ -304,29 +418,36 @@ impl<M: StepModel> Engine<M> {
             sampler: Sampler::new(sampling),
             penalties,
             penalty_window,
+            priority,
+            arrival,
             cancel,
             on_event,
             table: BlockTable::new(),
             processed: 0,
-            next_input: None,
             history: Vec::new(),
+            fed: 0,
             generated: 0,
+            preemptions: 0,
+            preempted: false,
             submitted_at: Instant::now(),
             first_token_at: None,
             finished: false,
         };
         let error = if seq.prompt.is_empty() {
-            Some("empty prompt".to_owned())
+            Some((ErrorCause::Internal, "empty prompt".to_owned()))
         } else if seq.max_tokens == 0 {
-            Some("max_tokens must be >= 1".to_owned())
+            Some((ErrorCause::Internal, "max_tokens must be >= 1".to_owned()))
         } else {
             let needed = seq.prompt.len() + seq.max_tokens;
             let capacity = self.config.num_blocks * self.config.block_size;
             (needed > capacity).then(|| {
-                format!(
-                    "prompt ({}) + max_tokens ({}) exceeds the KV pool ({capacity} tokens)",
-                    seq.prompt.len(),
-                    seq.max_tokens
+                (
+                    ErrorCause::Capacity,
+                    format!(
+                        "prompt ({}) + max_tokens ({}) exceeds the KV pool ({capacity} tokens)",
+                        seq.prompt.len(),
+                        seq.max_tokens
+                    ),
                 )
             })
         };
@@ -342,7 +463,6 @@ impl<M: StepModel> Engine<M> {
         }
         // A 1-token prompt has no prefill: it decodes immediately.
         if seq.prompt.len() == 1 {
-            seq.next_input = Some(seq.prompt[0]);
             seq.history.push(seq.prompt[0]);
         }
         self.waiting.push_back(seq);
@@ -365,8 +485,9 @@ impl<M: StepModel> Engine<M> {
         }
     }
 
-    /// Cancels flagged requests between steps (Phase-3 behavior; full
-    /// `Cancel` semantics land in part 3).
+    /// Cancels flagged requests between steps (proto `Cancel`: the flag is
+    /// honored within 2 engine steps; this sweep plus the post-sample
+    /// check keep it within 1).
     fn sweep_cancelled(&mut self) {
         let mgr = &mut self.mgr;
         for seq in &mut self.waiting {
@@ -385,12 +506,20 @@ impl<M: StepModel> Engine<M> {
 
     /// SPEC §6.2 step 1: admit while the token budget allows. One request
     /// prefills at a time (each step carries at most one prefill chunk),
-    /// so admission pauses while a prefill is in flight.
+    /// so admission pauses while a prefill is in flight; the head of the
+    /// queue additionally waits until its admission projection fits in
+    /// free blocks (SPEC §6.4).
     fn admit(&mut self) {
         loop {
             let mid_prefill = self.running.iter().any(|seq| !seq.decoding());
             let budget_left = self.running.len() < self.config.max_batch_tokens;
             if mid_prefill || !budget_left {
+                return;
+            }
+            let Some(head) = self.waiting.front() else {
+                return;
+            };
+            if self.mgr.num_free() < head.admission_blocks(self.mgr.block_size()) {
                 return;
             }
             match self.waiting.pop_front() {
@@ -403,82 +532,78 @@ impl<M: StepModel> Engine<M> {
     fn run_iteration(&mut self) -> Result<(), EngineError> {
         self.iterations += 1;
 
-        // --- Build (SPEC §6.2 step 2). Decode group first in `running`
-        // order; then at most one prefill chunk.
-        let mut decode_ids: Vec<usize> = Vec::new();
-        let mut prefill_id: Option<usize> = None;
-        for (i, seq) in self.running.iter().enumerate() {
-            if seq.decoding() {
-                decode_ids.push(i);
-            } else if prefill_id.is_none() {
-                prefill_id = Some(i);
-            }
-        }
-
-        let mut decode_batch = StepBatch {
-            tokens: Vec::with_capacity(decode_ids.len()),
-            seqs: Vec::with_capacity(decode_ids.len()),
-        };
-        let mut sampled_ids: Vec<usize> = Vec::with_capacity(decode_ids.len());
-        for &i in &decode_ids {
-            let seq = &mut self.running[i];
-            // `decoding()` guarantees next_input is set.
-            let Some(token) = seq.next_input else {
+        // --- Plan (SPEC §6.2 step 2, §6.1 preemption): decode/replay
+        // segments in `running` order, then at most one prefill chunk.
+        // Planning is pure bookkeeping (block tables + write runs), so a
+        // preemption mid-plan drops the victim's segment before any
+        // compute references its blocks.
+        let mut decode_plans: Vec<DecodePlan> = Vec::new();
+        for i in 0..self.running.len() {
+            let seq = &self.running[i];
+            if seq.finished || seq.preempted || !seq.decoding() {
                 continue;
-            };
-            match build_seq_step(seq, &mut self.mgr, &mut self.kv, 1, true, &self.stream)? {
-                Some(step) => {
-                    decode_batch.tokens.push(token);
-                    decode_batch.seqs.push(step);
-                    sampled_ids.push(i);
-                }
-                None => finish(
-                    seq,
-                    &mut self.mgr,
-                    FinishKind::Error,
-                    None,
-                    Some("KV pool exhausted (preemption lands in Phase 4 part 3)".to_owned()),
-                ),
+            }
+            // Feed history[fed]; sample only at the newest entry — older
+            // entries are post-preemption replay, already streamed.
+            let sample = seq.fed + 1 == seq.history.len();
+            if let Some(step) = self.plan_step(i, 1, sample, &mut decode_plans)? {
+                decode_plans.push(DecodePlan {
+                    seq: i,
+                    sample,
+                    step,
+                });
             }
         }
-
-        let mut prefill_batch: Option<StepBatch> = None;
-        let mut prefill_seq: Option<usize> = None;
-        if let Some(i) = prefill_id {
+        let mut prefill: Option<(usize, StepBatch)> = None;
+        if let Some(i) = self
+            .running
+            .iter()
+            .position(|seq| !seq.finished && !seq.preempted && !seq.decoding())
+        {
             let budget = self
                 .config
                 .max_batch_tokens
-                .saturating_sub(decode_batch.tokens.len());
-            let seq = &mut self.running[i];
+                .saturating_sub(decode_plans.len());
+            let seq = &self.running[i];
             // Phase-3/mlx-lm chunk rule: prefill covers prompt[..n-1]; the
             // last prompt token is fed by the first sampled (decode) step.
             let remaining = seq.prompt.len() - 1 - seq.processed;
             let chunk = remaining.min(self.config.prefill_chunk).min(budget);
-            if chunk > 0 {
-                match build_seq_step(seq, &mut self.mgr, &mut self.kv, chunk, false, &self.stream)?
-                {
-                    Some(step) => {
-                        let tokens = seq.prompt[seq.processed..seq.processed + chunk].to_vec();
-                        prefill_batch = Some(StepBatch {
-                            tokens,
-                            seqs: vec![step],
-                        });
-                        prefill_seq = Some(i);
-                    }
-                    None => finish(
-                        seq,
-                        &mut self.mgr,
-                        FinishKind::Error,
-                        None,
-                        Some("KV pool exhausted (preemption lands in Phase 4 part 3)".to_owned()),
-                    ),
-                }
+            if chunk > 0
+                && let Some(step) = self.plan_step(i, chunk, false, &mut decode_plans)?
+            {
+                let seq = &self.running[i];
+                let tokens = seq.prompt[seq.processed..seq.processed + chunk].to_vec();
+                prefill = Some((
+                    i,
+                    StepBatch {
+                        tokens,
+                        seqs: vec![step],
+                    },
+                ));
+            }
+        }
+
+        let mut decode_batch = StepBatch {
+            tokens: Vec::with_capacity(decode_plans.len()),
+            seqs: Vec::with_capacity(decode_plans.len()),
+        };
+        let mut sampled_ids: Vec<usize> = Vec::new();
+        let mut replay_ids: Vec<usize> = Vec::new();
+        for plan in decode_plans {
+            let seq = &self.running[plan.seq];
+            decode_batch.tokens.push(seq.history[seq.fed]);
+            decode_batch.seqs.push(plan.step);
+            if plan.sample {
+                sampled_ids.push(plan.seq);
+            } else {
+                replay_ids.push(plan.seq);
             }
         }
 
         // --- Forward (SPEC §6.2 step 3). Prefill first so its KV writes
         // sit earliest on the pools' functional-update chain.
-        if let Some(batch) = &prefill_batch {
+        if let Some((_, batch)) = &prefill {
             let logits = self.model.forward_step(batch, &mut self.kv, &self.stream)?;
             debug_assert!(logits.is_none(), "prefill chunks never sample");
         }
@@ -486,37 +611,43 @@ impl<M: StepModel> Engine<M> {
         if !decode_batch.seqs.is_empty() {
             let logits = self
                 .model
-                .forward_step(&decode_batch, &mut self.kv, &self.stream)?
-                .ok_or_else(|| MlxError {
+                .forward_step(&decode_batch, &mut self.kv, &self.stream)?;
+            if sampled_ids.is_empty() {
+                debug_assert!(logits.is_none(), "replay-only steps never sample");
+            } else {
+                let logits = logits.ok_or_else(|| MlxError {
                     message: "model returned no logits for a decode step".to_owned(),
                 })?;
-            let vocab = logits.dim(2);
-            for (row, &i) in sampled_ids.iter().enumerate() {
-                let seq = &mut self.running[i];
-                let row = row as i32;
-                let last = ops::slice(&logits, &[0, row, 0], &[1, row + 1, vocab], &self.stream)?;
-                let mut last = ops::reshape(&last, &[1, vocab], &self.stream)?;
-                if !seq.penalties.is_disabled() {
-                    let window = seq.history.len().saturating_sub(seq.penalty_window);
-                    last = apply_penalties(
+                let vocab = logits.dim(2);
+                for (row, &i) in sampled_ids.iter().enumerate() {
+                    let seq = &mut self.running[i];
+                    let row = row as i32;
+                    let last =
+                        ops::slice(&logits, &[0, row, 0], &[1, row + 1, vocab], &self.stream)?;
+                    let mut last = ops::reshape(&last, &[1, vocab], &self.stream)?;
+                    if !seq.penalties.is_disabled() {
+                        let window = seq.history.len().saturating_sub(seq.penalty_window);
+                        last = apply_penalties(
+                            &last,
+                            &seq.history[window..],
+                            seq.penalties,
+                            &self.stream,
+                        )?;
+                    }
+                    let logprobs = ops::subtract(
                         &last,
-                        &seq.history[window..],
-                        seq.penalties,
+                        &ops::logsumexp(&last, true, &self.stream)?,
                         &self.stream,
                     )?;
+                    let token = seq.sampler.sample(&logprobs, &self.stream)?;
+                    sampled.push((i, token));
                 }
-                let logprobs = ops::subtract(
-                    &last,
-                    &ops::logsumexp(&last, true, &self.stream)?,
-                    &self.stream,
-                )?;
-                let token = seq.sampler.sample(&logprobs, &self.stream)?;
-                sampled.push((i, token));
             }
         }
 
         // --- Evaluate the step: sampled tokens + pool state together
-        // (prefill-only steps still materialize their KV writes here).
+        // (prefill/replay-only steps still materialize their KV writes
+        // here).
         {
             let mut outputs: Vec<&Array> = sampled.iter().map(|(_, token)| token).collect();
             let state = self.kv.state();
@@ -533,7 +664,7 @@ impl<M: StepModel> Engine<M> {
             }
             seq.generated += 1;
             seq.history.push(token);
-            seq.next_input = None;
+            seq.fed += 1;
             if seq.cancel.load(Ordering::Acquire) {
                 finish(seq, &mut self.mgr, FinishKind::Cancelled, None, None);
             } else if seq.stop_tokens.contains(&token) {
@@ -544,31 +675,133 @@ impl<M: StepModel> Engine<M> {
                 finish(seq, &mut self.mgr, FinishKind::Cancelled, None, None);
             } else if seq.generated as usize >= seq.max_tokens {
                 finish(seq, &mut self.mgr, FinishKind::Length, None, None);
-            } else {
-                seq.next_input = Some(token);
             }
         }
+        // Replay segments advance silently: their tokens were emitted
+        // before the preemption.
+        for &i in &replay_ids {
+            self.running[i].fed += 1;
+        }
 
-        // --- Advance prefill progress; hand fully prefilled sequences
-        // their first sampled step.
-        if let (Some(i), Some(batch)) = (prefill_seq, &prefill_batch) {
-            let seq = &mut self.running[i];
+        // --- Advance prefill progress; a fully prefilled sequence starts
+        // (or, after a preemption, resumes) feeding its history.
+        if let Some((i, batch)) = &prefill {
+            let seq = &mut self.running[*i];
             seq.processed += batch.tokens.len();
-            if seq.processed == seq.prompt.len() - 1 {
-                let last = seq.prompt[seq.processed];
-                seq.next_input = Some(last);
-                seq.history.push(last);
+            if seq.processed + 1 == seq.prompt.len() && seq.history.is_empty() {
+                seq.history.push(seq.prompt[seq.processed]);
             }
         }
 
+        // --- Preempted requests return to WAITING (SPEC §6.1), reset for
+        // re-prefill; insertion keeps the queue sorted by arrival so a
+        // resumed request keeps its seniority.
+        let mut i = 0;
+        while i < self.running.len() {
+            if self.running[i].preempted {
+                let mut seq = self.running.remove(i);
+                seq.preempted = false;
+                let at = self
+                    .waiting
+                    .iter()
+                    .position(|w| w.arrival > seq.arrival)
+                    .unwrap_or(self.waiting.len());
+                self.waiting.insert(at, seq);
+            } else {
+                i += 1;
+            }
+        }
         self.running.retain(|seq| !seq.finished);
 
         // --- SPEC §6.2 step 5: cache maintenance (Phase-3 cadence: after
         // every prefill chunk, else every 256 iterations).
-        if prefill_batch.is_some() || self.iterations.is_multiple_of(MAINTENANCE_INTERVAL) {
+        if prefill.is_some() || self.iterations.is_multiple_of(MAINTENANCE_INTERVAL) {
             memory::clear_cache()?;
         }
         Ok(())
+    }
+
+    /// Plans one segment (`len` KV slots) for `running[i]`, preempting
+    /// less-deserving requests when the pool is exhausted (SPEC §6.1).
+    /// Returns `None` when the requester itself yielded (self-preemption)
+    /// or was failed in-band; preempted victims' segments are dropped from
+    /// `plans`.
+    fn plan_step(
+        &mut self,
+        i: usize,
+        len: usize,
+        sample: bool,
+        plans: &mut Vec<DecodePlan>,
+    ) -> Result<Option<SeqStep>, EngineError> {
+        loop {
+            if let Some(step) = build_seq_step(
+                &mut self.running[i],
+                &mut self.mgr,
+                &mut self.kv,
+                len,
+                sample,
+                &self.stream,
+            )? {
+                return Ok(Some(step));
+            }
+            // Out of blocks: preempt the least-deserving block-holder
+            // (the requester competes with its own key, so a newcomer
+            // can never displace a more deserving request).
+            let victim = self
+                .running
+                .iter()
+                .enumerate()
+                .filter(|&(j, seq)| {
+                    !seq.finished && !seq.preempted && (j == i || !seq.table.blocks().is_empty())
+                })
+                .min_by_key(|(_, seq)| seq.deservingness())
+                .map(|(j, _)| j);
+            match victim {
+                Some(j) if j != i => {
+                    self.preempt(j);
+                    plans.retain(|plan| plan.seq != j);
+                }
+                _ => {
+                    // The requester is the least deserving: it yields back
+                    // to WAITING. If even an empty pool cannot cover the
+                    // segment the request is unservable — unreachable, as
+                    // submit() prechecks capacity — and fails in-band
+                    // rather than retrying forever.
+                    if self.running[i].table.blocks().is_empty()
+                        && self.mgr.num_free() == self.mgr.capacity()
+                    {
+                        let error = format!(
+                            "segment of {len} token(s) exceeds the KV pool ({} blocks x {})",
+                            self.config.num_blocks, self.config.block_size
+                        );
+                        finish(
+                            &mut self.running[i],
+                            &mut self.mgr,
+                            FinishKind::Error,
+                            None,
+                            Some((ErrorCause::Capacity, error)),
+                        );
+                    } else {
+                        self.preempt(i);
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    /// Releases `running[j]`'s blocks and rewinds it for re-prefill; the
+    /// sequence moves back to `waiting` at the end of the iteration. Its
+    /// history (generated tokens) survives — the resume replays it.
+    fn preempt(&mut self, j: usize) {
+        let seq = &mut self.running[j];
+        let released = std::mem::take(&mut seq.table).release(&mut self.mgr);
+        debug_assert!(released.is_ok(), "preemption released a foreign block");
+        seq.processed = 0;
+        seq.fed = 0;
+        seq.preemptions += 1;
+        seq.preempted = true;
+        self.preemptions_total += 1;
     }
 
     /// Fails every in-flight request and resets the pools — fault recovery
@@ -582,7 +815,7 @@ impl<M: StepModel> Engine<M> {
                 mgr,
                 FinishKind::Error,
                 None,
-                Some(format!("engine step failed: {error}")),
+                Some((ErrorCause::Internal, format!("engine step failed: {error}"))),
             );
         }
         self.running.clear();
@@ -599,8 +832,8 @@ impl<M: StepModel> Engine<M> {
 }
 
 /// Appends `len` token slots to the sequence's table and derives the write
-/// runs; `Ok(None)` means the pool is exhausted (caller fails the request
-/// until preemption lands).
+/// runs; `Ok(None)` means the pool is exhausted (the planner resolves that
+/// via preemption, SPEC §6.1).
 fn build_seq_step(
     seq: &mut Seq,
     mgr: &mut BlockManager,
@@ -616,7 +849,9 @@ fn build_seq_step(
         Err(err) => return Err(err.into()),
     };
     // No prefix sharing yet (radix cache is Phase 5), but honor the plan:
-    // a detached tail must be copied before this step writes to it.
+    // a detached tail must be copied before this step writes to it. (If a
+    // later preemption drops this segment the copy is dead work into a
+    // freed block — harmless, and unreachable until blocks are shared.)
     if let Some(cow) = plan.cow {
         kv.copy_block(cow, s)?;
     }

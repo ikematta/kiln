@@ -3,26 +3,28 @@
 //! batching loop (SPEC §6.2), which is `!Send` by construction. gRPC
 //! handler tasks only enqueue submissions and read event channels.
 //!
-//! Requests stream concurrently now: the loop drains the submission
-//! channel between engine iterations, so new requests join the running
-//! batch at the next step. Cancellation is still flag-based (checked
-//! between steps, well inside the ≤2-step budget `Cancel` promises);
-//! proper Cancel/Drain/preemption semantics land in Phase 4 part 3.
+//! Requests stream concurrently: the loop drains the submission channel
+//! between engine iterations, so new requests join the running batch at
+//! the next step. Cancellation (and Drain, which cancels through the same
+//! flags) is flag-based, checked between steps — well inside the ≤2-step
+//! budget `Cancel` promises. Memory pressure is the engine's job now
+//! (SPEC §6.1 preemption); the worker only surfaces the counters.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use kiln_engine::{
-    Engine, EngineConfig, EngineRequest, FinishKind, PenaltyOptions, SamplingOptions, SeqEvent,
+    Engine, EngineConfig, EngineRequest, ErrorCause, FinishKind, PenaltyOptions, SamplingOptions,
+    SeqEvent,
 };
 use kiln_mlx::Stream;
 use kiln_proto::v1::{
-    FinishReason, Finished, MemoryReport, SamplingParams, StoppingParams, Timings, TokenChunk,
-    TokenEvent, WorkerErrorCode, WorkerState, token_event,
+    FinishReason, Finished, MemoryReport, Priority, SamplingParams, StoppingParams, Timings,
+    TokenChunk, TokenEvent, WorkerErrorCode, WorkerState, token_event,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -37,6 +39,7 @@ pub struct Submission {
     pub prompt_ids: Vec<u32>,
     pub sampling: SamplingParams,
     pub stopping: StoppingParams,
+    pub priority: Priority,
     pub enqueued_at: Instant,
     pub handle: Arc<RequestHandle>,
     pub events: UnboundedSender<TokenEvent>,
@@ -51,17 +54,31 @@ pub struct RequestHandle {
     pub finished: AtomicBool,
 }
 
+/// Drain posture (proto `Drain`), monotonic: `NONE → GRACEFUL → IMMEDIATE`
+/// (`fetch_max`; there is no un-drain — the gateway SIGTERMs next).
+pub const DRAIN_NONE: u8 = 0;
+pub const DRAIN_GRACEFUL: u8 = 1;
+pub const DRAIN_IMMEDIATE: u8 = 2;
+
 /// State shared between the engine thread and the gRPC services.
 pub struct Shared {
     pub model_id: String,
     pub info: StaticInfo,
     state: std::sync::Mutex<(WorkerState, String)>,
     pub registry: std::sync::Mutex<HashMap<String, Arc<RequestHandle>>>,
+    /// One of the `DRAIN_*` levels. Kept separate from `state` so a Drain
+    /// received while the model is still loading survives the engine
+    /// thread's `Loading → Ready` transition.
+    pub drain: AtomicU8,
+    /// Submissions accepted by gRPC but not yet drained into the engine.
     pub waiting: AtomicU32,
+    /// Requests in the engine's WAITING queue (incl. preempted).
+    pub engine_waiting: AtomicU32,
     pub running: AtomicU32,
     pub requests_total: AtomicU64,
     pub requests_failed: AtomicU64,
     pub requests_cancelled: AtomicU64,
+    pub requests_preempted: AtomicU64,
     pub tokens_prefilled_total: AtomicU64,
     pub tokens_generated_total: AtomicU64,
     pub kv_pool_allocated_bytes: AtomicU64,
@@ -76,11 +93,14 @@ impl Shared {
             info,
             state: std::sync::Mutex::new((WorkerState::Loading, String::new())),
             registry: std::sync::Mutex::new(HashMap::new()),
+            drain: AtomicU8::new(DRAIN_NONE),
             waiting: AtomicU32::new(0),
+            engine_waiting: AtomicU32::new(0),
             running: AtomicU32::new(0),
             requests_total: AtomicU64::new(0),
             requests_failed: AtomicU64::new(0),
             requests_cancelled: AtomicU64::new(0),
+            requests_preempted: AtomicU64::new(0),
             tokens_prefilled_total: AtomicU64::new(0),
             tokens_generated_total: AtomicU64::new(0),
             kv_pool_allocated_bytes: AtomicU64::new(0),
@@ -131,6 +151,29 @@ impl Shared {
         if let Some(handle) = handle {
             handle.finished.store(true, Ordering::Release);
         }
+    }
+
+    /// Flags every live request cancelled (Drain IMMEDIATE / deadline
+    /// escalation). The engine honors the flags within its ≤2-step
+    /// `Cancel` budget.
+    pub(crate) fn cancel_all(&self) {
+        let registry = match self.registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for handle in registry.values() {
+            handle.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    /// Requests accepted but not yet finished (the registry only holds
+    /// live entries — `retire` removes finished ones).
+    pub(crate) fn live_requests(&self) -> u32 {
+        let registry = match self.registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry.len() as u32
     }
 }
 
@@ -201,7 +244,13 @@ pub fn engine_main(model_dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Submiss
         }
         shared
             .running
-            .store(engine.num_active() as u32, Ordering::Release);
+            .store(engine.num_running() as u32, Ordering::Release);
+        shared
+            .engine_waiting
+            .store(engine.num_waiting() as u32, Ordering::Release);
+        shared
+            .requests_preempted
+            .store(engine.preemptions(), Ordering::Release);
         shared
             .kv_pool_allocated_bytes
             .store(engine.kv_allocated_bytes(), Ordering::Release);
@@ -224,6 +273,7 @@ fn submit(
         prompt_ids,
         sampling,
         stopping,
+        priority,
         enqueued_at,
         handle,
         events,
@@ -307,7 +357,12 @@ fn submit(
                         tracing::error!(request_id = %request_id, error = %detail,
                             "generation failed");
                         finished.set_finish_reason(FinishReason::Error);
-                        finished.set_error_code(WorkerErrorCode::WorkerErrorInternal);
+                        finished.set_error_code(match summary.error_cause {
+                            // The request can never fit the KV pool: proto's
+                            // admission-refusal code (SPEC §6.4).
+                            Some(ErrorCause::Capacity) => WorkerErrorCode::WorkerErrorOomRejected,
+                            _ => WorkerErrorCode::WorkerErrorInternal,
+                        });
                         finished.error_detail = detail;
                         shared.requests_failed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -351,6 +406,11 @@ fn submit(
         penalties,
         penalty_window,
         stop_tokens,
+        // Proto: BATCH is preempted first; UNSPECIFIED means INTERACTIVE.
+        priority: match priority {
+            Priority::Batch => kiln_engine::Priority::Batch,
+            _ => kiln_engine::Priority::Interactive,
+        },
         cancel: Arc::clone(&handle.cancelled),
         on_event,
     });

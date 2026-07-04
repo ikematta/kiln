@@ -865,3 +865,196 @@
   in our pinned 0.31.1 build today but arrives with any quarterly mlx-c bump.
   If part 4's batch-16 golden re-verification diverges, check first which
   quantized-matmul kernel variant dispatches at the batched M vs M=1.
+
+## [2026-07-04] Phase 4 / part 3/4 — preemption (§6.1), Cancel, Drain — DONE
+- What:
+  - Step-zero check (per prompt): pre-preemption pool exhaustion was already
+    a clean in-band Finished{error} on both paths — submit() rejects
+    requests that can never fit, and mid-flight OutOfBlocks failed the one
+    request while survivors stayed bit-exact (asserted in batching.rs).
+    The one gap was the code: the worker mapped every engine error to
+    WORKER_ERROR_INTERNAL; capacity refusals now carry
+    FinishSummary.error_cause=Capacity → WORKER_ERROR_OOM_REJECTED.
+  - crates/kiln-engine/src/engine.rs: preemption in the step planner. On
+    OutOfBlocks the planner frees the least-deserving block-holder —
+    lowest Priority (new: Batch < Interactive, from proto) first, then
+    most-recently-admitted (stable `arrival` number assigned at submit,
+    kept across preemption so a resumed request keeps seniority) — and
+    retries; if the requester itself is least deserving it self-preempts.
+    Preemption releases the whole block table and rewinds
+    `processed`/`fed` to 0; the request returns to WAITING (queue kept
+    arrival-sorted) with `history` (generated tokens) intact.
+  - Resume = re-prefill prompt[..n-1] with the original chunk boundaries,
+    then replay generated tokens as single-token non-sampled steps
+    (skipping lm_head via the existing sample flag), then continue
+    sampling. Replay emits nothing and never re-checks stop/max caps.
+    Seq state reworked to `history` + `fed` cursor (replaces `next_input`;
+    computation-neutral for never-preempted requests — golden re-verified).
+  - Admission projection (§6.4-lite): the waiting-queue head is admitted
+    only once free blocks cover its path to the *next sampled token*
+    (full prefill + replay), so every admission generates ≥1 token —
+    kills preemption thrash while keeping FIFO order.
+  - crates/kiln-worker: Drain implemented per proto. GRACEFUL sets an
+    escalate-only AtomicU8 posture (survives Loading→Ready), rejects new
+    Submits in-band with WORKER_ERROR_DRAINING (double-check after
+    registry insert closes the Submit/Drain race), lets in-flight finish;
+    deadline_ms > 0 arms a task that cancels stragglers at the deadline;
+    IMMEDIATE flags every registry handle cancelled — the same flags
+    Cancel uses, so the engine loop needs no drain-specific path. Health
+    derives DRAINING over Ready; requests_waiting now includes the
+    engine's queue; requests_preempted mirrored into Shared for the
+    part-4 Stats RPC. Submission carries proto Priority into the engine.
+  - tests: kiln-models/tests/preemption.rs (same-priority victim resumes
+    bit-exact vs solo; BATCH self-preempts under an younger INTERACTIVE
+    and both match solo; cancel honored ≤2 steps mid-stream and while
+    preempted-in-WAITING; golden chat-code fixture forced through
+    preemption reproduces expected_token_ids exactly; leak-checked).
+    kiln-worker/tests/rpc.rs (black-box: spawns the real binary on a UDS,
+    tonic client — Cancel found/CANCELLED/not-found, GRACEFUL drain with
+    deadline escalation, DRAINING health + in-band rejects, IMMEDIATE
+    drain cancels in-flight). batching.rs test 5 updated: mid-flight
+    exhaustion now asserts preempt-and-resume bit-exactness instead of
+    the old in-band failure (that failure mode is superseded, not
+    weakened — the old assertion text even pointed here).
+- Decisions:
+  - Replay-as-single-token-steps rather than chunked re-prefill of
+    generated tokens: a chunk would change trunk-matmul M and give
+    attention a multi-token query — exactly the M-dependent kernel
+    dispatch class flagged in the mlx#3120 addendum — while len=1 decode
+    steps are the shapes already empirically pinned bit-exact. Perf of
+    resume is part 4's problem if it matters (preemption should be rare
+    at production pool sizes).
+  - "Most-recently-admitted" implemented as submit-order `arrival`,
+    stable across preemption; re-admission would otherwise mark the
+    victim newest and starve it. Waiting queue stays FIFO-by-arrival;
+    priority affects only victim choice (gateway-level priority
+    scheduling is Phase 9 per SPEC §12).
+  - Drain deadline semantics (proto leaves them open): GRACEFUL +
+    deadline_ms>0 escalates stragglers to cancellation at the deadline;
+    deadline_ms=0 waits indefinitely. DrainAck.requests_remaining =
+    live registry count at ack. Python worker Drain stays UNIMPLEMENTED
+    (its batching upgrade is Phase 9).
+  - Dev-deps added to kiln-worker for tests/rpc.rs: tower + hyper-util
+    (UDS connector, same pattern/deps as kiln-gateway/src/uds.rs; both
+    already in the workspace tree).
+- Deviations: none beyond part 2's recorded forward-signature deltas.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --test preemption -- --nocapture
+  same-priority preemption: victim resumed bit-exact
+  priority preemption: BATCH yielded to INTERACTIVE, both bit-exact
+  cancel honored within 1 step(s) of the flag
+  cancel-while-preempted ok, survivor bit-exact
+  golden chat-code under preemption: exact match after resume
+  test result: ok. 1 passed (no leaked mlx handles)
+  $ cargo test -p kiln-models --test golden -- --nocapture   (CRITICAL GATE, re-run)
+  golden chat-basic/chat-code/chat-multibyte/raw-continuation/raw-long-prefill
+    — exact match (batched/paged engine); test result: ok. 1 passed
+  $ cargo test -p kiln-models --test batching -> ok (incl. rewritten
+    pool-pressure case: loser preempted, resumed, both streams == solo)
+  $ cargo test -p kiln-worker --test rpc -- --nocapture
+  worker 1: cancel + graceful drain (deadline escalation) ok
+  worker 2: immediate drain ok
+  test result: ok. 1 passed in 3.89s
+  $ cargo test --workspace -> 27/27 test targets ok (leak gate incl.)
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 19 passed in 27.37s
+  $ uv run --project python/kiln_worker_py pytest python/kiln_worker_py/tests -q -> 28 passed
+  $ cargo fmt --all --check -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean  (exact CI lint shape)
+  $ cargo build --workspace --no-default-features -> clean                (exact CI compile-linux shape)
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- Next: Phase 4 part 4/4 (await prompt) — batch-16 ≥3× throughput gate
+  (re-verify decode parity at batch 16 against the mlx#3120 addendum),
+  golden re-run, criterion step-overhead bench (<200µs), async_eval decode
+  re-pipelining, Stats RPC, leak/soak acceptance.
+
+## [2026-07-04] Phase 4 / Verification — adversarial review of parts 1-3 (§6.1-6.4) — DONE
+- What (findings first, fixes after):
+  - (1) batching.rs test 5, old vs new, verdict: NOT a literal strict
+    superset as shipped. Mapping: submit-time in-band rejection kept and
+    strengthened (+error_cause=Capacity); survivor Length + bit-exact
+    stream kept verbatim; loser "Error/exhausted" replaced by the
+    strictly stronger Length + preemptions>=1 + bit-exact-vs-solo (the
+    old failure mode intentionally no longer exists, so a superset of
+    the *assertion* is impossible — the invariants are what carried
+    over). One old invariant had NO successor: `completion_tokens > 0`
+    ("failed mid-decode, not at submit") — mid-stream-ness was only
+    guaranteed by sizing, unasserted. Fixed: test 5 now steps until the
+    first preemption and asserts the loser had already streamed tokens
+    at that instant (the direct successor), then drains.
+  - (2) tests/preemption.rs section 5: BATCH request under sustained
+    pressure from sequential younger INTERACTIVE arrivals — preempted on
+    both cycles (preemptions >= 2), never starved (MAX_STEPS liveness
+    bound), resumes onto its solo stream bit-exact; the interactive
+    juniors finish untouched. Section 6 (seniority discriminator): after
+    J is preempted and resumes, a younger equal-priority K forces the
+    next collision — victim must be K; asserts J.preemptions == 1
+    exactly, which fails if arrival were (buggily) renewed on
+    re-admission and J ranked newest.
+  - (3) Coverage gap found in the pass: no test preempted a request
+    mid-PREFILL (blocks held, zero tokens generated). Section 7 covers
+    it (chunk=8, pool 9, 120-tok senior needing its 5th block 10 decode
+    steps in): junior self-preempts at 128/149 prompt tokens with an
+    asserted-empty stream, later re-prefills from scratch bit-exact.
+    First sizing attempt admitted-then-decoded before pressure landed —
+    the admission projection makes mid-prefill preemption reachable only
+    when a senior grows *during* the junior's prefill window; the final
+    sizing pins that.
+  - (4) Honesty correction to part 3's ledger claim that the admission
+    projection "kills preemption thrash": it is a snapshot heuristic,
+    not a reservation — section 7's scenario shows bounded churn
+    (readmit → partial re-prefill → re-preempt while a senior grows),
+    and a churn cycle can produce zero tokens for the churned request.
+    Global progress still holds (the most-deserving runner always
+    advances; all scenarios drain well inside the 2000-step bound). A
+    real reservation is Phase 9 admission-control territory.
+  - (5) Replay-cost forward reference recorded: new row in SPEC §14's
+    risk table (single-token replay = O(generated) forwards per resume;
+    revisit before Phase 9 makes preemption routine; chunked replay
+    gated on part 4's batched-M parity evidence / mlx#3120). SPEC edit
+    made under the review prompt's explicit sanction ("PROGRESS.md or
+    SPEC's risk table"); no normative section touched.
+  - (6) Remaining sweeps, clean: no other test file weakened across
+    adc7b03..4ba9239 (golden.rs semantics unchanged — engine rewiring +
+    priority field only; all other suites purely additive); zero
+    unwrap()/expect() outside in-file test modules in all touched crates
+    (verified per-file against `mod tests` line boundaries); proto/ and
+    docs/decisions/ untouched; dependency deltas are proptest (dev-only,
+    named by SPEC §12 Phase 4), kiln-engine dev→regular promotion
+    (intra-workspace, recorded in part 2), tower+hyper-util (dev-only,
+    justified in part 3's commit); the one added #[allow(dead_code)]
+    mirrors golden.rs's fixture-schema precedent; num_active stays live
+    via is_idle().
+- Decisions: kept the bounded-churn behavior rather than adding
+  admission reservations now (correctness unaffected, Phase 9 owns
+  policy); asserted J.preemptions == 1 exactly (not >=) in section 6
+  because the equality is the discriminator.
+- Deviations: none. SPEC §14 row is additive and PM-sanctioned.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --test preemption -- --nocapture
+  same-priority preemption: victim resumed bit-exact
+  priority preemption: BATCH yielded to INTERACTIVE, both bit-exact
+  cancel honored within 1 step(s) of the flag
+  cancel-while-preempted ok, survivor bit-exact
+  golden chat-code under preemption: exact match after resume
+  double preemption under sustained pressure: resumed bit-exact both times
+  arrival seniority stable across resume: younger K preempted, J untouched
+  mid-prefill preemption: junior re-prefilled from scratch, bit-exact
+  test result: ok. 1 passed in 13.46s (no leaked mlx handles)
+  $ cargo test -p kiln-models --test batching -> ok (test 5 now also
+    asserts the loser streamed before its first preemption)
+  $ cargo test --workspace -> 27/27 test targets ok
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 19 passed in 25.54s
+  $ cargo fmt --all --check -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean  (exact CI lint shape)
+  $ cargo build --workspace --no-default-features -> clean                (exact CI compile-linux shape)
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- Next: Phase 4 part 4/4 (await prompt) — batch-16 ≥3× throughput gate
+  (re-verify decode parity at batch 16 against the mlx#3120 addendum),
+  golden re-run, criterion step-overhead bench (<200µs), async_eval decode
+  re-pipelining, Stats RPC, leak/soak acceptance.

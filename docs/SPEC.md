@@ -418,6 +418,7 @@ Append-only ledger: `## [date] Phase N / Task M — status`, bullet summary, acc
 | Quantization format drift in mlx-community models | Router falls back to python worker on unknown `quantization` config |
 | minijinja vs HF Jinja template edge cases | Vendored templates for supported models + template unit fixtures |
 | Agent-introduced unsoundness in FFI | All `unsafe` confined to `kiln-mlx/src/sys.rs` + wrappers; review every diff touching that crate manually |
+| Preemption resume cost: a resumed request replays its generated tokens as single-token forwards for bit-exactness — O(generated) extra steps per resume (PROGRESS 2026-07-04, Phase 4 part 3) | Acceptable while preemption is rare (Phase 4 pool sizes). Before Phase 9 makes preemption routine (memory governance, INTERACTIVE/BATCH floods), either batch the replay as one chunk — requires the batched-M bit-parity evidence from Phase 4 part 4 / the mlx#3120 note — or bound resumes via admission/eviction policy |
 
 Open decisions to make before Phase 0: final project name; MSRV; whether gateway serves TLS natively or defers to a reverse proxy (recommend: localhost-only default, no TLS in v1).
 
