@@ -419,3 +419,282 @@
   ```
 - Next: Phase 3 — Rust worker v0: single-request Llama (SPEC §12), pending
   PM phase gate.
+
+## [2026-07-04] Phase 3 / Rust worker v0: single-request Llama — DONE
+- What:
+  - kiln-tokenize: crate-level BOS/special-token contract doc (written
+    first, per task instruction); tokenizer.json loading + encode/decode
+    over the HF `tokenizers` crate; `ChatTemplate::render_with` for pinned
+    template vars (date_string).
+  - scripts/gen-golden.py + tests/golden/llama-3.2-1b-4bit/ (5 fixtures):
+    generated AFTER verifying the reference stack is mlx.core 0.31.1 /
+    mlx-lm 0.31.2 (ADR 0001 follow-up B1 state — the same core MLX the
+    vendored mlx-c v0.6.0 builds). Script hard-refuses any other mlx.core.
+    Fixtures pin date_string="26 Jul 2024" (Llama templates interpolate
+    strftime_now() otherwise) and compare exactly max_tokens greedy tokens,
+    no EOS stop.
+  - kiln-mlx: bindgen-generated sys bindings from the pinned headers (SPEC
+    §7.1); safe Array/Stream RAII wrappers (!Send/!Sync, Clone via
+    mlx_array_set); recording error handler replacing mlx-c's exit()-ing
+    default; debug live-object leak counter; ops/fast/random/memory wrapper
+    surface incl. quantized_matmul/dequantize, fused rms_norm/rope/SDPA;
+    mmap io module (memmap2 confined here — unsafe stays in kiln-mlx).
+  - kiln-models: Llama config.json parsing (rope_scaling default/linear/
+    llama3), mmap'd safetensors loader (sharded or single-file), Llama
+    forward ported op-for-op from mlx_lm.models.llama (quantized linear/
+    embedding, tied lm_head, Llama3RoPE freqs in the same f32 MLX graph),
+    contiguous per-layer KV cache with mlx-lm's 256-step growth,
+    generate loop with chunked prefill + async_eval pipelining.
+  - kiln-engine: sampler (§6.6) — greedy argmax; temp/top-p/top-k/min-p +
+    seeded per-request categorical (key chain from seed, no global RNG);
+    repetition/presence/frequency penalties as a logits-processor fn.
+  - Tests: golden harness (exact token-id equality, revision-checked),
+    1k-iteration leak gate, sampler behavior suite, tokenizer BOS
+    single/double proof, wrapper FFI discipline suite; release bench
+    example for the tok/s comparison.
+- Decisions:
+  - bindgen as a kiln-mlx build-dependency (SPEC §7.1 names bindgen for
+    sys.rs); generation is metal-gated so the Linux compile-check never
+    needs libclang.
+  - mmap lives in kiln-mlx::io because Mmap::map is unsafe and unsafe is
+    confined to kiln-mlx; kiln-models consumes a safe &[u8].
+  - Fixtures store generated-only token ids and both sides re-derive
+    prompt ids (template render + encode) — tokenization parity is tested
+    together with model parity.
+  - A module is quantized iff its .scales tensor exists (mlx-lm
+    class_predicate semantics); dense f16/bf16 Linear/Embedding also
+    implemented (exercised fully in Phase 6's dtype matrix).
+  - Penalties are a separate apply_penalties on raw logits (mlx-lm
+    logits-processor semantics), wired ahead of the sampler when the
+    Phase 4 per-request pipeline exists; generate() takes a sampler
+    callback on logprobs.
+- Deviations:
+  - Contiguous KvCache lives in kiln-models, not kiln-engine — it is the
+    explicitly temporary v0 cache the Phase 4 paged block manager
+    replaces; the sampler is in kiln-engine per the repo map.
+  - Per-module quantization overrides in config.json (mixed-precision
+    dicts) are not parsed; uniform group_size/bits only. Such checkpoints
+    fail loudly at load. Revisit with the Phase 6 quantization matrix.
+  - SPEC §12 Phase 3 also lists gateway-side pieces (token_ids submit
+    path via the worker protocol, incremental detok in the gateway) and
+    the kiln-worker gRPC binary — not in this task's scope per the prompt;
+    they are the Phase 3 remainder (see Next).
+- Acceptance:
+  ```
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-models --test golden -- --nocapture
+  golden chat-basic:        48 prompt tokens,  64 generated — exact match
+  golden chat-code:         47 prompt tokens, 128 generated — exact match
+  golden chat-multibyte:    51 prompt tokens,  64 generated — exact match
+  golden raw-continuation:   6 prompt tokens,  64 generated — exact match
+  golden raw-long-prefill: 249 prompt tokens,  64 generated — exact match
+  test result: ok. 1 passed (all 5 fixtures exact)
+
+  $ single-stream decode, same model/prompt/256 tokens (3 runs each):
+  mlx-lm generate: 98.2 / 100.0 / 100.2 tok/s   (median 100.0)
+  kiln  (release): 98.3 /  96.6 /  99.4 tok/s   (median 98.3)
+  -> -1.7% median (-0.8% best-vs-best), within the -10% bar.
+     Peak memory: mlx-lm 0.742 GB, kiln 0.752 GB.
+
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-models --test leak -- --nocapture
+  leak gate: 1000 decode iterations at 94.4 tok/s, live objects during run: 389
+  leak gate: mlx active memory 0B -> 0B, live objects 0 -> 0
+  test result: ok. 1 passed
+
+  $ cargo test --workspace          -> all green (incl. 22 gateway, 16 tokenize,
+                                       2 mlx, 1 engine, 5 models targets)
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo build --workspace --no-default-features -> clean (linux compile-check path)
+  $ ruff check/format python/ tests/e2e scripts/gen-golden.py -> clean
+  $ pytest python/kiln_worker_py/tests -> 9 passed, 19 skipped (no-GPU skips unchanged)
+  ```
+- Next: Phase 3 remainder — kiln-worker gRPC binary (Submit/token_ids path
+  over UDS, GetInfo/Health from the loaded model) + gateway routing to the
+  Rust worker with gateway-side tokenization and incremental detok; then
+  Phase 4 per SPEC §12.
+
+## [2026-07-04] Phase 3 / Follow-up — per-module quantization overrides — DONE
+- What: closeout review found the "Deviations" claim in the previous entry
+  ("mixed-precision checkpoints fail loudly at load") was WRONG and untested:
+  Quantization's derived Deserialize silently ignored unknown keys, so a
+  config.json with per-module override entries loaded as plain uniform
+  quantization and would have failed at the first forward pass with an
+  opaque MLX shape error — or quietly misread a module. Verified by probe
+  (loader returned Ok on an override-carrying config), then fixed:
+  LlamaConfig::from_json_str now validates the raw quantization object —
+  per-module keys are rejected at load with UnsupportedQuantization naming
+  the offending modules and the python-worker route; non-affine modes
+  rejected by name; "mode": "affine" accepted. Unit tests cover both
+  override forms (dict and false), the error variant, message contents,
+  and that the uniform golden-model block still loads.
+- Decisions: manual raw-JSON validation over serde deny_unknown_fields —
+  the latter would return a generic Parse error, reject the legitimate
+  "mode": "affine" key, and not name the route-to-python remedy.
+- Deviations: none (this corrects the record of the previous entry).
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models   (KILN_TEST_MODELS set)
+  test config::tests::per_module_quantization_overrides_are_a_named_load_error ... ok
+  test config::tests::quantization_mode_affine_accepted_others_named ... ok
+  test config::tests::uniform_quantization_still_loads ... ok
+  (+ 3 prior config tests, golden parity, 1k-iteration leak gate: all ok)
+  $ cargo fmt --check && cargo clippy -p kiln-models --all-targets -- -D warnings
+  clean
+  ```
+- Next: unchanged — Phase 3 remainder (kiln-worker gRPC binary + gateway
+  token_ids path + incremental detok), pending PM phase gate.
+
+## [2026-07-04] Phase 3 / Closeout — Rust worker wired end-to-end — DONE
+- What:
+  - kiln-tokenize: StreamingDecoder (TGI-style two-offset incremental
+    detokenization; U+FFFD holdback so partial code points never reach SSE;
+    fuzzed against full decode — 300 random id sequences + ZWJ-emoji/CJK
+    corpora at multiple chunk schedules) and StopStringMatcher (port of the
+    python worker's stops.py; gateway-side for rust workers).
+  - kiln-models: generate_with (logits-processor slot pre-normalization with
+    mlx-lm history semantics + per-token callback whose false return stops
+    generation — the ≤2-step cancel bound); eos_token_ids() from config.json
+    (int|list — same set mlx-lm stops on). Golden parity + leak gate re-run
+    green after the refactor.
+  - kiln-mlx: os module (RLIMIT_NOFILE raise per the CLAUDE.md sharp edge;
+    process RSS via proc_pidinfo for MemoryReport). New dep libc, confined
+    to the unsafe crate.
+  - kiln-worker: the Rust worker binary — tonic gRPC over UDS behind the
+    frozen proto, same argv contract as the python worker; one engine
+    thread owns model+Stream (!Send), single request at a time;
+    GetInfo/Health (fingerprint + template-hash schemes byte-identical to
+    modelinfo.py), Submit (python-parity validation as in-band
+    Finished{ERROR}; bare-id TokenChunks — text empty by design; stop token
+    counted but never chunked), Cancel (flag between steps), Drain/Stats/
+    Tokenize UNIMPLEMENTED per phase/design. UNHEALTHY-with-detail on load
+    failure so the supervisor recycles.
+  - kiln-gateway: worker="rust" spawns kiln-worker (rust_worker_argv,
+    default = sibling binary of the gateway); startup validation of rust-
+    servable models via kiln-models config parsing (no-MLX dep); gateway
+    tokenizes locally (BOS contract) and detokenizes incrementally;
+    stop strings matched gateway-side with Cancel-on-match and honest
+    usage (drain to Finished); auto still resolves to python until the
+    Phase 6 routing matrix.
+  - tests/e2e: stack fixture parametrized over both workers (same Phase 2
+    suite gates the rust worker forever); new cross-worker parity tests.
+- Decisions:
+  - The rust worker REJECTS stop_strings/raw_text (INVALID_REQUEST) instead
+    of silently ignoring them — the gateway owns text; a misconfigured
+    caller stays loud.
+  - The stop-triggering token is counted in usage but not chunked: the
+    gateway decodes chunks verbatim and stop text is excluded by contract.
+  - Penalty-enabled requests forfeit one step of async_eval pipelining
+    (host-side penalty window needs the token value); the default path is
+    unchanged.
+  - Gateway-side stop-string match ends the request as finish_reason
+    "stop" regardless of the worker's terminal event (usually our own
+    CANCELLED).
+- Deviations: none against the task; worker="auto"→python note stands
+  (Phase 6).
+- Acceptance:
+  ```
+  $ uv run --project tests/e2e pytest tests/e2e -v     (full stack, real model)
+  test_chat.py (6 tests)                  [python] PASSED   [rust] PASSED
+  test_crash_recovery.py::kill9...        [python] PASSED   [rust] PASSED
+  test_metrics.py::counters               [python] PASSED   [rust] PASSED
+  test_cross_worker_parity.py::greedy_outputs_identical_across_workers PASSED
+  test_cross_worker_parity.py::streaming_text_identical_across_workers PASSED
+  test_cross_worker_parity.py::stop_strings_work_on_both_workers       PASSED
+  ============ 19 passed in 36.69s ============
+
+  $ side-by-side, same prompt, temperature=0 (one gateway, both workers):
+  llama-py [stop] usage=48+39: 'A kiln is a type of furnace or oven used for
+    various industrial and commercial applications, such as firing ceramics,
+    baking materials, and testing materials, to achieve specific physical or
+    chemical properties.'
+  llama-rs [stop] usage=48+39: <byte-identical text, identical usage>
+
+  $ standalone worker smoke (python grpc client over UDS): READY health with
+    memory report (rss 0.72GB), GetInfo (q4_g64, template hash matches),
+    48-token greedy chat streamed at 101.5 tok/s decode, STOP on <|eot_id|>,
+    in-band INVALID_REQUEST for malformed input, Tokenize UNIMPLEMENTED.
+
+  $ cargo test --workspace            -> 22 test targets, all ok
+    (incl. golden parity exact + 1k-iteration leak gate re-run post-refactor)
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo build --workspace --no-default-features -> clean
+  $ ruff check/format python/ tests/e2e scripts/gen-golden.py -> clean
+  $ pytest python/kiln_worker_py/tests -> 28 passed
+  ```
+- Next: Phase 4 — paged KV + continuous batching (kiln-engine core), per
+  SPEC §12, pending PM phase gate.
+
+## [2026-07-04] Phase 3 / Follow-up — stop-string usage parity — DONE
+- What: closeout verification (PM request) of two properties of the
+  gateway-side stop-string path.
+  1. completion_tokens parity on stop-string matches: NOT identical before
+     this change — the rust path passed the worker's Finished count through,
+     which includes cancel-overshoot tokens (reproduced: python 7 vs rust 8
+     for identical text '1\n2\n3\n', stop=["4"]). The gateway now freezes
+     the token count at the chunk whose text completed the stop string and
+     overrides completion_tokens on matched requests — the client-visible
+     completion length, equal to the tokenizer-owning worker's count. The
+     cross-worker parity test now asserts full (content, finish_reason,
+     prompt_tokens, completion_tokens) equality for greedy AND stop-string
+     cases.
+  2. finish_reason precedence is now documented in kiln-gateway chat.rs
+     module docs (not just ledger prose): a gateway-side match always
+     reports "stop" regardless of the worker's terminal event
+     (CANCELLED/STOP/LENGTH/ERROR). The LENGTH-as-"stop" case is accepted
+     and correct, not a race bug: the client's completion was truncated at
+     the match; the worker's reason describes an uncancelled continuation
+     the client never saw; the python worker reports STOP at the same point
+     for the identical request. Usage guarantee stated alongside.
+- Decisions: usage overridden gateway-side rather than trying to stop the
+  worker synchronously — the ≤2-step cancel bound makes worker-side counts
+  inherently overshooting; the pipeline is the authority on what the client
+  saw.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ pre-fix (chat.rs stashed), strengthened test:
+  AssertionError: stop-string usage/text divergence:
+      python: ('1\n2\n3\n', 'stop', 48, 7)
+      rust:   ('1\n2\n3\n', 'stop', 48, 8)
+  $ post-fix:
+  test_greedy_outputs_identical_across_workers PASSED
+  test_streaming_text_identical_across_workers PASSED
+  test_stop_strings_work_on_both_workers PASSED
+  ============ 3 passed in 9.53s ============
+  $ cargo fmt --check / clippy -D warnings / ruff -> clean
+  ```
+- Next: unchanged — Phase 4 per SPEC §12, pending PM phase gate.
+
+## [2026-07-04] Phase 3 / Follow-up — Linux lint CI fix — DONE
+- What: PR #1's lint job (clippy --all-targets --no-default-features,
+  Linux, no submodules) failed: kiln-models' dev-dependency forced
+  kiln-engine/metal unconditionally, feature-unifying MLX into a graph
+  that cannot build there. The metal enable now forwards through
+  kiln-models' own metal feature; dev-dep default-features off.
+- Acceptance: exact CI lint command locally → zero mlx-c builds, clippy
+  clean; full-featured clippy + golden parity + leak gate still green.
+- Next: unchanged — Phase 4 pending PM phase gate.
+
+## [2026-07-04] Phase 3 / Follow-up — unsafe-surface review findings — DONE
+- What: pre-merge manual review of the kiln-mlx unsafe surface (SPEC §14 /
+  CLAUDE.md: reviewed regardless of green tests) found the safe host-read
+  APIs unsound: MLX's item<T>/data<T> are raw reinterpreting accessors
+  (verified in the vendored sources), so wrong-dtype or non-contiguous
+  reads through the safe wrappers were UB (incl. out-of-bounds reads for
+  wider-T dtype mismatches). Latent only — every call site reads fresh
+  typed contiguous op outputs. Fixed with dtype guards on item_*/data_*,
+  a strides-based row-contiguity guard on data_*, and an ops::contiguous
+  escape hatch; wrapper tests pin all failure modes. Also re-audited the
+  metal feature graph after the CI fix: cargo tree shows [] for every kiln
+  crate under --no-default-features (dev-deps included) and no dependency
+  edge anywhere enables metal unconditionally; the Linux lint job is the
+  standing tripwire.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-mlx --test wrappers -> ok (incl. new guard cases)
+  $ cargo clippy --workspace --all-targets [-D warnings] and
+    --no-default-features variant -> both clean
+  $ cargo test --workspace -> 22 targets ok (golden parity + leak gate green)
+  ```
+- Next: unchanged — Phase 4 pending PM phase gate; PR #1 merge is the PM's
+  call after this review.

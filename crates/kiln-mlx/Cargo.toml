@@ -11,5 +11,20 @@ default = ["metal"]
 # Disabled for the Linux CI compile-check: `cargo build --workspace --no-default-features`.
 metal = []
 
+[dependencies]
+thiserror.workspace = true
+# Read-only weight-file mapping (SPEC §3: safetensors mmap loading). Lives in
+# kiln-mlx because Mmap::map is unsafe and unsafe is confined to this crate;
+# std has no mmap. MIT/Apache-2.0.
+memmap2 = "0.9"
+# setrlimit(RLIMIT_NOFILE) and proc_pidinfo RSS for MemoryReport — no std
+# equivalents; unsafe libc calls are confined to this crate. MIT/Apache-2.0.
+libc = "0.2"
+
 [build-dependencies]
 cmake.workspace = true
+# Generates the raw FFI surface from the vendored mlx-c headers at the pin —
+# SPEC §7.1 mandates bindgen for kiln-mlx/src/sys.rs. Build-time only; the
+# hand-written Phase 0 bindings it replaces could not scale to the full op
+# surface the Llama path needs without transcription risk. BSD-3-Clause.
+bindgen = "0.72"

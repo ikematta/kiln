@@ -5,4 +5,32 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = ["metal"]
+# Model implementations need MLX; config parsing compiles everywhere
+# (the Linux CI compile-check builds with --no-default-features).
+# kiln-engine/metal rides along for the dev-target-only sampler dependency:
+# forwarding it here (instead of forcing it on the dev-dependency) keeps
+# `clippy --all-targets --no-default-features` on the Linux lint runner from
+# feature-unifying MLX into the graph — there is no Metal or vendored
+# submodule there.
+metal = ["kiln-mlx/metal", "kiln-engine/metal"]
+
 [dependencies]
+kiln-mlx = { workspace = true, default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Weight-file parsing per the mlx-lm conventions (SPEC §3 tech stack:
+# "safetensors crate, mmap loading"; the mmap itself lives in kiln-mlx::io).
+# Zero-copy views over the mapped bytes. Apache-2.0.
+safetensors = "0.8"
+
+[dev-dependencies]
+# Tests/examples exercise the full generate path; they are gated on this
+# crate's `metal` feature, which forwards kiln-engine/metal (see [features]).
+kiln-engine.workspace = true
+kiln-tokenize.workspace = true
+minijinja.workspace = true
+serde.workspace = true
+serde_json.workspace = true

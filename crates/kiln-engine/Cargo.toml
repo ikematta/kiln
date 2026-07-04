@@ -5,4 +5,12 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = ["metal"]
+# The sampler (and everything else in this crate) runs on MLX; off for the
+# Linux CI compile-check (--no-default-features).
+metal = ["kiln-mlx/metal"]
+
 [dependencies]
+kiln-mlx = { workspace = true, default-features = false }
+thiserror.workspace = true

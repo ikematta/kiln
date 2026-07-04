@@ -62,6 +62,11 @@ pub struct ServerConfig {
     /// tracer bullet); packaged installs override it (SPEC §12 Phase 10).
     #[serde(default = "defaults::python_worker_argv")]
     pub python_worker_argv: Vec<String>,
+    /// Command prefix for the Rust worker (same appended args). Default: a
+    /// `kiln-worker` binary next to the running gateway binary — true for
+    /// cargo target dirs and packaged installs alike.
+    #[serde(default = "defaults::rust_worker_argv")]
+    pub rust_worker_argv: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -174,6 +179,9 @@ impl KilnConfig {
         {
             return invalid("server.python_worker_argv must name an executable".into());
         }
+        if self.server.rust_worker_argv.is_empty() || self.server.rust_worker_argv[0].is_empty() {
+            return invalid("server.rust_worker_argv must name an executable".into());
+        }
         let fraction = self.memory.budget_fraction;
         if !(fraction > 0.0 && fraction <= 1.0) {
             return invalid(format!(
@@ -235,6 +243,7 @@ impl Default for ServerConfig {
             cache_dir: defaults::cache_dir(),
             model_dir: defaults::model_dir(),
             python_worker_argv: defaults::python_worker_argv(),
+            rust_worker_argv: defaults::rust_worker_argv(),
         }
     }
 }
@@ -290,6 +299,15 @@ mod defaults {
         ]
         .map(String::from)
         .to_vec()
+    }
+    pub(super) fn rust_worker_argv() -> Vec<String> {
+        // Sibling of the gateway binary; falls back to $PATH lookup.
+        let sibling = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.join("kiln-worker")))
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned());
+        vec![sibling.unwrap_or_else(|| "kiln-worker".to_string())]
     }
     pub(super) fn budget_fraction() -> f64 {
         0.80

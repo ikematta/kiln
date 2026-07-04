@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kiln_proto::v1::WorkerInfo;
-use kiln_tokenize::ChatTemplate;
+use kiln_tokenize::{ChatTemplate, Tokenizer};
 use sha2::{Digest, Sha256};
 use tokio::sync::{RwLock, watch};
 use tonic::transport::Channel;
@@ -50,6 +50,13 @@ pub struct ModelEntry {
     pub model_path: PathBuf,
     pub socket_path: PathBuf,
     pub config: ModelConfig,
+    /// Which worker binary serves this model (Rust or Python; `auto` is
+    /// resolved at registry build).
+    pub worker_kind: WorkerKind,
+    /// Gateway-side tokenizer, loaded for Rust-worker models only: the
+    /// gateway encodes prompts (token_ids submit path, BOS contract) and
+    /// detokenizes streamed ids. Python workers own their tokenizer.
+    pub tokenizer: Option<Arc<Tokenizer>>,
     /// None when the model directory has no chat template; chat requests
     /// against such a model fail with a clear 400.
     pub template: Option<ChatTemplate>,
@@ -80,8 +87,17 @@ pub enum RegistryError {
          model downloads arrive with kiln-jobs (Phase 10) — fetch it first"
     )]
     NotLocal { id: String, path: String },
-    #[error("model '{id}': worker = \"rust\" is not available until Phase 3; use \"python\"")]
-    RustWorkerUnavailable { id: String },
+    #[error(
+        "model '{id}': the rust worker cannot serve this model ({reason}); \
+         set worker = \"python\""
+    )]
+    RustUnsupported { id: String, reason: String },
+    #[error("model '{id}': failed to load tokenizer.json for gateway-side tokenization: {source}")]
+    Tokenizer {
+        id: String,
+        #[source]
+        source: kiln_tokenize::TokenizerError,
+    },
     #[error("model '{id}': failed to build worker channel: {source}")]
     Channel {
         id: String,
@@ -112,20 +128,6 @@ impl Registry {
         let mut senders = Vec::new();
 
         for model in &config.models {
-            // Phase 2: only the Python worker exists, so `auto` resolves to
-            // python unconditionally (SPEC §12 tracer bullet).
-            match model.worker {
-                WorkerKind::Rust => {
-                    return Err(RegistryError::RustWorkerUnavailable {
-                        id: model.id.clone(),
-                    });
-                }
-                WorkerKind::Auto => {
-                    tracing::info!(model = %model.id, "worker=auto resolves to python (Phase 2)");
-                }
-                WorkerKind::Python => {}
-            }
-
             let model_path = expand_tilde(Path::new(&model.path));
             if !model_path.join("config.json").is_file() {
                 return Err(RegistryError::NotLocal {
@@ -133,6 +135,39 @@ impl Registry {
                     path: model.path.clone(),
                 });
             }
+
+            // `auto` still resolves to python until the Phase 6 routing
+            // matrix (arch + quant-format detection) lands; explicit
+            // worker="rust" is validated eagerly so a wrong arch fails at
+            // startup, not at first request.
+            let worker_kind = match model.worker {
+                WorkerKind::Rust => {
+                    kiln_models::LlamaConfig::from_model_dir(&model_path).map_err(|err| {
+                        RegistryError::RustUnsupported {
+                            id: model.id.clone(),
+                            reason: err.to_string(),
+                        }
+                    })?;
+                    WorkerKind::Rust
+                }
+                WorkerKind::Auto => {
+                    tracing::info!(model = %model.id,
+                        "worker=auto resolves to python (routing matrix lands in Phase 6)");
+                    WorkerKind::Python
+                }
+                WorkerKind::Python => WorkerKind::Python,
+            };
+            let tokenizer = match worker_kind {
+                WorkerKind::Rust => {
+                    Some(Arc::new(Tokenizer::from_model_dir(&model_path).map_err(
+                        |source| RegistryError::Tokenizer {
+                            id: model.id.clone(),
+                            source,
+                        },
+                    )?))
+                }
+                _ => None,
+            };
 
             let template = match ChatTemplate::from_model_dir(&model_path) {
                 Ok(t) => Some(t),
@@ -163,6 +198,8 @@ impl Registry {
                 model_path,
                 socket_path,
                 config: model.clone(),
+                worker_kind,
+                tokenizer,
                 template,
                 channel,
                 status: status_rx,

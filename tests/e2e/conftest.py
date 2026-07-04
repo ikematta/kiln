@@ -1,9 +1,14 @@
-"""Full-stack fixture: kiln-gateway + the Python worker + pinned tiny model.
+"""Full-stack fixture: kiln-gateway + a model worker + pinned tiny model.
 
-The session fixture builds the gateway binary, writes a throwaway kiln.toml,
-starts the gateway (which spawns the worker via the supervisor), and waits
-for /readyz. Tests then drive it exclusively over HTTP — the real `openai`
-SDK for the API surface, plain httpx for metrics/health (SPEC §11.3).
+The session fixture builds the gateway and Rust worker binaries, writes a
+throwaway kiln.toml, starts the gateway (which spawns workers via the
+supervisor), and waits for /readyz. Tests then drive it exclusively over
+HTTP — the real `openai` SDK for the API surface, plain httpx for
+metrics/health (SPEC §11.3).
+
+The `stack` fixture is parametrized over both worker kinds (Phase 3: the
+same e2e suite must pass against the Python worker and the Rust worker);
+`running_stack` is reusable for multi-model stacks (cross-worker parity).
 
 Requires the pinned Llama-3.2-1B test model (./scripts/fetch-test-model.sh);
 skips with an actionable message otherwise.
@@ -11,6 +16,7 @@ skips with an actionable message otherwise.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import pathlib
 import shutil
@@ -58,7 +64,8 @@ class Stack:
 
     def worker_pids(self) -> list[int]:
         """PIDs of worker processes, identified by the unique runtime dir in
-        their --socket argument (matches uv wrapper and python alike)."""
+        their --socket argument. Matches the python worker (uv wrapper and
+        python module alike) and the rust worker binary."""
         result = subprocess.run(
             ["pgrep", "-f", str(self.runtime_dir)],
             capture_output=True,
@@ -76,7 +83,7 @@ class Stack:
                 text=True,
                 check=False,
             ).stdout
-            if "kiln_worker_py" in cmd:
+            if "kiln_worker_py" in cmd or "kiln-worker" in cmd:
                 pids.append(pid)
         return pids
 
@@ -105,11 +112,13 @@ def tail(path: pathlib.Path, lines: int = 40) -> str:
         return "<no log>"
 
 
-def build_gateway() -> pathlib.Path:
+def build_binaries() -> pathlib.Path:
+    """Builds kiln-gateway + kiln-worker; returns the gateway binary path
+    (the worker is found by the gateway as its sibling)."""
     binary = REPO / "target" / "debug" / "kiln-gateway"
     try:
         subprocess.run(
-            ["cargo", "build", "-p", "kiln-gateway"],
+            ["cargo", "build", "-p", "kiln-gateway", "-p", "kiln-worker"],
             cwd=REPO,
             check=True,
             capture_output=True,
@@ -119,20 +128,15 @@ def build_gateway() -> pathlib.Path:
         if not binary.is_file():
             pytest.fail("cargo not on PATH and no prebuilt target/debug/kiln-gateway")
     except subprocess.CalledProcessError as exc:
-        pytest.fail(f"cargo build -p kiln-gateway failed:\n{exc.stderr[-4000:]}")
+        pytest.fail(f"cargo build failed:\n{exc.stderr[-4000:]}")
     return binary
 
 
-@pytest.fixture(scope="session")
-def stack():
-    model = model_dir()
-    if model is None:
-        pytest.skip(
-            f"pinned test model '{MODEL_ID}' not found; set KILN_TEST_MODELS and run "
-            "./scripts/fetch-test-model.sh"
-        )
-
-    binary = build_gateway()
+@contextlib.contextmanager
+def running_stack(models: list[tuple[str, str]]):
+    """Launches a gateway serving `models` ([(id, worker_kind), ...]);
+    tears down with the leaked-worker guard. Callers wait_ready()."""
+    binary = build_binaries()
     key_hash = subprocess.run(
         [binary, "hash-key", API_KEY], capture_output=True, text=True, check=True
     ).stdout.strip()
@@ -141,6 +145,16 @@ def stack():
     # 104-byte macOS UDS limit.
     runtime_dir = pathlib.Path(tempfile.mkdtemp(prefix="kiln-e2e-", dir="/tmp"))
     port = free_port()
+    model_path = model_dir()
+    blocks = "\n".join(
+        f"""
+[[model]]
+id = "{mid}"
+path = "{model_path}"
+worker = "{worker}"
+"""
+        for mid, worker in models
+    )
     config_path = runtime_dir / "kiln.toml"
     config_path.write_text(
         f"""
@@ -148,12 +162,7 @@ def stack():
 host = "127.0.0.1"
 port = {port}
 runtime_dir = "{runtime_dir}"
-
-[[model]]
-id = "{MODEL_ID}"
-path = "{model}"
-worker = "python"
-
+{blocks}
 [[auth.api_keys]]
 name = "e2e"
 key_hash = "{key_hash}"
@@ -171,13 +180,12 @@ key_hash = "{key_hash}"
     stack = Stack(
         base_url=f"http://127.0.0.1:{port}",
         api_key=API_KEY,
-        model_id=MODEL_ID,
+        model_id=models[0][0],
         runtime_dir=runtime_dir,
         gateway=gateway,
         log_path=log_path,
     )
     try:
-        stack.wait_ready()
         yield stack
     finally:
         gateway.terminate()
@@ -196,6 +204,18 @@ key_hash = "{key_hash}"
                 f"gateway shutdown leaked worker processes {leaked}; the "
                 "supervisor must kill the whole worker process group"
             )
+
+
+@pytest.fixture(scope="session", params=["python", "rust"])
+def stack(request):
+    if model_dir() is None:
+        pytest.skip(
+            f"pinned test model '{MODEL_ID}' not found; set KILN_TEST_MODELS and run "
+            "./scripts/fetch-test-model.sh"
+        )
+    with running_stack([(MODEL_ID, request.param)]) as running:
+        running.wait_ready()
+        yield running
 
 
 @pytest.fixture(scope="session")

@@ -1,5 +1,7 @@
 //! Builds the vendored mlx-c (which FetchContent-pins and builds MLX itself)
-//! via cmake and links the resulting static archives.
+//! via cmake, links the resulting static archives, and bindgen-generates the
+//! raw FFI surface from the pinned headers (SPEC §7.1) into
+//! `$OUT_DIR/mlx_sys.rs`, included by `src/sys.rs`.
 //!
 //! Skipped entirely when the `metal` feature is off — that is the Linux CI
 //! compile-check path (`cargo build --workspace --no-default-features`).
@@ -35,6 +37,8 @@ fn main() {
         None => manifest_dir.join("../../target"),
     }
     .join("mlx-c-build");
+
+    generate_bindings(&vendor);
 
     let metal = metal_enabled();
     println!(
@@ -86,6 +90,32 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=QuartzCore");
     }
+}
+
+/// Bindgen the entire `mlx_*` C surface from the vendored headers at the pin.
+/// The headers are frozen with the submodule (ADR 0001), so the generated
+/// bindings are reproducible; regenerating on every build keeps them honest.
+fn generate_bindings(vendor: &Path) {
+    let header = vendor.join("mlx/c/mlx.h");
+    println!("cargo:rerun-if-changed={}", header.display());
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let bindings = bindgen::Builder::default()
+        .header(header.display().to_string())
+        .clang_arg(format!("-I{}", vendor.display()))
+        .allowlist_function("mlx_.*")
+        .allowlist_type("mlx_.*")
+        .allowlist_var("MLX_.*")
+        .default_enum_style(bindgen::EnumVariation::NewType {
+            is_bitfield: false,
+            is_global: false,
+        })
+        .layout_tests(false)
+        .rust_edition(bindgen::RustEdition::Edition2024)
+        .generate()
+        .expect("bindgen failed on vendored mlx-c headers");
+    bindings
+        .write_to_file(out.join("mlx_sys.rs"))
+        .expect("failed to write mlx_sys.rs");
 }
 
 /// Metal kernel compilation needs the Metal toolchain (full Xcode); plain
