@@ -1058,3 +1058,213 @@
   (re-verify decode parity at batch 16 against the mlx#3120 addendum),
   golden re-run, criterion step-overhead bench (<200µs), async_eval decode
   re-pipelining, Stats RPC, leak/soak acceptance.
+
+## [2026-07-04] Phase 4 / part 4/4 — acceptance run (SPEC §12 Phase 4 gates) — DONE
+- What:
+  - crates/kiln-models/tests/throughput.rs (new; #[ignore]d perf gate, run
+    explicitly in release): batch-16 aggregate vs single-stream decode on
+    llama-3.2-1b-4bit (27-token prompt, 128 decode tokens per request).
+    Measured on the dev machine: single-stream 124.3 tok/s (Phase-3
+    pipelined path; the engine at batch 1 does 116.5 tok/s), batch-16
+    aggregate 378.7 tok/s = **3.05x** the stricter denominator. Gate
+    >= 3x: PASS — thin margin, stable across three runs (3.05/3.06/3.05).
+  - tests/golden.rs: every fixture re-verified **bit-exact with the decode
+    batch pinned at width 16** — the mlx#3120 checkpoint flagged since
+    part 2. Mechanism: 15 longer-lived fillers admitted (FIFO) ahead of
+    the fixture; asserted, not assumed: width stays 16 from fixture
+    admission to fixture finish, all fillers outlive it, zero preemptions.
+    All 5 fixtures exact -> no M-dependent quantized-matmul divergence at
+    the core 0.31.1 pin; the exact-parity bar stands untouched, no kernel
+    investigation triggered, no ADR needed. These width-16 rounds are now
+    a permanent part of the keystone test (+~14s locally).
+  - tests/preemption.rs section 8: preemption under the batch-16 load
+    shape (not a 2-3 request micro-pool): a 16-deep interactive burst
+    (8x 64-token + 8x 96-token prompts, interleaved) against a 54-block
+    pool whose peak demand is 64 blocks. Width demonstrably reached 16,
+    the youngest request was preempted mid-decode and resumed, all 16
+    streams bit-exact vs their solo runs, both most-senior requests
+    untouched.
+  - tests/leak_batched.rs (new; own file because the live-object counter
+    is process-global): the 1k-iteration leak gate re-run through the full
+    batched/paged/preemption path — 1020 engine iterations over 15 waves
+    of 16 requests (chunk=48 so long prompts prefill in 4 chunks; pool 42
+    vs ~54-block peak), 45 preemptions, 15 mid-stream cancellations, every
+    request Finished{Length|Cancelled} as expected; live objects 0 -> 0.
+    tests/leak.rs (Phase-3 contiguous path) still passes unchanged.
+  - crates/kiln-engine/benches/step_overhead.rs (new criterion bench):
+    an Engine::step() around a null StepModel at steady-state batch 16 is
+    272.6µs wall. Two companion benches attribute it: the standalone
+    eval+readback round-trip of the 16 sampling graphs is 255.3µs (a
+    null-forward artifact — production pays one step-boundary eval that
+    the real forward dominates) and host-side sampling-graph construction
+    is 22.2µs. Non-GPU engine overhead per step ≈ 272.6 − 255.3 ≈ 17µs
+    (~40µs counting graph build) — SPEC §6.2 target < 200µs: PASS.
+- Decisions:
+  - Throughput gate is an #[ignore]d release-only cargo test rather than a
+    CI test: perf ratios on shared CI runners are noise, and SPEC §13.4
+    has the PM re-run phase gates anyway. It asserts against the stricter
+    of the two single-stream denominators. scripts/bench.sh (§11.3 load
+    harness, referenced by CLAUDE.md) still does not exist — the §12
+    Phase 4 gate needs only the recorded ratio; full harness flagged for
+    the packaging/tooling pass.
+  - Bench methodology: with a null forward, the step-boundary eval stands
+    alone and carries a fixed Metal round-trip production absorbs inside
+    the forward's eval, so the bench reports the attribution triplet
+    instead of pretending the 272µs headline is scheduler cost. All three
+    numbers recorded; the headline stays the conservative bound.
+  - New dev-dependency criterion 0.8 (workspace-wide, dev-only, minimal
+    features — no plotters/rayon): named by SPEC §3's testing stack and
+    CLAUDE.md's `cargo bench -p kiln-engine`; cargo-test alone cannot do
+    steady-state statistical sampling. Apache-2.0 OR MIT.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --release --test throughput -- --ignored --nocapture
+  prompt: 27 tokens, decode: 128 tokens
+  single-stream decode: 124.3 tok/s (phase-3 pipelined path), 116.5 tok/s (engine batch 1)
+  batch-16 aggregate: 378.7 tok/s -> 3.05x the stricter single-stream rate
+  test result: ok. 1 passed (re-runs: 3.06x @ 379.1, 3.05x @ 383.0 tok/s)
+  $ cargo test -p kiln-models --test golden -- --nocapture   (CRITICAL GATE)
+  golden chat-basic/chat-code/chat-multibyte/raw-continuation/raw-long-prefill
+    — exact match (batched/paged engine)
+    — exact match at decode width 16          <- the mlx#3120 checkpoint
+  test result: ok. 1 passed in 27.57s (no leaked mlx handles)
+  $ cargo test -p kiln-models --test preemption -- --nocapture
+  (sections 1-7 unchanged, all ok) ... batch-16 pressure: width 16,
+  1 preemption(s) across 1 request(s), all 16 streams bit-exact
+  test result: ok. 1 passed in 17.08s (no leaked mlx handles)
+  $ cargo test -p kiln-models --test leak_batched -- --nocapture
+  leak gate (batched): 1020 engine iterations over 15 waves, 45 preemption(s),
+  15 cancellation(s); mlx active memory 0B -> 0B, live objects 0 -> 0
+  test result: ok. 1 passed in 38.59s
+  $ cargo bench -p kiln-engine --bench step_overhead
+  engine/step_overhead_batch16        time: [269.69 µs 272.60 µs 276.96 µs]
+  engine/sampling_graph_build_batch16 time: [21.968 µs 22.156 µs 22.320 µs]
+  engine/sampling_eval_floor_batch16  time: [254.23 µs 255.32 µs 257.38 µs]
+  => non-GPU overhead ≈ 272.6 − 255.3 ≈ 17µs per step at batch 16 (< 200µs)
+  $ cargo test --workspace -> 28/28 test targets ok (both leak gates incl.;
+    throughput #[ignore]d by default, exactly as CI runs it)
+  $ cargo run -p kiln-mlx --example smoke -> 3.0        (exact CI smoke step)
+  $ python proto codegen + git diff --exit-code -> clean (exact CI codegen step)
+  $ uv run --project python/kiln_worker_py pytest -q -> 28 passed
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 19 passed in 25.79s
+  $ cargo fmt --all --check -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean  (exact CI lint shape)
+  $ cargo build --workspace --no-default-features -> clean                (exact CI compile-linux shape)
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- Next: PM phase gate on Phase 4 (SPEC §13.4: re-run bench + e2e on PM
+  hardware), then Phase 5 — radix prefix cache + SSD tier (SPEC §12).
+  Notes for the gate: (a) the 3.05x margin is thin; the async_eval decode
+  re-pipelining forecast in the part-2/3 ledgers was NOT in this prompt's
+  scope and remains unimplemented — it and Phase 7's paged-attention
+  kernel are the obvious levers if the PM wants headroom; (b) the Stats
+  RPC likewise was not in this prompt's scope and has no §12 Phase 4
+  acceptance criterion — say when it should land; (c) the width-16
+  parity evidence pins the trunk matmul at M=16 bit-exact, which is the
+  batched-M half of what SPEC §14's replay-cost row asks for — chunked
+  replay additionally needs the multi-token attention-query shape
+  validated before it is safe.
+
+## [2026-07-04] Phase 4 / Follow-up — async_eval decode pipelining (batched engine) — DONE
+- What:
+  - Implements the lever flagged in the closeout entry for the thin 3.05x
+    margin: `generate.rs`'s async_eval decode pipeline, lifted to the
+    batched engine. A steady-state pure-decode step now defers its token
+    readback (`async_eval` on the sampled `[1]` arrays); at the next
+    `step()` call the following step's forward is built *feeding those
+    still-lazy arrays* (reshape + concatenate to `[1, n]`), scheduled,
+    and only then is the previous step read back and settled — host-side
+    graph construction (large at batch 16: per-seq per-layer gather/write
+    chains) overlaps GPU execution.
+  - Strict gating, so scheduling semantics are untouched: the pipeline
+    engages only when nothing is waiting, every running sequence is
+    sampling (no prefill, no replay), penalties are off (their windows
+    need the previous token host-side, same forfeit as mlx-lm), no
+    cancel flag is up, and the next single-token appends *provably* fit
+    free blocks (exact per-row count, checked before any table slot is
+    appended). Prefill, replay, admission, preemption, and capacity
+    decisions always run on the synchronous path against fully-applied
+    state — victim choice, seniority, and the admission projection are
+    bit-for-bit the pre-change logic, which is why the exact-count
+    preemption assertions (suite section 6) still pass unmodified.
+  - Contract change (kiln-engine internal API, not the frozen proto):
+    `StepBatch.tokens: Vec<u32>` became `StepBatch.input: StepInput`
+    (`Ids(Vec<u32>)` | `Lazy(Array)`); `llama.rs::forward_step` accepts
+    either — identical u32 values reach the embedding lookup both ways.
+  - Speculative-row semantics: a sequence that stops/cancels at an apply
+    has one already-scheduled row in flight; it is discarded unread. Its
+    KV write lands in blocks the sequence owned at build time; releasing
+    them is safe because a future owner rewrites every row below its own
+    length and `PagedKv::gather` trims to that length. **Phase 5 NOTE
+    (recorded in the engine module docs): radix sharing must re-review
+    this invariant before blocks with a stale speculative tail row can
+    enter the prefix cache.**
+- Before/after (same machine, same session, release, 27-token prompt,
+  128 decode tokens, median of 3):
+  ```
+  BEFORE (commit ff91746, re-measured this session):
+    single-stream 125.6 tok/s (generate) / 116.8 tok/s (engine batch 1)
+    batch-16 aggregate 385.8 tok/s -> 3.07x   (closeout entry: 378.7 -> 3.05x)
+  AFTER (pipelined):
+    single-stream 123.9-126.1 tok/s (generate) / 122.7-126.6 tok/s (engine batch 1)
+    batch-16 aggregate 396.2 / 397.9 / 417.8 tok/s -> 3.13x / 3.16x / 3.30x
+  ```
+  Honest read: the margin measurably improved (median ratio 3.07x ->
+  3.16x; aggregate +3-8%) but the win is modest — at batch 16 the step is
+  GPU-dominated by the gather-based paged attention, so hiding host time
+  buys less than at batch 1. The engine's *single-stream* deficit closed
+  entirely (116.8 -> ~126 tok/s, at parity with the pipelined Phase-3
+  path), which raises the gate's stricter denominator and makes the ratio
+  gain conservative. The next real throughput lever is Phase 7's
+  block-table-aware attention kernel (eliminates the gather), not more
+  pipelining.
+  - Step-overhead bench moved: 272.6µs -> 170.0µs per step()
+    (null-forward headline now itself < 200µs — the standalone-eval
+    round-trip previously counted there now hides behind the next step's
+    build; attribution benches unchanged: build 22.4µs, eval floor
+    255.3µs).
+- Decisions:
+  - Depth-2 pipeline only (one step in flight), mirroring generate.rs —
+    matches MLX stream discipline and keeps the cancel bound at <= 2
+    steps (proto promise; suite re-verified <= 1 observed).
+  - Sync-fallback-on-anything-unusual over pipelining through pressure:
+    correctness of preemption order and the §6.4 admission projection is
+    worth more than the rare-path speedup; pressure scenarios in the
+    tests therefore exercise the identical pre-change planner.
+  - No new dependencies.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --test golden -- --nocapture   (CRITICAL GATE)
+  all 5 fixtures — exact match (batched/paged engine)
+  all 5 fixtures — exact match at decode width 16
+  test result: ok. 1 passed in 24.73s (no leaked mlx handles)
+  $ cargo test -p kiln-models --test batching -- --nocapture -> ok (solo ==
+    contiguous; 4-way == solo x2; late-join; stop-token; pool-pressure)
+  $ cargo test -p kiln-models --test preemption -- --nocapture -> ok, all 9
+    sections incl. exact-count seniority (J.preemptions == 1) and batch-16
+    pressure, all streams bit-exact; cancel honored within 1 step
+  $ cargo test -p kiln-models --test leak_batched -- --nocapture
+  1035 engine iterations / 15 waves, 45 preemptions, 15 cancellations,
+  live objects 0 -> 0   ($ --test leak -> also 0 -> 0)
+  $ cargo test -p kiln-models --release --test throughput -- --ignored --nocapture
+  single-stream decode: 125.8 tok/s (phase-3 pipelined path), 122.7 tok/s (engine batch 1)
+  batch-16 aggregate: 397.9 tok/s -> 3.16x   (runs: 3.30x @ 417.8, 3.13x @ 396.2)
+  $ cargo bench -p kiln-engine --bench step_overhead
+  engine/step_overhead_batch16 time: [168.58 µs 169.98 µs 172.52 µs]
+  $ cargo test --workspace -> all test targets ok
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 19 passed in 29.04s
+  $ uv run --project python/kiln_worker_py pytest -q -> 28 passed
+  $ cargo run -p kiln-mlx --example smoke -> 3.0 ; codegen diff -> clean
+  $ cargo fmt --all --check -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean  (exact CI lint shape)
+  $ cargo build --workspace --no-default-features -> clean                (exact CI compile-linux shape)
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- Next: PM phase gate on Phase 4 (SPEC §13.4), then Phase 5 — radix
+  prefix cache + SSD tier (SPEC §12). Carry-forward for Phase 5: the
+  stale-speculative-tail-row invariant above must be part of the radix
+  integration review.

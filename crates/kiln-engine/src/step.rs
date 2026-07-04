@@ -26,18 +26,41 @@ pub struct SeqStep {
     pub writes: Vec<WriteRun>,
 }
 
-/// One forward pass: `tokens` is the concatenation of every sequence's
+/// The step's input tokens: host-known ids on the synchronous path, or a
+/// lazily computed `[1, n]` u32 array on the pipelined decode path — the
+/// engine feeds the previous step's sampled tokens back into the next
+/// forward *before* reading their values to the host (the async_eval
+/// pipeline, mirroring `generate.rs`), so no id vector exists at
+/// graph-build time.
+#[derive(Debug)]
+pub enum StepInput {
+    Ids(Vec<u32>),
+    Lazy(Array),
+}
+
+impl StepInput {
+    /// Total positions in the step (shape-only for `Lazy`; MLX shapes are
+    /// known without evaluation).
+    pub fn num_tokens(&self) -> usize {
+        match self {
+            StepInput::Ids(ids) => ids.len(),
+            StepInput::Lazy(tokens) => tokens.dim(1) as usize,
+        }
+    }
+}
+
+/// One forward pass: `input` is the concatenation of every sequence's
 /// segment, in `seqs` order.
 #[derive(Debug)]
 pub struct StepBatch {
-    pub tokens: Vec<u32>,
+    pub input: StepInput,
     pub seqs: Vec<SeqStep>,
 }
 
 impl StepBatch {
     /// Total positions in the step.
     pub fn num_tokens(&self) -> usize {
-        self.tokens.len()
+        self.input.num_tokens()
     }
 }
 

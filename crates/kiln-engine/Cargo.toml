@@ -17,4 +17,13 @@ kiln-mlx = { workspace = true, default-features = false }
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
+
+# SPEC §6.2 / Phase 4 acceptance: non-forward engine overhead per decode
+# step at batch 16. `harness = false` (criterion owns main); the bench body
+# is metal-gated like the engine itself, so the Linux CI compile/lint
+# shapes see an empty main.
+[[bench]]
+name = "step_overhead"
+harness = false

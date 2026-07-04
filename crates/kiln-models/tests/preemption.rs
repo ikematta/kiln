@@ -508,6 +508,83 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
             );
         }
         eprintln!("mid-prefill preemption: junior re-prefilled from scratch, bit-exact");
+
+        // 8) Phase 4 closeout: preemption under the batch-16 load shape,
+        //    not a 2-3 request micro-pool. A 16-deep interactive burst
+        //    (8 × A: 64-token prompts, 48 new tokens; 8 × B: 96-token
+        //    prompts, 32 new tokens, interleaved) runs against a pool that
+        //    admits all 16 — the batch genuinely reaches width 16 — but
+        //    cannot hold their full growth (peak demand 64 blocks vs 54),
+        //    so the youngest requests are preempted mid-decode as seniors
+        //    grow, sit out, resume, and every one of the 16 streams must
+        //    still equal its solo run bit-exact.
+        {
+            let a_prompt = &ids[..64];
+            let b_prompt = &ids[64..160];
+            let wide = EngineConfig {
+                num_blocks: 54,
+                ..EngineConfig::default()
+            };
+            let solo_a = solo(&model, wide, a_prompt, 48);
+            let solo_b = solo(&model, wide, b_prompt, 32);
+            let mut engine = new_engine(&model, wide);
+            let outs: Vec<Collected> = (0..16)
+                .map(|k| {
+                    let (req, out) = if k % 2 == 0 {
+                        request(a_prompt, 48, Priority::Interactive)
+                    } else {
+                        request(b_prompt, 32, Priority::Interactive)
+                    };
+                    engine.submit(req);
+                    out
+                })
+                .collect();
+            let mut max_width = 0;
+            let mut steps = 0;
+            while !engine.is_idle() {
+                assert!(steps < MAX_STEPS, "batch-16 pressure scenario livelocked");
+                engine.step().expect("engine step");
+                max_width = max_width.max(engine.num_running());
+                steps += 1;
+            }
+            assert_eq!(
+                max_width, 16,
+                "the load never reached the batch-16 shape (resize the scenario)"
+            );
+            assert!(
+                engine.preemptions() >= 1,
+                "pool pressure never landed at width 16 (resize the scenario)"
+            );
+            for (k, out) in outs.iter().enumerate() {
+                let summary = out.summary();
+                assert_eq!(
+                    summary.reason,
+                    FinishKind::Length,
+                    "request {k} must finish under batch-16 pressure: {summary:?}"
+                );
+                let want = if k % 2 == 0 { &solo_a } else { &solo_b };
+                assert_eq!(
+                    &out.tokens(),
+                    want,
+                    "request {k} diverged from its solo stream under batch-16 pressure \
+                     (preemptions: {})",
+                    summary.preemptions
+                );
+            }
+            // Victim order still holds at this width: the two most senior
+            // requests must never be preempted.
+            assert_eq!(outs[0].summary().preemptions, 0, "senior A preempted");
+            assert_eq!(outs[1].summary().preemptions, 0, "senior B preempted");
+            let preempted = outs
+                .iter()
+                .filter(|out| out.summary().preemptions > 0)
+                .count();
+            eprintln!(
+                "batch-16 pressure: width {max_width}, {} preemption(s) across \
+                 {preempted} request(s), all 16 streams bit-exact",
+                engine.preemptions()
+            );
+        }
     }
     assert_eq!(
         debug::live_objects(),
