@@ -5,7 +5,11 @@ description = "mlx-lm fallback worker speaking the Kiln worker protocol (gRPC ov
 requires-python = ">=3.12"
 dependencies = [
     "grpcio>=1.75",
-    "mlx-lm==0.31.3 ; sys_platform == 'darwin'",
+    # mlx pinned explicitly so both workers share core MLX v0.31.1 (the version
+    # vendored mlx-c v0.6.0 builds) — PROGRESS.md 2026-07-03 decision, option B1.
+    # Revisit both pins together when mlx-c tags a release for a newer core.
+    "mlx==0.31.1 ; sys_platform == 'darwin'",
+    "mlx-lm==0.31.2 ; sys_platform == 'darwin'",
     "protobuf>=6.30",
     "psutil>=7",
 ]
