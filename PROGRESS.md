@@ -856,3 +856,12 @@
   pressure (§6.1), proper Cancel/Drain semantics, per-worker admission;
   then part 4/4 owns the batch-16 ≥3× throughput gate, golden re-run,
   criterion step-overhead bench (<200µs), and the leak/soak acceptance.
+- Addendum (2026-07-04, PM instruction, cross-reference only): the batch-16
+  decode-parity risk flagged under Decisions above is the same mechanism the
+  2026-07-03 drift investigation (feeding ADR 0001's B1 follow-up) pinned on
+  mlx#3120 — Metal split-K quantized matmul for small M, a reduction-order
+  change in exactly our 4-bit matmul path. Same dependency, M-dependent
+  kernel/reduction dispatch; note #3120 landed in core 0.31.2, so it is not
+  in our pinned 0.31.1 build today but arrives with any quarterly mlx-c bump.
+  If part 4's batch-16 golden re-verification diverges, check first which
+  quantized-matmul kernel variant dispatches at the batched M vs M=1.
