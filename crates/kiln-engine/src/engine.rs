@@ -81,6 +81,42 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
 /// part 3+): 512 blocks × 32 tokens = 16k tokens of KV.
 pub const DEFAULT_NUM_BLOCKS: usize = 512;
 
+/// Fine grid of the canonical prefill schedule's final super-chunk
+/// (PROGRESS 2026-07-04 Option B): default for
+/// `EngineConfig::prefill_fine_chunk`.
+pub const DEFAULT_PREFILL_FINE_CHUNK: usize = 64;
+
+/// Canonical prefill schedule (SPEC §6.2 + Phase 5 Option B, PROGRESS
+/// 2026-07-04): positions `0..limit` are prefilled in bulk chunks of
+/// `prefill_chunk` split at absolute multiples of `prefill_chunk`, and
+/// the final partial super-chunk is split at absolute multiples of
+/// `fine` (plus the final sub-`fine` remainder). Returns the length of
+/// the chunk starting at `at` (`at < limit`).
+///
+/// Every (offset, length) pair this yields for a given `limit` is a
+/// function of the absolute grid alone — independent of where prefill
+/// started — so a warm prefix-cache resume at any boundary recomputes
+/// its segments in exactly the shapes a cold run of the same prompt
+/// uses. That is the bit-exactness requirement for cache hits: KV bits
+/// are chunk-shape dependent (kernel dispatch varies with query
+/// length), so no position may ever be computed in a shape the
+/// cache-off run would not use. `fine >= prefill_chunk` degenerates to
+/// the pre-Phase-5 single-tail-chunk schedule (used to bench the miss
+/// path cost of the fine grid).
+pub fn canonical_prefill_len(at: usize, limit: usize, prefill_chunk: usize, fine: usize) -> usize {
+    debug_assert!(at < limit, "no prefill remains at {at} of {limit}");
+    let fine = fine.clamp(1, prefill_chunk);
+    let tail_start = limit / prefill_chunk * prefill_chunk;
+    if at < tail_start {
+        // Bulk: run to the next absolute super-chunk boundary.
+        prefill_chunk - at % prefill_chunk
+    } else {
+        // Final partial super-chunk: run to the next absolute fine
+        // boundary, or to the end.
+        (fine - at % fine).min(limit - at)
+    }
+}
+
 /// Cache maintenance cadence in decode iterations (mirrors the Phase-3
 /// loop's `clear_cache` every 256 steps).
 const MAINTENANCE_INTERVAL: u64 = 256;
@@ -110,6 +146,10 @@ pub struct EngineConfig {
     pub num_blocks: usize,
     pub max_batch_tokens: usize,
     pub prefill_chunk: usize,
+    /// Fine grid of the final partial super-chunk (see
+    /// [`canonical_prefill_len`]); values `>= prefill_chunk` restore the
+    /// single-tail-chunk schedule.
+    pub prefill_fine_chunk: usize,
     /// Radix prefix cache (SPEC §6.3); on by default.
     pub prefix_cache: bool,
     /// SSD cold tier (SPEC §6.4); requires `prefix_cache`.
@@ -123,6 +163,7 @@ impl Default for EngineConfig {
             num_blocks: DEFAULT_NUM_BLOCKS,
             max_batch_tokens: DEFAULT_MAX_BATCH_TOKENS,
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
+            prefill_fine_chunk: DEFAULT_PREFILL_FINE_CHUNK,
             prefix_cache: true,
             ssd: None,
         }
@@ -1389,8 +1430,13 @@ impl<M: StepModel> Engine<M> {
             let seq = &self.running[i];
             // Phase-3/mlx-lm chunk rule: prefill covers prompt[..n-1]; the
             // last prompt token is fed by the first sampled (decode) step.
-            let remaining = seq.prompt.len() - 1 - seq.processed;
-            let chunk = remaining.min(self.config.prefill_chunk).min(budget);
+            let chunk = canonical_prefill_len(
+                seq.processed,
+                seq.prompt.len() - 1,
+                self.config.prefill_chunk,
+                self.config.prefill_fine_chunk,
+            )
+            .min(budget);
             if chunk > 0
                 && let Some(step) = self.plan_step(i, chunk, false, &mut decode_plans)?
             {
@@ -1896,4 +1942,61 @@ fn build_seq_step(
         blocks: seq.table.blocks().to_vec(),
         writes,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_prefill_len;
+
+    /// Walks the schedule from `start`, returning (offset, len) segments.
+    fn walk(start: usize, limit: usize, chunk: usize, fine: usize) -> Vec<(usize, usize)> {
+        let mut at = start;
+        let mut segments = Vec::new();
+        while at < limit {
+            let len = canonical_prefill_len(at, limit, chunk, fine);
+            assert!(len >= 1 && at + len <= limit, "bad segment ({at}, {len})");
+            segments.push((at, len));
+            at += len;
+        }
+        segments
+    }
+
+    #[test]
+    fn schedule_shapes_and_boundaries() {
+        // Sub-super-chunk prompt: pure fine grid plus remainder.
+        assert_eq!(
+            walk(0, 248, 2048, 64),
+            vec![(0, 64), (64, 64), (128, 64), (192, 56)]
+        );
+        // Bulk super-chunk, then the fine tail.
+        let schedule = walk(0, 4095, 2048, 64);
+        assert_eq!(schedule[0], (0, 2048));
+        assert_eq!(schedule[1], (2048, 64));
+        assert_eq!(*schedule.last().unwrap(), (4032, 63));
+        // fine >= chunk degenerates to the pre-Phase-5 schedule.
+        assert_eq!(walk(0, 248, 2048, 2048), vec![(0, 248)]);
+        assert_eq!(walk(0, 4095, 2048, 2048), vec![(0, 2048), (2048, 2047)]);
+        // Exact super-chunk multiple: no partial tail exists.
+        assert_eq!(walk(0, 4096, 2048, 64), vec![(0, 2048), (2048, 2048)]);
+    }
+
+    /// The bit-exactness property: resuming at any boundary of the cold
+    /// schedule yields exactly the cold schedule's suffix — no (offset,
+    /// length) shape a cold run would not produce.
+    #[test]
+    fn schedule_is_resume_invariant() {
+        for &(chunk, fine) in &[(16_usize, 4_usize), (2048, 64), (8, 8), (48, 48)] {
+            for limit in 1..=(3 * chunk + 5) {
+                let cold = walk(0, limit, chunk, fine);
+                for i in 0..cold.len() {
+                    let (offset, _) = cold[i];
+                    assert_eq!(
+                        walk(offset, limit, chunk, fine),
+                        cold[i..],
+                        "resume at {offset} diverges (limit {limit}, chunk {chunk}, fine {fine})"
+                    );
+                }
+            }
+        }
+    }
 }
