@@ -2865,3 +2865,89 @@
   concrete evidence. Standing items unchanged (gemma3 window-crossing
   fixture — note the cross-device flip is also gemma-3 — rustc miscompile
   upstream report).
+
+## [2026-07-05] Phase 6 — independent re-verify: GVN exposure sweep confirms Sampler-only; gemma-3 divergence logprob delta measured — DONE
+- What (task A — coverage check on the sampler-UAF exposure survey):
+  - Independently re-swept the workspace for the GENERAL trigger shape
+    (struct passed by value + two provably-identical constant call sites
+    + callee mutates a field dropping the old value), not just the
+    `Option<Array>` scoping of the original survey. Method: (1) every
+    `.take()`/`mem::replace`/`mem::take`/`mem::swap`/`Option::replace`
+    site in the workspace — 22 sites; (2) every `Option<Array>` field and
+    every `Option<handle>` of other kiln-mlx types; (3) every `impl Drop`
+    type; (4) every by-value `mut`-bound struct parameter.
+  - Result: **original claim CONFIRMED — Sampler was the only exposure.**
+    All 22 extract-and-replace sites sit behind `&mut self`, heap
+    indexing (`self.nodes[..]`, `self.pools`, `self.running[j]`), TLS
+    (`RefCell` in kiln-mlx error slot), or child-process handles — zero
+    by-value receivers. `KvCache` is the one OTHER constant-constructible
+    no-niche double-`Option<Array>` aggregate with the interior
+    take+reassign shape (kv_cache.rs:54), but it is only ever reached via
+    `&mut KvCache`/`&mut [KvCache]`/`Vec<KvCache>` — never a by-value
+    param anywhere in src or tests (the Vec-collect construction stores
+    resourceless `{None,None,0}` bytes to distinct heap slots — sound
+    even if const-merged). Remaining by-value params fail the other
+    conditions: `SamplingOptions`/`PenaltyOptions` are all-scalar (no
+    drop glue — merging Copy data is sound); `supervise(mut ctx:
+    SuperviseCtx)` has one call site, all-runtime niched fields
+    (Arc/Vec/watch channels), and no field-drop; `finish()` takes
+    `seq: &mut Seq` (the by-value move at engine.rs:606 is a reborrow
+    into `donate`). `Array`/`Stream`/`VectorArray` are FFI-only
+    constructible (unprovable-identical). The one intentional instance of
+    the trigger shape is tests/sampler.rs's REGRESSION SHAPE canary, as
+    documented. Nothing was left unchecked by the original survey; its
+    `Option<Array>` scoping was the right cut (per the recorded MIR
+    evidence the merge requires a no-niche constant aggregate, and
+    Option<Array> is the workspace's only such layout).
+- What (task B — logprob delta at the gemma-3-1b/chat-basic divergence):
+  - CI logit access impractical (no logprob instrumentation in the
+    harness); reproduced locally on the generating device instead, per
+    instruction, replaying the EXACT fixture-generation path
+    (mlx-lm 0.31.2 generate_step, mlx.core 0.31.1, greedy, gen-golden.py
+    prompt encoding, pinned date_string; scratch probe, not committed).
+    Full 64-token replay matches the fixture — and since CI matched
+    tokens 1–49 too, the input state at the divergence position is
+    identical across devices; only accumulated activation rounding
+    differs.
+  - **Measured, dev machine, step 49 (token 50 of 64):
+    logprob[195597] = -2.40625 (top-1, the fixture token),
+    logprob[188797] = -2.46875 (top-2, the token CI sampled).
+    DELTA = 6.25e-2 — FAILS the < 1e-3 clause by ~62x.**
+    So this instance satisfies SPEC §11.2's relaxed bar on POSITION ONLY
+    (divergence at token 50 > 48); the full relaxed bar is NOT met as
+    measured on the generating device. (CI-side delta has the opposite
+    sign by construction; its magnitude is unmeasured without CI
+    instrumentation.)
+  - Structural observation for the ruling (flagged, not acted on): the
+    logprob vector is bf16 — all top-5 values sit on the 1/128 grid
+    (-2.40625, -2.46875, -2.71875, -2.796875, -3.2265625). At this
+    magnitude a nonzero bf16 logprob delta is >= 2^-7 ≈ 7.8e-3, so the
+    1e-3 clause is UNSATISFIABLE for this model class except for exact
+    ties — and a 1-2 ulp bf16 kernel-order difference at raw-logit
+    magnitude ~16-32 is exactly 0.06-0.125, the size of the observed
+    flip. The relaxed bar's delta threshold appears calibrated for f32
+    logits; whether to recalibrate it is part of the open golden-bar
+    device-scope ruling (ADR-level, not mine to change).
+- Decisions: none — both tasks were verification/measurement only; no
+  code, test, or workflow change.
+- Deviations: none. Probe script lives in the session scratchpad only.
+- Acceptance:
+  ```
+  Task A greps (workspace, vendor excluded): 22 extract-replace sites, all
+  classified above; Option<Stream|Closure|VectorArray>: 0 hits; impl Drop:
+  Worker(test)/SsdStore/Stream/Array/VectorArray; by-value mut params:
+  Pin<&mut Self>, supervise(SuperviseCtx), 2x median(Vec<f64>).
+  Task B probe output:
+    mlx.core 0.31.1, mlx_lm 0.31.2 / prompt tokens: 21
+    step 49: sampled 195597
+    logprob[195597] = -2.4062500000, logprob[188797] = -2.4687500000
+    DELTA = 6.2500000000e-02  (>= 1e-3)
+    top-5: 195597 -2.40625 | 188797 -2.46875 | 224816 -2.71875
+           | 4631 -2.796875 | 20861 -3.2265625
+    full 64-token replay == fixture: True
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
+  unchanged. The golden-bar device-scope ruling now has the delta number
+  it was waiting on: position clause met, delta clause failed 62x, and
+  the delta clause is structurally unsatisfiable under bf16 logprobs.
+  Standing items unchanged.
