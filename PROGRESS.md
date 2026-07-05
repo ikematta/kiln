@@ -2951,3 +2951,69 @@
   it was waiting on: position clause met, delta clause failed 62x, and
   the delta clause is structurally unsatisfiable under bf16 logprobs.
   Standing items unchanged.
+
+## [2026-07-05] Phase 6 — ADR 0004: golden-bar device scope RULED + dtype-aware relaxed bar — DONE (closes the DECISION NEEDED)
+- What:
+  - **The golden-bar device-scope DECISION NEEDED (opened in the
+    2026-07-05 CI-gap analysis entry) is CLOSED by PM ruling**, recorded
+    as `docs/decisions/0004-golden-parity-device-scope-and-dtype-aware-delta.md`:
+    (1) golden-token bit-exactness is a SAME-DEVICE guarantee bound to
+    the fixture-generating device class; the CI golden step is
+    permanently advisory, never promoted to blocking; dev-machine golden
+    red remains a correctness bug with no relaxation. (2) The relaxed
+    bar's delta clause is recalibrated dtype-aware: <= 4 ULPs of the
+    logit compute dtype at the divergence candidates' raw-logit
+    magnitude (replaces the fixed < 1e-3; tightens f32, makes fp16/bf16
+    satisfiable-in-principle); position clause unchanged; invoking the
+    relaxed bar still requires a further ADR naming model + reason.
+  - SPEC §11.2 amended to state the same-device scope and reference
+    ADR 0004 (PM-directed; the dtype-aware clause supersedes the fixed
+    1e-3 in place). ci.yml advisory-step comment updated from "open PM
+    ruling" to the ADR 0004 permanent-advisory contract.
+  - **CORRECTION to the previous entry** (append-only, so noted here):
+    the gemma-3 logit dtype is **float16, not bf16** — measured:
+    `generate_step` logprobs and raw logits are `mlx.core.float16`
+    (config.json declares `torch_dtype: bfloat16`; the loaded pipeline
+    computes fp16). The candidates' raw logits sit at ~16.72 (fp16
+    binade [16,32), ULP 2^-6 = 1.5625e-2), so the measured 6.25e-2
+    delta is exactly **4 fp16 ULPs**, and the minimum nonzero delta at
+    that magnitude is 1.5625e-2 — still >= 1e-3, so the
+    "clause unsatisfiable for half-precision logits" conclusion stands
+    with the corrected mechanism (the earlier "bf16 / 1/128 grid /
+    7.8e-3" framing was imprecise).
+  - New measurement that unifies the finding with ADR 0002: recomputing
+    the same 70-token divergence state in ONE prefill pass (M=70, tiled
+    kernel class) on the generating device yields an EXACT fp16 tie —
+    both candidates' logits = 16.71875 — and argmax breaks to 188797,
+    the CI outcome. The "cross-device" flip reproduces on the dev
+    machine by kernel class alone; device change is kernel-class change.
+    This is the decisive evidence line in the ADR.
+- Decisions: all within the PM directive. My call per the directive: the
+  dtype-aware formulation is a 4-ULP-at-logit-magnitude bound rather
+  than waiving the delta clause for half-precision — a waiver would
+  accept ANY-magnitude divergence past token 48 (a real distribution
+  difference would pass), which guards nothing; the ULP bound keeps the
+  clause meaningful at every dtype and covers the observed legitimate
+  flip (exactly 4 fp16 ULPs, an exact tie one kernel class over) with
+  no headroom for genuine defects (orders of magnitude larger).
+- Deviations: none. (ci.yml change is comment-only; no step semantics
+  touched. docs/decisions/ 0001–0003 untouched; 0004 is a new file
+  created under explicit PM direction.)
+- Acceptance:
+  ```
+  $ ls docs/decisions/ -> 0001..0003 + 0004-golden-parity-device-scope-
+    and-dtype-aware-delta.md (new)
+  $ grep -c "ADR 0004" docs/SPEC.md -> 2 (§11.2 scope + clause)
+  dtype probe (dev machine, worker venv):
+    config torch_dtype: bfloat16
+    generate_step logprobs dtype: mlx.core.float16 / delta 0.0625
+    raw logits dtype: mlx.core.float16
+    decode path: logprob delta 6.25e-2 = 4 fp16 ULPs @ |logit| 16.72
+    one-pass (M=70) recompute: logit[195597] = logit[188797] = 16.71875
+    (exact tie), argmax -> 188797 (the CI token, on the dev machine)
+  ci.yml: comment-only edit; YAML parse + step list unchanged (verified)
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order).
+  No open DECISION NEEDED remains. Standing items: gemma3
+  window-crossing fixture, rustc miscompile upstream report, and (per
+  ADR 0004) read the advisory lane for pattern changes at each mlx bump.
