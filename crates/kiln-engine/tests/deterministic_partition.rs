@@ -223,8 +223,16 @@ fn decode_shapes(observations: &[Obs]) -> Vec<Obs> {
         .collect()
 }
 
+/// One `#[test]` entry point (the kiln-mlx live-object counter is
+/// process-global and two concurrent engines on separate test threads race
+/// the Metal stream — same convention as pipeline_discard.rs).
 #[test]
-fn deterministic_rows_subbatch_and_nondet_rows_ride_full_width() {
+fn deterministic_partition_contract() {
+    partition_shapes();
+    donation_cap();
+}
+
+fn partition_shapes() {
     let baseline = debug::live_objects();
     {
         let observations = Rc::new(RefCell::new(Vec::new()));
@@ -339,8 +347,7 @@ fn deterministic_rows_subbatch_and_nondet_rows_ride_full_width() {
     assert_eq!(debug::live_objects(), baseline, "leaked mlx handles");
 }
 
-#[test]
-fn nondeterministic_finishes_donate_only_prefill_covered_blocks() {
+fn donation_cap() {
     let baseline = debug::live_objects();
     {
         let observations = Rc::new(RefCell::new(Vec::new()));
