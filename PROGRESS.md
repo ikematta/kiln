@@ -2568,3 +2568,85 @@
 - Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order).
   Standing items: gemma3 window-crossing (ring-order gather + fixture),
   rustc miscompile upstream report.
+
+## [2026-07-05] Phase 6 — yarn freq unit test red on CI (1-ulp) — root-caused + bar corrected — DONE
+- What:
+  - `nn::tests::yarn_freqs_match_reference_bit_for_bit` (kiln-models) was
+    red on main in BOTH `test-macos` and `test-macos-release` (run
+    28736232673): `freq[3] = 0x3FF49A1A` on CI vs fixture `0x3FF49A1B`,
+    identical in debug and release — deterministic per machine, never
+    reproducible locally.
+  - Diagnosis (measured, not guessed): the divergence is **MLX/Metal
+    computation, NOT Rust host-side floating point**. freq[3]'s dataflow
+    provably excludes every host-side float: `low`=23.596/`high`=39.651
+    are ~0.4 from their floor/ceil boundaries (libm ulp noise is ~1e-16
+    relative), the ramp clips to exactly 0 at index 3 so `freq_mask`=1.0
+    exactly, and the host-f64 `mscale` assertion passed byte-for-byte on
+    CI. A scratch provenance test (removed) isolated the op: the
+    mul/div tail `(4e·e)/(4e)` is bit-transparent for both candidate
+    bits (strict-f32 emulation AND MLX on both streams), so the
+    divergent op is `ops::power` itself. Measured pow(1e6, 0.046875),
+    true value 1.91095297497…: local Metal `0x3FF49A1B` (0.41 ulp),
+    CI macos-14 paravirtual GPU `0x3FF49A1A` (1.41 ulp), MLX CPU
+    backend on this same machine `0x3FF49A1C` (0.59 ulp), host Rust
+    powf f32/f64 `0x3FF49A1B`. Three faithful, per-device-deterministic
+    pow implementations spanning 2 ulp. Metal transcendentals carry no
+    correctly-rounded or cross-device guarantee — a cross-machine
+    bit-exact bar on raw f32 intermediates was never achievable
+    (ADR 0002's per-device/kernel-class observation at unit-test scale).
+  - Fix: test renamed `yarn_freqs_match_reference_within_ulp_tol`;
+    per-element ulp bound with a failure path that reports EVERY
+    offending index + worst ulp, so one CI run yields the whole
+    spectrum. That reporting immediately earned its keep: a first PR
+    run at tolerance 2 (the pow spread at index 3) was red on CI with
+    the full spectrum revealed — all 64 elements within 2 ulp EXCEPT
+    freq[39] = 15407.383 vs 15407.387: 4 ulp (2.6e-7 relative).
+    Index 39 is the deepest interpolation-blend element (ramp = 16/17,
+    mask = 1/17), where the (I*E)/(I*m + E*(1-m)) divide chain
+    AMPLIFIES the pow spread instead of passing it through
+    bit-transparently as at mask-saturated indices — consistent with
+    ~2x amplification of a ±1.5-ulp pow difference, and hundreds of
+    thousands of ulp away from any real defect. Final bound:
+    YARN_FREQ_ULP_TOL = 8 (2x the observed worst, ~1e-6 relative —
+    the rel-epsilon band anticipated for f32). `mscale` assertion
+    stays bit-exact (host f64; f64->f32 rounding absorbs libm ulp
+    noise; CI agrees). Test doc states explicitly why bit-exact was
+    wrong HERE and why the golden bar (bit-exact token ids, same-device
+    reference) is different and must never be relaxed citing this.
+    `Rope::new` doc amended: freq tables match the Python reference
+    bit-for-bit *on the generating device*.
+- Decisions:
+  - Tolerance over recomputing freqs host-side: nn.rs mirrors mlx-lm's
+    MLX graph op-for-op so same-device golden parity holds; moving the
+    table to host math would break that for a non-goal (cross-machine
+    float bit-equality). Test-bar correction only; zero model-code
+    change.
+  - Assertion weakened only because the bar was unattainable-by-
+    construction, and under explicit human direction (task prompt);
+    recorded here per the never-weaken-a-test rule.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --lib yarn_freqs
+  test nn::tests::yarn_freqs_match_reference_within_ulp_tol ... ok
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-models --test golden
+  test greedy_parity_is_exact_for_every_fixture_model ... ok (217.30s)
+    (all fixtures, all archs, single-stream + width-16 rounds per
+     ADR 0002/0003 — unchanged, as expected: NO committed fixture model
+     exercises the yarn path (qwen3/qwen2.5/gemma-2/gemma-3 configs have
+     rope_scaling: None; llama-3.2 uses the llama3 branch), so this unit
+     test is the only guard on yarn freqs; propagation into golden token
+     ids is structurally impossible for the committed set. Note: CI's
+     `cargo test --workspace` runs before models are fetched, so the
+     golden harness skips on CI and has only ever run on dev machines.)
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+  clean (also clippy --no-default-features: clean; ruff check + format: clean)
+  $ cargo test -p kiln-models -> 11 passed lib + integration green
+  CI (PR #7): run 28736761483 at tol=2 -> test-macos red, full-spectrum
+  report "worst 4: freq[39] ... 4 ulp" (the measurement above);
+  final run at tol=8 -> all four jobs green (run id + confirmation in
+  the PR thread; merged to main only after green).
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
+  unchanged. Standing items unchanged (gemma3 window-crossing fixture,
+  rustc miscompile upstream report).

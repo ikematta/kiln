@@ -1276,7 +1276,9 @@ impl Rope {
     /// Builds the RoPE for one attention layer. `head_dim`/`base` come from
     /// the architecture's config; frequency tables are computed with the
     /// same MLX float32 graph as the Python reference so they match
-    /// bit-for-bit.
+    /// bit-for-bit on the device the reference ran on. (Across devices the
+    /// graph's `power` op differs at ulp level — Metal transcendentals are
+    /// not correctly rounded; see the yarn test's tolerance note.)
     pub(crate) fn new(
         scaling: &RopeScaling,
         head_dim: usize,
@@ -1460,10 +1462,39 @@ mod tests {
     /// `initialize_rope(128, base=1e6, traditional=False, scaling_config=
     /// {"rope_type": "yarn", "factor": 4.0,
     ///  "original_max_position_embeddings": 32768})` — the documented Qwen3
-    /// long-context recipe — and are compared as raw f32 bit patterns:
-    /// the bar is bit-exactness, not closeness.
+    /// long-context recipe.
+    ///
+    /// The freq bar is <= [`YARN_FREQ_ULP_TOL`] ulp per element, NOT
+    /// bit-exactness. That is deliberate — do not "fix" it back:
+    ///
+    /// - The freq table is an MLX float32 graph evaluated on the Metal
+    ///   stream, and its transcendental (`power`) is neither correctly
+    ///   rounded nor identical across GPU families / Metal compiler
+    ///   versions. Measured at this pin for freq[3] = 1e6^0.046875 (true
+    ///   value 1.91095297497…): local Metal 0x3FF49A1B, the macos-14 CI
+    ///   runner's paravirtual GPU 0x3FF49A1A, MLX's CPU backend 0x3FF49A1C
+    ///   — three faithful `pow` implementations spanning 2 ulp, each
+    ///   deterministic per device. Fixture bits captured on one machine can
+    ///   therefore never be a cross-machine bit-exact bar; this is ADR
+    ///   0002's observation (bit-identity holds per device and kernel
+    ///   class) at unit-test scale. Outside the interpolation blend the
+    ///   multiply/divide chain around the `power` is bit-transparent
+    ///   (verified in strict f32 emulation); inside the blend it AMPLIFIES
+    ///   the pow spread — measured full spectrum on the macos-14 CI GPU:
+    ///   every element within 2 ulp of the fixture bits except freq[39]
+    ///   (deepest into the blend, mask = 1/17) at 4 ulp (2.6e-7 relative).
+    /// - This does NOT loosen the golden-parity bar (SPEC §11.2 /
+    ///   ADR 0002), which stays strictly bit-exact and is a different kind
+    ///   of bar: it compares integer token ids from a reference generated
+    ///   by mlx-lm running the SAME MLX kernels on the SAME device class,
+    ///   where bit-equality is real and load-bearing. Never cite this
+    ///   test's tolerance as precedent for relaxing a golden fixture.
+    /// - `mscale` stays bit-exact: it is host-side f64 scalar math
+    ///   (Python-float semantics), and the f64→f32 rounding at the
+    ///   comparison absorbs any libm ulp differences; CI agrees
+    ///   byte-for-byte across machines.
     #[test]
-    fn yarn_freqs_match_reference_bit_for_bit() {
+    fn yarn_freqs_match_reference_within_ulp_tol() {
         if !kiln_mlx::memory::metal_is_available() {
             eprintln!("skipping: no Metal device");
             return;
@@ -1503,16 +1534,43 @@ mod tests {
         );
         let values = freqs.data_f32().expect("freqs readable");
         assert_eq!(values.len(), EXPECTED_FREQ_BITS.len());
+        let mut worst = 0u32;
+        let mut offenders = Vec::new();
         for (i, (got, want)) in values
             .iter()
             .zip(EXPECTED_FREQ_BITS.iter().map(|b| f32::from_bits(*b)))
             .enumerate()
         {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "freq[{i}] = {got} != reference {want} (bitwise)"
-            );
+            let d = ulp_distance(*got, want);
+            worst = worst.max(d);
+            if d > YARN_FREQ_ULP_TOL {
+                offenders.push(format!(
+                    "freq[{i}] = {got} ({:#010x}) vs reference {want} ({:#010x}): {d} ulp",
+                    got.to_bits(),
+                    want.to_bits()
+                ));
+            }
         }
+        assert!(
+            offenders.is_empty(),
+            "yarn freqs off reference by > {YARN_FREQ_ULP_TOL} ulp (worst {worst}):\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Per-element bound for the yarn freq table vs the committed reference
+    /// bits. Measured cross-device spectrum (macos-14 CI GPU vs the dev
+    /// machine that generated the fixture bits): all elements within 2 ulp
+    /// except freq[39] — deepest into the interpolation blend, where the
+    /// divide chain amplifies the pow spread — at 4 ulp. 8 is 2x the
+    /// observed worst (~1e-6 relative); any real defect (wrong exponent,
+    /// mask, or factor) lands thousands of ulp out.
+    const YARN_FREQ_ULP_TOL: u32 = 8;
+
+    /// Ulp distance via bit-pattern difference — valid because all yarn
+    /// freqs are positive finite f32 (monotone bit ordering); a NaN/inf/
+    /// negative from a broken graph yields a huge distance and still fails.
+    fn ulp_distance(a: f32, b: f32) -> u32 {
+        (i64::from(a.to_bits()) - i64::from(b.to_bits())).unsigned_abs() as u32
     }
 }
