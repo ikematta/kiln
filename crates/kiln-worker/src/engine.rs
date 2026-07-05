@@ -262,9 +262,9 @@ pub fn engine_main(
     let stream = Stream::gpu();
 
     let load_started = Instant::now();
-    let (model, eos_ids) = match kiln_models::LlamaModel::load(&model_dir, &stream) {
+    let (model, eos_ids) = match kiln_models::AnyModel::load(&model_dir, &stream) {
         Ok(model) => {
-            let eos: HashSet<u32> = model.config().eos_token_ids().into_iter().collect();
+            let eos: HashSet<u32> = model.eos_token_ids().into_iter().collect();
             (model, eos)
         }
         Err(err) => {
@@ -359,7 +359,7 @@ pub fn engine_main(
 
 /// Copies the engine's gauges/counters into `Shared` for Health and Stats
 /// (the gRPC side never touches the engine directly).
-fn publish_stats(engine: &Engine<kiln_models::LlamaModel>, shared: &Shared) {
+fn publish_stats(engine: &Engine<kiln_models::AnyModel>, shared: &Shared) {
     shared
         .running
         .store(engine.num_running() as u32, Ordering::Release);
@@ -407,7 +407,7 @@ fn publish_stats(engine: &Engine<kiln_models::LlamaModel>, shared: &Shared) {
 /// Maps a proto submission onto an engine request whose event sink speaks
 /// `TokenEvent`.
 fn submit(
-    engine: &mut Engine<kiln_models::LlamaModel>,
+    engine: &mut Engine<kiln_models::AnyModel>,
     shared: &Arc<Shared>,
     eos_ids: &HashSet<u32>,
     submission: Submission,
