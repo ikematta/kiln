@@ -1532,3 +1532,84 @@
   warm resumes recompute only in shapes the same prompt's cold schedule
   produces, per the resume-invariance unit test.
 - Next: step 3 — serve cache hits from F-aligned boundaries.
+
+## [2026-07-04] Phase 5 / Option B (F=64) — fine-grained prefix reuse — DONE
+- What (sequenced per the PM instruction; each step its own commit):
+  1. **Canonical schedule** (`canonical_prefill_len`, shared by the
+     batched engine and the Phase-3 generate path): bulk chunks split at
+     absolute `prefill_chunk` multiples; the final partial super-chunk
+     split at absolute `prefill_fine_chunk` (default 64) multiples plus
+     the sub-fine remainder. A unit test exhaustively proves
+     resume-invariance: walking from any boundary reproduces exactly the
+     cold schedule's suffix, for several (chunk, fine) configs — the
+     property the bit-exactness argument stands on. `fine >=
+     prefill_chunk` restores the old schedule (bench knob); test configs
+     with `prefill_chunk <= 64` degenerate to their old schedules.
+  2. **Golden gate: PASSED** (own commit, before any cache-path change).
+     All 5 fixtures exact, including the width-16 rounds, with every
+     sub-2k prefill re-chunked onto the 64 grid (e.g. raw-long-prefill:
+     one 248-token chunk -> 64+64+64+56). Batch-1 == contiguous parity
+     also re-verified.
+  3. **Cache hits now resume at schedule boundaries** (fine multiples in
+     the final super-chunk, chunk multiples in bulk). Re-measured the
+     8-turn conversation (90-200-token increments, debug build):
+     ```
+     turn | prompt | reused | skip%  | warm TTFT | cold TTFT   (before: all 0%)
+        1 |    844 |    640 |  75.8% |   164.8ms |    573.2ms
+        2 |   1028 |    896 |  87.2% |   114.0ms |    681.4ms
+        3 |   1252 |   1088 |  86.9% |   147.6ms |    842.7ms
+        4 |   1406 |   1280 |  91.0% |   107.6ms |    933.9ms
+        5 |   1670 |   1408 |  84.3% |   216.5ms |   1133.4ms
+        6 |   1884 |   1728 |  91.7% |   142.3ms |   1291.6ms
+        7 |   2088 |      0 |   0.0% |  1285.6ms |   1286.3ms
+     ```
+     The 76-93% estimate is confirmed for steady turns (75.8-91.7%,
+     warm TTFT cut 3.5-9.1x), with one correction: **the single turn
+     whose prompt crosses a 2048 super-chunk boundary serves 0** — its
+     donor overlap (1920 here) lies inside the new prompt's bulk chunk,
+     which is not a resumable boundary; resuming there would compute a
+     shape the cold run never uses, so it is correctly refused. Reuse
+     returns the following turn. Cost: one cold prefill per 2048 tokens
+     of conversation growth (~1 turn in 10-15). Warm == cold bit-exact
+     asserted on every turn; the divergent-extension scenario in
+     prefix_cache.rs now exercises a real fine-aligned resume on real
+     weights (was: expects-no-hit).
+  4. **Miss-path cost** (release medians, fresh engine, cache off,
+     `tests/prefill_schedule_bench.rs`):
+     ```
+     prompt | tail fwds | fine=64 TTFT | old sched | delta
+        257 |         4 |     179.0ms |   168.2ms |  +10.7ms (+6.4%)
+        512 |         8 |     352.3ms |   314.9ms |  +37.4ms (+11.9%)
+       1024 |        16 |     714.6ms |   615.1ms |  +99.5ms (+16.2%)
+       2048 |        32 |    1470.8ms |  1288.4ms | +182.4ms (+14.2%)
+     tuning curve @2048: F=64 +13.9% | F=128 +2.9% | F=256 +0.2%
+     ```
+     ~6.5ms per added forward — dominated by per-step fixed cost (eval
+     sync + per-chunk cache maintenance), not matmul time; hence the
+     sharply non-linear curve.
+  5. Full re-run: workspace 34/34 test targets ok (batching, preemption
+     exact counts, both leak gates 0 -> 0, golden, all prefix suites,
+     worker rpc); batch-16 throughput 398.5 tok/s -> 3.22x (gate >= 3x);
+     e2e 21 passed (both worker kinds); python worker 28 passed; both CI
+     shapes + fmt + ruff clean; smoke 3.0.
+- Decisions:
+  - F=64 shipped as the default per the instruction. **Flagging for the
+    PM**: the measured curve says F=128 (+2.9% miss cost, warm recompute
+    grows by at most 64 extra tokens/turn) or F=256 (+0.2%) may be the
+    better default trade on this hardware; it is a one-line default
+    change (`DEFAULT_PREFILL_FINE_CHUNK`), golden re-gated the same way
+    (a coarser grid is strictly closer to the old schedule). Say the
+    word and it lands with a fresh golden run.
+  - The super-chunk-crossing seam (step 3) is inherent to keeping bulk
+    chunks at 2048: finer bulk boundaries would tax every long cold
+    prompt. Left as-is; the multiturn test documents it.
+  - Per-step overhead, not matmuls, dominates the fine-grid cost —
+    batching several consecutive fine chunks into one engine iteration
+    (same forward shapes, fewer step boundaries) is the obvious lever if
+    the miss cost ever matters; noted, not built.
+- Deviations: none.
+- Acceptance: outputs quoted above per step; gate commands identical to
+  the Phase 5 closeout list.
+- Next: PM phase gate on Phase 5 (SPEC §13.4) including the F-default
+  choice above, then Phase 6 — Qwen + Gemma, quantization matrix,
+  worker="auto" routing (SPEC §12).
