@@ -2783,3 +2783,53 @@
   unchanged. Standing item updated: rustc miscompile upstream report is
   ready to file (payload above); re-test the eager-key workaround at
   every toolchain bump.
+
+## [2026-07-05] Phase 6 — rustc MIR-GVN miscompile: upstream report FILED — DONE
+- What (closes the "file upstream" standing item from the two 2026-07-05
+  sampler-SIGBUS entries):
+  1. **Filed https://github.com/rust-lang/rust/issues/158830** — "MIR GVN
+     merges by-value argument temporaries with drop glue, causing double
+     free in safe code (1.95/1.96, aarch64-apple-darwin)". Payload: the
+     kiln-free zero-unsafe reproducer (previous entry), the
+     `-Zmir-enable-passes=-GVN` clean-run isolation, the MIR excerpt
+     (`_6 = Sampler {...}` built once; `_5 = (copy _6,)`; call 1
+     `copy _5`, call 2 `move _5`), and the opt-level threshold finding
+     stated as an inlining artifact of one defect (kiln shape — no-niche
+     `Option<FfiHandle>` — triggers at >= 1; minimized niched
+     `Option<Box>` shape needs >= 2), target rustc 1.96.1
+     aarch64-apple-darwin. Labels applied via rustbot: T-compiler,
+     C-bug, I-unsound, A-mir-opt, A-mir-opt-GVN (+ auto I-prioritize).
+  2. New pre-filing evidence gathered for the report:
+     - rustc 1.95.0 (59807616e) also crashes (opt 2/3) — NOT a 1.96
+       regression; introduction unbisected, stated as such.
+     - nightly 1.98.0 (c397dae80 2026-07-02) does NOT crash **but emits
+       the identical merged MIR** — the report asks upstream to
+       determine fixed-needs-backport vs masked-latent.
+     - duplicate search (gh, several phrasings incl. broad "GVN"
+       sanity check): no existing report of this defect.
+  3. **rust-toolchain.toml created** (did not previously exist) with the
+     issue link + workaround/bump-protocol comment, `channel = "stable"`.
+- Decisions: `channel = "stable"`, not a 1.96.1 pin — CI already floats
+  on dtolnay/rust-toolchain@stable so this changes no behavior anywhere,
+  the landed eager-key workaround makes 1.96.1 safe for Kiln, and
+  freezing onto a known-miscompiling compiler would invert the intent;
+  the comment (not the pin) carries the warning, and the
+  test-macos-release lane is the enforcement at every bump.
+- Deviations: none (no Rust code touched).
+- Acceptance (real output, trimmed):
+  ```
+  $ gh issue create -R rust-lang/rust --title "MIR GVN merges by-value
+    argument temporaries with drop glue, causing double free in safe
+    code (1.95/1.96, aarch64-apple-darwin)" --body-file issue-body.md
+  https://github.com/rust-lang/rust/issues/158830
+  $ gh issue view 158830 -R rust-lang/rust --json number,state,labels
+  158830 [OPEN] | labels: T-compiler, I-unsound, C-bug, A-mir-opt,
+  I-prioritize, needs-triage, A-mir-opt-GVN
+  $ rustup run 1.95.0 rustc -C opt-level=2 main.rs && ./repro -> exit 133
+  $ rustup run nightly rustc -C opt-level=3 main.rs && ./repro -> exit 0
+    (nightly --emit=mir: same single _6/_5 construction, copy/move pair)
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
+  unchanged. Standing item updated: upstream report FILED (#158830);
+  at every toolchain bump re-run the release suite and check #158830
+  for the fix/backport landing.

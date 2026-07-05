@@ -1,0 +1,15 @@
+# Kiln builds on current stable (matches CI's dtolnay/rust-toolchain@stable).
+#
+# KNOWN MISCOMPILATION in stable rustc 1.95.0-1.96.1 (at least) on
+# aarch64-apple-darwin: MIR GVN merges identical constant-constructed
+# by-value argument temporaries with drop glue -> double free in safe code.
+# Upstream report (filed from this repo, with minimized reproducer):
+#   https://github.com/rust-lang/rust/issues/158830
+# Kiln-side workaround: eager Sampler PRNG key (commit 495bc3c); the trigger
+# shape is pinned by the REGRESSION SHAPE contract in
+# crates/kiln-engine/tests/sampler.rs, exercised by the test-macos-release
+# CI lane. Nightly 1.98 (2026-07-02) does not crash but emits the same
+# merged MIR, so re-run the full release suite at every toolchain bump
+# before trusting a new stable (PROGRESS 2026-07-05 standing item).
+[toolchain]
+channel = "stable"
