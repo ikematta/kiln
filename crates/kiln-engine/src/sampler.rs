@@ -24,6 +24,13 @@ pub struct SamplingOptions {
     pub top_k: u32,
     pub min_p: f32,
     pub seed: u64,
+    /// The CLIENT set the seed (as opposed to a worker-generated one).
+    /// Seeded requests promise reproducibility per worker version
+    /// (SPEC §6.6), so they ride the deterministic decode path (ADR 0002
+    /// B': sub-batched trunk, bit-identical to single-stream) together
+    /// with greedy requests. The engine cannot infer this from `seed`
+    /// alone — the worker fills unset seeds with random ones.
+    pub explicit_seed: bool,
 }
 
 impl Default for SamplingOptions {
@@ -34,7 +41,16 @@ impl Default for SamplingOptions {
             top_k: 0,
             min_p: 0.0,
             seed: 0,
+            explicit_seed: false,
         }
+    }
+}
+
+impl SamplingOptions {
+    /// Whether a request with these options carries a determinism promise:
+    /// greedy decoding, or a client-chosen seed (SPEC §6.6 reproducibility).
+    pub fn deterministic(&self) -> bool {
+        self.temperature == 0.0 || self.explicit_seed
     }
 }
 

@@ -96,6 +96,12 @@ impl Worker for WorkerService {
             worker_version: env!("CARGO_PKG_VERSION").to_owned(),
             kv_block_size: kiln_engine::DEFAULT_BLOCK_SIZE as u32,
             chat_template_hash: info.chat_template_hash.clone(),
+            // Diagnostics only (ADR 0002 B'): the engine enforces
+            // determinism itself by sub-batching greedy/seeded rows.
+            max_deterministic_decode_width: self
+                .shared
+                .deterministic_decode_width
+                .load(Ordering::Acquire),
         }))
     }
 

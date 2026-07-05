@@ -23,10 +23,10 @@ pub mod step;
 pub use block::{AppendPlan, BlockError, BlockId, BlockManager, BlockTable, CowCopy, CowOutcome};
 #[cfg(feature = "metal")]
 pub use engine::{
-    DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_TOKENS, DEFAULT_NUM_BLOCKS, DEFAULT_PREFILL_CHUNK,
-    DEFAULT_PREFILL_FINE_CHUNK, Engine, EngineConfig, EngineError, EngineRequest, ErrorCause,
-    EventSink, FinishKind, FinishSummary, KvDims, PREFILL_PAD_MIN_ROWS, PrefixCacheStats, Priority,
-    SeqEvent, SsdParams, canonical_prefill_len,
+    DEFAULT_BLOCK_SIZE, DEFAULT_DETERMINISTIC_DECODE_WIDTH, DEFAULT_MAX_BATCH_TOKENS,
+    DEFAULT_NUM_BLOCKS, DEFAULT_PREFILL_CHUNK, DEFAULT_PREFILL_FINE_CHUNK, Engine, EngineConfig,
+    EngineError, EngineRequest, ErrorCause, EventSink, FinishKind, FinishSummary, KvDims,
+    PREFILL_PAD_MIN_ROWS, PrefixCacheStats, Priority, SeqEvent, SsdParams, canonical_prefill_len,
 };
 #[cfg(feature = "metal")]
 pub use paged::{KvSpec, PagedKv, WriteRun};
