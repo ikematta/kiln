@@ -1,8 +1,19 @@
 //! Continuous-batching correctness (SPEC §6.2 / Phase 4 part 2): the
-//! batched/paged engine must produce bit-identical greedy outputs to the
+//! batched/paged engine must produce the same greedy token streams as the
 //! Phase-3 single-request contiguous path, alone and under 2-4-way
-//! concurrency (CLAUDE.md determinism: batching must not change greedy
-//! outputs).
+//! concurrency (SPEC §6.6/§11.3, CLAUDE.md determinism: batching must not
+//! change greedy outputs).
+//!
+//! Two distinct guarantees back these token assertions (ADR 0002):
+//! - engine at batch 1 vs the contiguous path: bit-identical by
+//!   construction — both run the canonical prefill schedule (including its
+//!   kernel-class padding of ragged tail pieces) and M=1 decode, so every
+//!   kernel dispatch matches shape-for-shape;
+//! - concurrent runs vs solo: token-id equality only. Concurrency raises
+//!   the trunk's row count across MLX's qmv/qmm dispatch classes, so the
+//!   logits differ from solo in ulps by library design; a pass means
+//!   greedy argmax absorbed that noise for these prompts, not that the
+//!   math is bit-identical.
 //!
 //! Skips (with a note) when `KILN_TEST_MODELS` is unset or Metal is
 //! unavailable. Single `#[test]` because the kiln-mlx live-object counter
@@ -123,6 +134,10 @@ fn batched_greedy_matches_single_stream() {
         let model = LlamaModel::load(&model_dir, &stream).expect("model loads");
         let tokenizer = Tokenizer::from_model_dir(&model_dir).expect("tokenizer loads");
         let encode = |text: &str| tokenizer.encode(text, true).expect("encodes");
+        // Production posture (ADR 0002 B'): calibrate like the worker does.
+        let det_width = model
+            .calibrate_deterministic_width(&stream)
+            .expect("calibrates");
 
         let short = encode("The capital of France is");
         let medium = encode(
@@ -131,27 +146,43 @@ fn batched_greedy_matches_single_stream() {
         );
         let long = encode(&"The quick brown fox jumps over the lazy dog. ".repeat(16));
         assert!(long.len() > 100, "long prompt should span several chunks");
+        // A prompt whose prefill limit lands a few tokens past a fine
+        // boundary: its ragged tail piece is shorter than
+        // PREFILL_PAD_MIN_ROWS and exercises the ADR 0002 kernel-class
+        // padding on BOTH paths (engine and contiguous).
+        let mut tiny_rem = encode(&"Clay hardens in the kiln's steady fire. ".repeat(18));
+        let fine = kiln_engine::DEFAULT_PREFILL_FINE_CHUNK;
+        tiny_rem.truncate(fine + 6); // limit = fine + 5 -> ragged piece of 5
+        assert_eq!((tiny_rem.len() - 1) % fine, 5, "ragged tail size drifted");
 
         // Prompt sizes and budgets chosen to cross block boundaries (32)
-        // during decode and to split the long prompt into several chunks
-        // under the small-chunk config below.
-        let jobs: Vec<(&[u32], usize)> =
-            vec![(&short, 40), (&medium, 24), (&long, 24), (&short, 12)];
+        // during decode, to split the long prompt into several chunks
+        // under the small-chunk config below, and to hit the padded
+        // ragged-tail path.
+        let jobs: Vec<(&[u32], usize)> = vec![
+            (&short, 40),
+            (&medium, 24),
+            (&long, 24),
+            (&short, 12),
+            (&tiny_rem, 24),
+        ];
 
         let config = EngineConfig {
             num_blocks: 64,
+            deterministic_decode_width: det_width,
             ..EngineConfig::default()
         };
         let chunked = EngineConfig {
             num_blocks: 64,
             prefill_chunk: 48,
+            deterministic_decode_width: det_width,
             ..EngineConfig::default()
         };
 
         // 1) Engine (paged, batch of 1) == Phase-3 contiguous path, with
         //    the production chunk size.
         let reference = |prompt: &[u32], max_tokens: usize| -> Vec<u32> {
-            let mut sampler = kiln_engine::Sampler::greedy();
+            let mut sampler = kiln_engine::Sampler::greedy().expect("sampler");
             generate(
                 &model,
                 prompt,

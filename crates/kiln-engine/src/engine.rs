@@ -119,6 +119,29 @@ pub fn canonical_prefill_len(at: usize, limit: usize, prefill_chunk: usize, fine
     }
 }
 
+/// Minimum trunk row count for ragged prefill tail pieces (ADR 0002): a
+/// piece shorter than this that does not start on a `prefill_chunk`
+/// boundary is computed with pad rows so every matmul/SDPA stays in the
+/// same kernel class the mlx-lm reference used for those positions
+/// (MLX's `get_qmv_batch_limit` tops out at 32 across GPU classes; the
+/// SDPA vector-kernel bound is lower). Pieces starting ON a
+/// `prefill_chunk` boundary are exactly the piece the reference also
+/// computes at that size and are never padded. Pad rows are compute
+/// filler only — never written to KV, sampled, or emitted (see
+/// `StepBatch::pad_rows` and the `prefill_pad` tests).
+pub const PREFILL_PAD_MIN_ROWS: usize = 32;
+
+/// Default `EngineConfig::deterministic_decode_width` (ADR 0002 / B'):
+/// deterministic rows (greedy or client-seeded) decode in sub-batches of
+/// at most this many rows so every trunk matmul stays in the same kernel
+/// class as M=1 — bit-identical to single-stream at any admitted batch
+/// width. 4 is safe under the smallest dispatch threshold anywhere in
+/// MLX's device table (6); workers RAISE it at load via
+/// `AnyModel::calibrate_deterministic_width` (9 on the Phase 6 dev
+/// machine), so this conservative default only governs engines built
+/// without calibration.
+pub const DEFAULT_DETERMINISTIC_DECODE_WIDTH: usize = 4;
+
 /// Cache maintenance cadence in decode iterations (mirrors the Phase-3
 /// loop's `clear_cache` every 256 steps).
 const MAINTENANCE_INTERVAL: u64 = 256;
@@ -156,6 +179,10 @@ pub struct EngineConfig {
     pub prefix_cache: bool,
     /// SSD cold tier (SPEC §6.4); requires `prefix_cache`.
     pub ssd: Option<SsdParams>,
+    /// Max rows per forward for DETERMINISTIC decode rows (ADR 0002 B');
+    /// see [`DEFAULT_DETERMINISTIC_DECODE_WIDTH`]. Non-deterministic rows
+    /// always ride one unrestricted full-width forward.
+    pub deterministic_decode_width: usize,
 }
 
 impl Default for EngineConfig {
@@ -168,6 +195,7 @@ impl Default for EngineConfig {
             prefill_fine_chunk: DEFAULT_PREFILL_FINE_CHUNK,
             prefix_cache: true,
             ssd: None,
+            deterministic_decode_width: DEFAULT_DETERMINISTIC_DECODE_WIDTH,
         }
     }
 }
@@ -320,6 +348,11 @@ struct Seq {
     /// resumed request keeps its seniority ("most-recently-admitted"
     /// victims are picked by the highest `arrival`).
     arrival: u64,
+    /// Greedy or client-seeded (ADR 0002 B'): decode/replay rows ride
+    /// sub-batched forwards bit-identical to single-stream, and finished
+    /// blocks donate in full. Non-deterministic sequences decode at full
+    /// width and donate only prefill-covered blocks.
+    deterministic: bool,
     cancel: Arc<AtomicBool>,
     on_event: EventSink,
     table: BlockTable,
@@ -407,7 +440,17 @@ impl CacheState {
     /// only writers can reacquire it.
     fn donate(&mut self, mgr: &mut BlockManager, seq: &Seq, table: BlockTable) {
         let block_size = self.radix.block_size();
-        let settled = seq.processed + seq.fed;
+        // ADR 0002 B': non-deterministic sequences' decode rows were
+        // computed at arbitrary trunk widths (ulp-off from M=1), so only
+        // their prefill-written rows — canonical at any load — are
+        // donatable; a deterministic request reusing more would silently
+        // lose its bit guarantee. Deterministic sequences' decode rows
+        // ARE single-stream bits and donate in full.
+        let settled = if seq.deterministic {
+            seq.processed + seq.fed
+        } else {
+            seq.processed
+        };
         let blocks = table.into_blocks();
         let full = (settled / block_size).min(blocks.len());
         let token_at = |pos: usize| {
@@ -577,6 +620,32 @@ struct DecodePlan {
     seq: usize,
     sample: bool,
     step: SeqStep,
+}
+
+/// Splits decode entries into the ADR 0002 B' forward groups:
+/// deterministic entries in chunks of at most `width` rows (each such
+/// forward reproduces M=1 bits — qmv row M-invariance below the
+/// calibrated dispatch threshold), then ONE unrestricted group carrying
+/// every non-deterministic entry. Order within each class is preserved.
+fn partition_decode_plans<T>(
+    plans: Vec<T>,
+    width: usize,
+    mut deterministic: impl FnMut(&T) -> bool,
+) -> Vec<Vec<T>> {
+    let (det, nondet): (Vec<T>, Vec<T>) = plans.into_iter().partition(|p| deterministic(p));
+    let mut groups: Vec<Vec<T>> = Vec::new();
+    let mut det = det.into_iter();
+    loop {
+        let chunk: Vec<T> = det.by_ref().take(width).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        groups.push(chunk);
+    }
+    if !nondet.is_empty() {
+        groups.push(nondet);
+    }
+    groups
 }
 
 /// One scheduled-but-unread decode step: forward and sampling graphs are
@@ -890,15 +959,36 @@ impl<M: StepModel> Engine<M> {
             stop_tokens,
             priority,
             cancel,
-            on_event,
+            mut on_event,
         } = request;
+        // Key creation is a host-side mlx allocation; a failure (never seen
+        // in practice) is the proto's in-band error. No engine resources
+        // exist for the request yet, so the summary is emitted directly.
+        let sampler = match Sampler::new(sampling) {
+            Ok(sampler) => sampler,
+            Err(err) => {
+                let _ = on_event(SeqEvent::Finished(FinishSummary {
+                    reason: FinishKind::Error,
+                    completion_tokens: 0,
+                    matched_stop_token: None,
+                    error: Some(format!("sampler key init failed: {err}")),
+                    error_cause: Some(ErrorCause::Internal),
+                    preemptions: 0,
+                    cached_prompt_tokens: 0,
+                    prefill_seconds: 0.0,
+                    decode_seconds: 0.0,
+                }));
+                return;
+            }
+        };
         let arrival = self.next_arrival;
         self.next_arrival += 1;
         let mut seq = Seq {
             prompt,
             max_tokens,
             stop_tokens,
-            sampler: Sampler::new(sampling),
+            deterministic: sampling.deterministic(),
+            sampler,
             penalties,
             penalty_window,
             priority,
@@ -1090,47 +1180,59 @@ impl<M: StepModel> Engine<M> {
             return Ok(None);
         }
 
-        // Pass 2: append the slots and build the step. Inputs are the
-        // pending `[1]` arrays reshaped and concatenated to `[1, n]`.
+        // Pass 2: append the slots and build the step, partitioned into
+        // the same ADR 0002 B' forward groups as the synchronous path
+        // (deterministic rows in <= width chunks, non-deterministic rows
+        // full-width). Inputs are the pending `[1]` arrays reshaped and
+        // concatenated to `[1, n]` per group.
         self.iterations += 1;
-        let mut seqs = Vec::with_capacity(included.len());
-        let mut inputs = Vec::with_capacity(included.len());
-        for &(i, pending) in &included {
-            let step = build_seq_step(
-                &mut self.running[i],
-                &mut self.mgr,
-                &mut self.kv,
-                1,
-                true,
-                &self.stream,
-            )?
-            .ok_or_else(|| MlxError {
-                message: "pipelined append exceeded the precounted pool".to_owned(),
-            })?;
-            seqs.push(step);
-            inputs.push(ops::reshape(pending, &[1, 1], &self.stream)?);
-        }
-        let refs: Vec<&Array> = inputs.iter().collect();
-        let input = ops::concatenate(&refs, 1, &self.stream)?;
-        let batch = StepBatch {
-            input: StepInput::Lazy(input),
-            seqs,
-        };
-        let logits = self
-            .model
-            .forward_step(&batch, &mut self.kv, &self.stream)?
-            .ok_or_else(|| MlxError {
-                message: "pipelined decode returned no logits".to_owned(),
-            })?;
-        let mut rows = Vec::with_capacity(included.len());
-        for (row, &(i, _)) in included.iter().enumerate() {
-            let seq = &mut self.running[i];
-            debug_assert!(
-                seq.penalties.is_disabled(),
-                "pipeline_ok admitted penalties"
-            );
-            let token = sample_from_row(seq, &logits, row as i32, &self.stream)?;
-            rows.push((seq.arrival, token));
+        let total = included.len();
+        let groups = partition_decode_plans(
+            included,
+            self.config.deterministic_decode_width.max(1),
+            |&(i, _)| self.running[i].deterministic,
+        );
+        let mut rows = Vec::with_capacity(total);
+        for group in groups {
+            let mut seqs = Vec::with_capacity(group.len());
+            let mut inputs = Vec::with_capacity(group.len());
+            for &(i, pending) in &group {
+                let step = build_seq_step(
+                    &mut self.running[i],
+                    &mut self.mgr,
+                    &mut self.kv,
+                    1,
+                    true,
+                    &self.stream,
+                )?
+                .ok_or_else(|| MlxError {
+                    message: "pipelined append exceeded the precounted pool".to_owned(),
+                })?;
+                seqs.push(step);
+                inputs.push(ops::reshape(pending, &[1, 1], &self.stream)?);
+            }
+            let refs: Vec<&Array> = inputs.iter().collect();
+            let input = ops::concatenate(&refs, 1, &self.stream)?;
+            let batch = StepBatch {
+                input: StepInput::Lazy(input),
+                seqs,
+                pad_rows: 0,
+            };
+            let logits = self
+                .model
+                .forward_step(&batch, &mut self.kv, &self.stream)?
+                .ok_or_else(|| MlxError {
+                    message: "pipelined decode returned no logits".to_owned(),
+                })?;
+            for (row, &(i, _)) in group.iter().enumerate() {
+                let seq = &mut self.running[i];
+                debug_assert!(
+                    seq.penalties.is_disabled(),
+                    "pipeline_ok admitted penalties"
+                );
+                let token = sample_from_row(seq, &logits, row as i32, &self.stream)?;
+                rows.push((seq.arrival, token));
+            }
         }
         {
             let outputs: Vec<&Array> = rows.iter().map(|(_, token)| token).collect();
@@ -1443,8 +1545,9 @@ impl<M: StepModel> Engine<M> {
             let seq = &self.running[i];
             // Phase-3/mlx-lm chunk rule: prefill covers prompt[..n-1]; the
             // last prompt token is fed by the first sampled (decode) step.
+            let at = seq.processed;
             let chunk = canonical_prefill_len(
-                seq.processed,
+                at,
                 seq.prompt.len() - 1,
                 self.config.prefill_chunk,
                 self.config.prefill_fine_chunk,
@@ -1454,35 +1557,42 @@ impl<M: StepModel> Engine<M> {
                 && let Some(step) = self.plan_step(i, chunk, false, &mut decode_plans)?
             {
                 let seq = &self.running[i];
-                let tokens = seq.prompt[seq.processed..seq.processed + chunk].to_vec();
+                let tokens = seq.prompt[at..at + chunk].to_vec();
+                // ADR 0002 kernel-class padding: sub-32-row ragged pieces
+                // off the super-chunk grid run with pad rows. Capped at
+                // `at` so the padded SDPA query never exceeds the KV
+                // coverage (`at` is the piece's RoPE offset).
+                let pad_rows = if chunk < PREFILL_PAD_MIN_ROWS
+                    && !at.is_multiple_of(self.config.prefill_chunk)
+                {
+                    (PREFILL_PAD_MIN_ROWS - chunk).min(at) as i32
+                } else {
+                    0
+                };
                 prefill = Some((
                     i,
                     StepBatch {
                         input: StepInput::Ids(tokens),
                         seqs: vec![step],
+                        pad_rows,
                     },
                 ));
             }
         }
 
-        let mut decode_tokens: Vec<u32> = Vec::with_capacity(decode_plans.len());
-        let mut decode_seqs: Vec<SeqStep> = Vec::with_capacity(decode_plans.len());
-        let mut sampled_ids: Vec<usize> = Vec::new();
-        let mut replay_ids: Vec<usize> = Vec::new();
-        for plan in decode_plans {
-            let seq = &self.running[plan.seq];
-            decode_tokens.push(seq.history[seq.fed]);
-            decode_seqs.push(plan.step);
-            if plan.sample {
-                sampled_ids.push(plan.seq);
-            } else {
-                replay_ids.push(plan.seq);
-            }
-        }
-        let decode_batch = StepBatch {
-            input: StepInput::Ids(decode_tokens),
-            seqs: decode_seqs,
-        };
+        // --- Partition (ADR 0002 B'): deterministic rows (greedy or
+        // client-seeded) decode in sub-batches of at most
+        // `deterministic_decode_width` rows, keeping every trunk matmul
+        // in the M=1 kernel class — bit-identical to single-stream at any
+        // admitted width. Non-deterministic rows ride ONE unrestricted
+        // full-width forward (no weight re-reads). Grouping is
+        // value-neutral across sequences: each gathers only its own
+        // history within the step.
+        let groups = partition_decode_plans(
+            decode_plans,
+            self.config.deterministic_decode_width.max(1),
+            |plan| self.running[plan.seq].deterministic,
+        );
 
         // --- Forward (SPEC §6.2 step 3). Prefill first so its KV writes
         // sit earliest on the pools' functional-update chain.
@@ -1490,22 +1600,41 @@ impl<M: StepModel> Engine<M> {
             let logits = self.model.forward_step(batch, &mut self.kv, &self.stream)?;
             debug_assert!(logits.is_none(), "prefill chunks never sample");
         }
-        let mut sampled: Vec<(usize, Array)> = Vec::with_capacity(sampled_ids.len());
-        if !decode_batch.seqs.is_empty() {
+        let mut sampled: Vec<(usize, Array)> = Vec::new();
+        let mut replay_ids: Vec<usize> = Vec::new();
+        for group in groups {
+            let mut tokens: Vec<u32> = Vec::with_capacity(group.len());
+            let mut seqs: Vec<SeqStep> = Vec::with_capacity(group.len());
+            let mut sampled_ids: Vec<usize> = Vec::new();
+            for plan in group {
+                let seq = &self.running[plan.seq];
+                tokens.push(seq.history[seq.fed]);
+                seqs.push(plan.step);
+                if plan.sample {
+                    sampled_ids.push(plan.seq);
+                } else {
+                    replay_ids.push(plan.seq);
+                }
+            }
+            let batch = StepBatch {
+                input: StepInput::Ids(tokens),
+                seqs,
+                pad_rows: 0,
+            };
             let logits = self
                 .model
-                .forward_step(&decode_batch, &mut self.kv, &self.stream)?;
+                .forward_step(&batch, &mut self.kv, &self.stream)?;
             if sampled_ids.is_empty() {
-                debug_assert!(logits.is_none(), "replay-only steps never sample");
-            } else {
-                let logits = logits.ok_or_else(|| MlxError {
-                    message: "model returned no logits for a decode step".to_owned(),
-                })?;
-                for (row, &i) in sampled_ids.iter().enumerate() {
-                    let token =
-                        sample_from_row(&mut self.running[i], &logits, row as i32, &self.stream)?;
-                    sampled.push((i, token));
-                }
+                debug_assert!(logits.is_none(), "replay-only groups never sample");
+                continue;
+            }
+            let logits = logits.ok_or_else(|| MlxError {
+                message: "model returned no logits for a decode step".to_owned(),
+            })?;
+            for (row, &i) in sampled_ids.iter().enumerate() {
+                let token =
+                    sample_from_row(&mut self.running[i], &logits, row as i32, &self.stream)?;
+                sampled.push((i, token));
             }
         }
 

@@ -119,6 +119,10 @@ pub struct Shared {
     /// from the cache flags; the engine thread may clear SSD_TIER if the
     /// store fails to open).
     pub capabilities: std::sync::Mutex<Vec<i32>>,
+    /// Device-calibrated deterministic decode width (ADR 0002 B'),
+    /// published in `WorkerInfo` for diagnostics; set by the engine
+    /// thread after model load (0 while loading).
+    pub deterministic_decode_width: AtomicU32,
     started_at: Instant,
 }
 
@@ -159,6 +163,7 @@ impl Shared {
             ssd_writes_total: AtomicU64::new(0),
             ssd_fingerprint_rejects_total: AtomicU64::new(0),
             capabilities: std::sync::Mutex::new(capabilities),
+            deterministic_decode_width: AtomicU32::new(0),
             started_at: Instant::now(),
         }
     }
@@ -262,9 +267,9 @@ pub fn engine_main(
     let stream = Stream::gpu();
 
     let load_started = Instant::now();
-    let (model, eos_ids) = match kiln_models::LlamaModel::load(&model_dir, &stream) {
+    let (model, eos_ids) = match kiln_models::AnyModel::load(&model_dir, &stream) {
         Ok(model) => {
-            let eos: HashSet<u32> = model.config().eos_token_ids().into_iter().collect();
+            let eos: HashSet<u32> = model.eos_token_ids().into_iter().collect();
             (model, eos)
         }
         Err(err) => {
@@ -277,11 +282,27 @@ pub fn engine_main(
         }
     };
     let dims = model.kv_dims();
+    // ADR 0002 B': measure this device's deterministic decode width once
+    // at load; greedy/seeded rows sub-batch below it (bit-identical to
+    // single-stream), everything else runs full-width. A probe failure
+    // falls back to the conservative default rather than failing the
+    // load — the default is correct, just slower for wide greedy batches.
+    let det_width = match model.calibrate_deterministic_width(&stream) {
+        Ok(width) => width,
+        Err(err) => {
+            tracing::warn!(error = %err,
+                "deterministic-width calibration failed; using the conservative default");
+            kiln_engine::DEFAULT_DETERMINISTIC_DECODE_WIDTH
+        }
+    };
+    shared
+        .deterministic_decode_width
+        .store(det_width as u32, Ordering::Release);
     // Pool sizing: EngineConfig defaults (512 blocks x 32 tokens) until
     // memory-budget admission lands (SPEC §6.4 / §2.3, Phase 4 part 3+).
     // Prefix cache/SSD per the CLI flags (SPEC §6.3/§6.4): slabs live
     // under `<ssd_dir>/<model_fingerprint>/blocks/`.
-    let config = EngineConfig {
+    let mut config = EngineConfig {
         prefix_cache: cache.prefix_cache,
         ssd: cache
             .ssd_dir
@@ -292,8 +313,15 @@ pub fn engine_main(
                 max_bytes: cache.ssd_max_bytes,
                 fingerprint: shared.info.weights_fingerprint.clone(),
             }),
+        deterministic_decode_width: det_width,
         ..EngineConfig::default()
     };
+    if model.monolithic_prefill_required() {
+        // gemma2 manual softcapped attention: prefill must run in the
+        // reference's own single-tail shape (no Phase 5 fine grid); values
+        // >= prefill_chunk select exactly that schedule.
+        config.prefill_fine_chunk = config.prefill_chunk;
+    }
     let mut engine = match Engine::new(model, dims, config, stream) {
         Ok(engine) => engine,
         Err(err) => {
@@ -310,6 +338,7 @@ pub fn engine_main(
     tracing::info!(
         model = %shared.model_id,
         load_ms = load_started.elapsed().as_millis() as u64,
+        deterministic_decode_width = det_width,
         "model ready"
     );
     shared.set_state(WorkerState::Ready, "");
@@ -359,7 +388,7 @@ pub fn engine_main(
 
 /// Copies the engine's gauges/counters into `Shared` for Health and Stats
 /// (the gRPC side never touches the engine directly).
-fn publish_stats(engine: &Engine<kiln_models::LlamaModel>, shared: &Shared) {
+fn publish_stats(engine: &Engine<kiln_models::AnyModel>, shared: &Shared) {
     shared
         .running
         .store(engine.num_running() as u32, Ordering::Release);
@@ -407,7 +436,7 @@ fn publish_stats(engine: &Engine<kiln_models::LlamaModel>, shared: &Shared) {
 /// Maps a proto submission onto an engine request whose event sink speaks
 /// `TokenEvent`.
 fn submit(
-    engine: &mut Engine<kiln_models::LlamaModel>,
+    engine: &mut Engine<kiln_models::AnyModel>,
     shared: &Arc<Shared>,
     eos_ids: &HashSet<u32>,
     submission: Submission,
@@ -439,6 +468,10 @@ fn submit(
         top_k: sampling.top_k,
         min_p: sampling.min_p,
         seed: seed_used,
+        // Proto: seed == 0 means "worker picks" — only a client-chosen
+        // seed carries the SPEC §6.6 reproducibility promise and rides
+        // the deterministic decode path (ADR 0002 B').
+        explicit_seed: sampling.seed != 0,
     };
     let penalties = PenaltyOptions {
         // Proto: both 0.0 and 1.0 mean "disabled" for the multiplicative one.

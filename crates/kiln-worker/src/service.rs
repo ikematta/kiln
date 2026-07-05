@@ -96,6 +96,12 @@ impl Worker for WorkerService {
             worker_version: env!("CARGO_PKG_VERSION").to_owned(),
             kv_block_size: kiln_engine::DEFAULT_BLOCK_SIZE as u32,
             chat_template_hash: info.chat_template_hash.clone(),
+            // Diagnostics only (ADR 0002 B'): the engine enforces
+            // determinism itself by sub-batching greedy/seeded rows.
+            max_deterministic_decode_width: self
+                .shared
+                .deterministic_decode_width
+                .load(Ordering::Acquire),
         }))
     }
 
@@ -193,6 +199,18 @@ impl Worker for WorkerService {
                     "prompt ({}) + max_tokens ({}) exceeds context ({max_ctx})",
                     prompt_ids.len(),
                     stopping.max_tokens
+                ),
+            )));
+        }
+        // Architecture parity envelope (Phase 6 Task 2, see modelinfo.rs):
+        // prompts past this bound have no reference-shaped prefill.
+        let max_prompt = self.shared.info.max_prompt_len;
+        if max_prompt > 0 && prompt_ids.len() as u64 > u64::from(max_prompt) {
+            return Ok(Response::new(error_stream(
+                WorkerErrorCode::WorkerErrorCtxOverflow,
+                format!(
+                    "prompt ({}) exceeds this architecture's prefill bound ({max_prompt})",
+                    prompt_ids.len(),
                 ),
             )));
         }

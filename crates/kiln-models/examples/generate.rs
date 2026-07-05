@@ -62,7 +62,7 @@ fn main() {
         tokenizer.encode(&prompt, true).expect("encodes")
     };
 
-    let mut sampler = Sampler::greedy();
+    let mut sampler = Sampler::greedy().expect("sampler");
     let output = generate(
         &model,
         &prompt_ids,

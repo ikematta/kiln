@@ -1,14 +1,25 @@
-//! Golden-token parity harness (SPEC §11.2, the keystone test): the Rust
-//! Llama implementation must reproduce the committed mlx-lm reference
-//! fixtures token-for-token, exactly.
+//! Golden-token parity harness (SPEC §11.2, the keystone test): every Rust
+//! model implementation must reproduce the committed mlx-lm reference
+//! fixtures token-for-token, exactly, for every model directory under
+//! `tests/golden/` (architecture dispatch via `AnyModel`).
 //!
 //! Since Phase 4 the fixtures run through the continuous-batching engine
 //! (paged KV + gather-based paged attention, SPEC §6.2/§7.4 v0) — the
 //! production decode path — with the production chunk size (2048, matching
-//! mlx-lm's `prefill_step_size`). Batching and paging must not change
-//! greedy outputs (CLAUDE.md determinism), so parity here is the Phase 4
-//! acceptance gate; `tests/batching.rs` separately pins engine == Phase-3
-//! contiguous path under concurrency.
+//! mlx-lm's `prefill_step_size`). Each model runs twice, and under
+//! ADR 0002 B' BOTH rounds are bit-exact bars:
+//! - request by request (single-stream): M=1 decode plus the pad-aligned
+//!   prefill build reference-class kernels, so any token difference is a
+//!   model bug;
+//! - with the decode batch pinned at width 16: the fixtures are greedy —
+//!   deterministic traffic — so the engine sub-batches their decode rows
+//!   below the device-calibrated kernel-dispatch threshold
+//!   (`calibrate_deterministic_width`), making every row bit-identical to
+//!   single-stream BY CONSTRUCTION at any width (the SPEC §6.6/§11.3
+//!   invariant, no longer argmax-margin luck). `tests/batching.rs`
+//!   separately pins engine == Phase-3 contiguous path, and the
+//!   kiln-engine `deterministic_partition` test pins the sub-batching
+//!   contract itself.
 //!
 //! Fixture semantics (mirrored from `scripts/gen-golden.py` — keep in sync):
 //! - `chat_template: true`  -> render the model's template for one user
@@ -18,8 +29,10 @@
 //! - greedy, exactly `max_tokens` tokens, no EOS stopping.
 //!
 //! Skips (with a note) when `KILN_TEST_MODELS` is unset or Metal is
-//! unavailable. Fails loudly if the local model revision differs from the
-//! one the fixtures were generated against.
+//! unavailable. A fixture directory whose model is missing under
+//! `KILN_TEST_MODELS` FAILS (fetch-test-model.sh and tests/golden must not
+//! drift apart), as does a local model revision differing from the one the
+//! fixtures were generated against.
 
 #![cfg(feature = "metal")]
 
@@ -34,14 +47,12 @@ use kiln_engine::{
     SamplingOptions, SeqEvent,
 };
 use kiln_mlx::{Stream, debug};
-use kiln_models::LlamaModel;
+use kiln_models::AnyModel;
 use kiln_tokenize::{ChatMessage, ChatTemplate, Tokenizer};
 use minijinja::Value;
 
 /// Must match PINNED_DATE_STRING in scripts/gen-golden.py.
 const PINNED_DATE_STRING: &str = "26 Jul 2024";
-
-const MODEL_NAME: &str = "llama-3.2-1b-4bit";
 
 #[derive(Debug, serde::Deserialize)]
 struct Fixture {
@@ -54,16 +65,8 @@ struct Fixture {
     weights_revision: String,
 }
 
-fn golden_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/golden")
-        .join(MODEL_NAME)
-}
-
-fn model_dir() -> Option<PathBuf> {
-    let root = std::env::var_os("KILN_TEST_MODELS")?;
-    let dir = PathBuf::from(root).join(MODEL_NAME);
-    dir.join("config.json").is_file().then_some(dir)
+fn golden_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden")
 }
 
 type Collected = (Rc<RefCell<Vec<u32>>>, Rc<RefCell<Option<FinishSummary>>>);
@@ -71,7 +74,7 @@ type Collected = (Rc<RefCell<Vec<u32>>>, Rc<RefCell<Option<FinishSummary>>>);
 /// Submits one greedy request (no stop tokens) and returns its
 /// token-stream/finish handles.
 fn submit_collected(
-    engine: &mut Engine<&LlamaModel>,
+    engine: &mut Engine<&AnyModel>,
     prompt_ids: &[u32],
     max_tokens: usize,
 ) -> Collected {
@@ -116,7 +119,7 @@ fn assert_full_length(finish: &Rc<RefCell<Option<FinishSummary>>>) -> FinishSumm
 /// Runs one greedy request through the batching engine and returns every
 /// generated token (no stop tokens, so the token stream is complete).
 fn engine_generate(
-    engine: &mut Engine<&LlamaModel>,
+    engine: &mut Engine<&AnyModel>,
     prompt_ids: &[u32],
     max_tokens: usize,
 ) -> Vec<u32> {
@@ -131,9 +134,12 @@ fn engine_generate(
 /// Safety bound for the batch-16 rounds (~200 steps expected each).
 const MAX_STEPS: usize = 4000;
 
-/// Runs one fixture request with its decode batch pinned at width 16 (the
-/// Phase-4 / mlx#3120 checkpoint: trunk-matmul kernel dispatch depends on
-/// M, so parity at M=1 does not imply parity at M=16).
+/// Runs one fixture request with its decode batch pinned at width 16.
+/// Under ADR 0002 B' the greedy rows sub-batch below the calibrated
+/// dispatch threshold, so this round is bit-exact by construction — it
+/// exists to prove that under real 16-wide admission (fillers, block
+/// recycling, staggered prefill) the deterministic path still reproduces
+/// the single-stream reference exactly.
 ///
 /// 15 filler requests are submitted (and, being FIFO, admitted) first and
 /// sized to outlive the fixture, so every sampled position of the fixture
@@ -142,7 +148,7 @@ const MAX_STEPS: usize = 4000;
 /// all 15 fillers are still running when the fixture finishes, and no
 /// preemption occurred.
 fn engine_generate_at_width16(
-    engine: &mut Engine<&LlamaModel>,
+    engine: &mut Engine<&AnyModel>,
     prompt_ids: &[u32],
     max_tokens: usize,
     filler_prompt: &[u32],
@@ -199,136 +205,171 @@ fn engine_generate_at_width16(
     out
 }
 
-#[test]
-fn llama_32_1b_greedy_parity_is_exact() {
-    if !kiln_mlx::memory::metal_is_available() {
-        eprintln!("skipping: no Metal device");
-        return;
-    }
-    let Some(model_dir) = model_dir() else {
-        eprintln!("skipping: KILN_TEST_MODELS not set or {MODEL_NAME} missing");
-        return;
-    };
-
-    let mut fixture_paths: Vec<PathBuf> = std::fs::read_dir(golden_dir())
-        .expect("tests/golden fixtures directory exists")
-        .filter_map(|entry| {
-            let path = entry.expect("readable dir entry").path();
-            (path.extension().is_some_and(|e| e == "json")).then_some(path)
-        })
-        .collect();
-    fixture_paths.sort();
-    assert!(!fixture_paths.is_empty(), "no golden fixtures found");
-
+/// Loads one fixture-model directory and proves parity for all its fixtures,
+/// request-by-request and at decode width 16.
+fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
     let local_revision = std::fs::read_to_string(model_dir.join(".kiln-revision"))
         .map(|text| text.trim().to_owned())
         .unwrap_or_default();
 
-    let baseline = debug::live_objects();
-    {
-        let stream = Stream::gpu();
-        let model = LlamaModel::load(&model_dir, &stream).expect("model loads");
-        let tokenizer = Tokenizer::from_model_dir(&model_dir).expect("tokenizer loads");
-        let template = ChatTemplate::from_model_dir(&model_dir).expect("template loads");
-        // Production config except pool size: 256 blocks x 32 = 8192 token
-        // slots, ample for every fixture. The engine is reused across
-        // fixtures, exercising block recycling between requests.
-        let mut engine = Engine::new(
-            &model,
-            model.kv_dims(),
-            EngineConfig {
-                num_blocks: 256,
-                ..EngineConfig::default()
-            },
-            Stream::gpu(),
-        )
-        .expect("engine builds");
+    let stream = Stream::gpu();
+    let model = AnyModel::load(model_dir, &stream).expect("model loads");
+    let tokenizer = Tokenizer::from_model_dir(model_dir).expect("tokenizer loads");
+    let template = ChatTemplate::from_model_dir(model_dir).expect("template loads");
+    // Production posture (ADR 0002 B'): the worker calibrates the
+    // deterministic width at load; the harness does the same.
+    let det_width = model
+        .calibrate_deterministic_width(&stream)
+        .expect("calibrates");
+    eprintln!(
+        "== {model_name}: model_type={}, {} fixture(s), deterministic width {det_width}",
+        model.model_type(),
+        fixture_paths.len()
+    );
+    // Production config except pool size: 256 blocks x 32 = 8192 token
+    // slots, ample for every fixture. The engine is reused across
+    // fixtures, exercising block recycling between requests.
+    let mut config = EngineConfig {
+        num_blocks: 256,
+        deterministic_decode_width: det_width,
+        ..EngineConfig::default()
+    };
+    if model.monolithic_prefill_required() {
+        // gemma2 manual softcapped attention: reference-shaped
+        // (single-tail) prefill only — the same override the worker
+        // applies at load (see kiln-worker engine_main).
+        config.prefill_fine_chunk = config.prefill_chunk;
+    }
+    let mut engine =
+        Engine::new(&model, model.kv_dims(), config, Stream::gpu()).expect("engine builds");
 
-        let fixtures: Vec<(String, Fixture, Vec<u32>)> = fixture_paths
-            .iter()
-            .map(|path| {
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?")
-                    .to_owned();
-                let fixture: Fixture =
-                    serde_json::from_str(&std::fs::read_to_string(path).expect("fixture readable"))
-                        .expect("fixture parses");
-                assert_eq!(
-                    fixture.weights_revision, local_revision,
-                    "fixture {name} was generated for a different weights revision than the \
-                     local test model — refetch models or regenerate fixtures (when told to)"
-                );
-                let prompt_ids = if fixture.chat_template {
-                    let rendered = template
-                        .render_with(
-                            &[ChatMessage {
-                                role: "user".into(),
-                                content: fixture.prompt.clone(),
-                            }],
-                            true,
-                            &[("date_string", Value::from(PINNED_DATE_STRING))],
-                        )
-                        .expect("template renders");
-                    // BOS contract: the rendered template already contains BOS.
-                    tokenizer.encode(&rendered, false).expect("encodes")
-                } else {
-                    tokenizer.encode(&fixture.prompt, true).expect("encodes")
-                };
-                (name, fixture, prompt_ids)
+    let fixtures: Vec<(String, Fixture, Vec<u32>)> = fixture_paths
+        .iter()
+        .map(|path| {
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_owned();
+            let fixture: Fixture =
+                serde_json::from_str(&std::fs::read_to_string(path).expect("fixture readable"))
+                    .expect("fixture parses");
+            assert_eq!(
+                fixture.weights_revision, local_revision,
+                "fixture {model_name}/{name} was generated for a different weights revision \
+                 than the local test model — refetch models or regenerate fixtures (when told to)"
+            );
+            let prompt_ids = if fixture.chat_template {
+                let rendered = template
+                    .render_with(
+                        &[ChatMessage {
+                            role: "user".into(),
+                            content: fixture.prompt.clone(),
+                        }],
+                        true,
+                        &[("date_string", Value::from(PINNED_DATE_STRING))],
+                    )
+                    .expect("template renders");
+                // BOS contract: the rendered template already contains BOS.
+                tokenizer.encode(&rendered, false).expect("encodes")
+            } else {
+                tokenizer.encode(&fixture.prompt, true).expect("encodes")
+            };
+            (name, fixture, prompt_ids)
+        })
+        .collect();
+
+    for (name, fixture, prompt_ids) in &fixtures {
+        let output = engine_generate(&mut engine, prompt_ids, fixture.max_tokens);
+        assert_eq!(
+            output,
+            fixture.expected_token_ids,
+            "greedy token divergence on fixture {model_name}/{name} \
+             (prompt tokens: {})",
+            prompt_ids.len()
+        );
+        eprintln!(
+            "golden {model_name}/{name}: {} prompt tokens, {} generated — exact match \
+             (batched/paged engine)",
+            prompt_ids.len(),
+            fixture.max_tokens
+        );
+    }
+
+    // Width-16 rounds: greedy fixtures are deterministic traffic, so the
+    // ADR 0002 B' sub-batched decode makes them bit-identical to
+    // single-stream at any admitted width. A divergence here with the
+    // sequential rounds green means the deterministic partition itself is
+    // broken (grouping, calibration, or replay), not kernel noise.
+    let filler_prompt = tokenizer
+        .encode("Pottery is one of the oldest human inventions", true)
+        .expect("encodes");
+    for (name, fixture, prompt_ids) in &fixtures {
+        let output =
+            engine_generate_at_width16(&mut engine, prompt_ids, fixture.max_tokens, &filler_prompt);
+        assert_eq!(
+            output,
+            fixture.expected_token_ids,
+            "greedy divergence on fixture {model_name}/{name} at decode width 16 \
+             (prompt tokens: {}) — the ADR 0002 B' deterministic path must be \
+             bit-exact at every width",
+            prompt_ids.len()
+        );
+        eprintln!(
+            "golden {model_name}/{name}: {} prompt tokens, {} generated — exact match \
+             at decode width 16 (B' deterministic sub-batching)",
+            prompt_ids.len(),
+            fixture.max_tokens
+        );
+    }
+}
+
+#[test]
+fn greedy_parity_is_exact_for_every_fixture_model() {
+    if !kiln_mlx::memory::metal_is_available() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let Some(root) = std::env::var_os("KILN_TEST_MODELS") else {
+        eprintln!("skipping: KILN_TEST_MODELS not set");
+        return;
+    };
+    let root = PathBuf::from(root);
+
+    let mut model_names: Vec<String> = std::fs::read_dir(golden_root())
+        .expect("tests/golden exists")
+        .filter_map(|entry| {
+            let entry = entry.expect("readable dir entry");
+            entry
+                .path()
+                .is_dir()
+                .then(|| entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    model_names.sort();
+    assert!(!model_names.is_empty(), "no golden fixture directories");
+
+    let baseline = debug::live_objects();
+    for model_name in &model_names {
+        let model_dir = root.join(model_name);
+        assert!(
+            model_dir.join("config.json").is_file(),
+            "fixtures exist for {model_name} but the model is missing under \
+             KILN_TEST_MODELS — run ./scripts/fetch-test-model.sh"
+        );
+        let mut fixture_paths: Vec<PathBuf> = std::fs::read_dir(golden_root().join(model_name))
+            .expect("fixture dir readable")
+            .filter_map(|entry| {
+                let path = entry.expect("readable dir entry").path();
+                (path.extension().is_some_and(|e| e == "json")).then_some(path)
             })
             .collect();
-
-        for (name, fixture, prompt_ids) in &fixtures {
-            let output = engine_generate(&mut engine, prompt_ids, fixture.max_tokens);
-            assert_eq!(
-                output,
-                fixture.expected_token_ids,
-                "greedy token divergence on fixture {name} \
-                 (prompt tokens: {})",
-                prompt_ids.len()
-            );
-            eprintln!(
-                "golden {name}: {} prompt tokens, {} generated — exact match \
-                 (batched/paged engine)",
-                prompt_ids.len(),
-                fixture.max_tokens
-            );
-        }
-
-        // Phase 4 closeout: the same fixtures, bit-exact with the decode
-        // batch pinned at width 16 — the M=16 quantized-matmul dispatch
-        // checkpoint flagged against mlx#3120 (PROGRESS.md 2026-07-04
-        // addendum). A divergence here and not above means the batched-M
-        // kernel variant, not the model, changed the numerics: check which
-        // quantized-matmul kernel dispatches at M=16 vs M=1 first.
-        let filler_prompt = tokenizer
-            .encode("Pottery is one of the oldest human inventions", true)
-            .expect("encodes");
-        for (name, fixture, prompt_ids) in &fixtures {
-            let output = engine_generate_at_width16(
-                &mut engine,
-                prompt_ids,
-                fixture.max_tokens,
-                &filler_prompt,
-            );
-            assert_eq!(
-                output,
-                fixture.expected_token_ids,
-                "greedy token divergence on fixture {name} at decode width 16 \
-                 (prompt tokens: {}) — M-dependent quantized-matmul dispatch \
-                 (mlx#3120 class); identify the kernel variant at M=16 vs M=1 \
-                 before touching the parity bar",
-                prompt_ids.len()
-            );
-            eprintln!(
-                "golden {name}: {} prompt tokens, {} generated — exact match \
-                 at decode width 16",
-                prompt_ids.len(),
-                fixture.max_tokens
-            );
-        }
+        fixture_paths.sort();
+        assert!(
+            !fixture_paths.is_empty(),
+            "no fixtures under tests/golden/{model_name}"
+        );
+        run_model(model_name, &model_dir, &fixture_paths);
     }
     assert_eq!(
         debug::live_objects(),

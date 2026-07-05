@@ -82,6 +82,12 @@ message WorkerInfo {
   string worker_version = 10;       // semver of the worker binary/package
   uint32 kv_block_size = 11;        // tokens per KV block (0 if not paged)
   string chat_template_hash = 12;   // so gateway can verify its vendored template matches
+  // Diagnostics (ADR 0002 B'): the device-calibrated per-forward row bound
+  // below which batched decode rows are bit-identical to single-stream.
+  // Informational only — the worker's engine enforces determinism itself by
+  // sub-batching deterministic (greedy/seeded) rows; 0 = greedy determinism
+  // under batching is not guaranteed at this build (e.g. the python worker).
+  uint32 max_deterministic_decode_width = 13;
 }
 
 // ---------------------------------------------------------------------------

@@ -38,6 +38,28 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo build --workspace --no-default-features
 
+  # Release-mode workspace tests on Apple Silicon. Debug-only coverage let
+  # a release-only use-after-free (a rustc MIR-GVN by-value-argument merge
+  # miscompiling the lazy sampler key; PROGRESS 2026-07-05) go undetected:
+  # optimized builds are what ship and what every benchmark number in
+  # ADR 0003 was measured on, so they get their own test lane.
+  test-macos-release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: brew install protobuf
+      - name: Cache mlx-c build tree
+        uses: actions/cache@v4
+        with:
+          path: target/mlx-c-build
+          key: mlx-c-build-${{ runner.os }}-${{ hashFiles('crates/kiln-mlx/vendor/mlx-c/CMakeLists.txt', 'crates/kiln-mlx/build.rs') }}
+      - run: cargo test --workspace --release
+
   # Full build + tests on Apple Silicon, including the vendored mlx-c build.
   test-macos:
     runs-on: macos-14

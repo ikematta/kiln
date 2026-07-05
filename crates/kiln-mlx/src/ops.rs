@@ -57,6 +57,11 @@ unary_op!(
     exp, mlx_exp
 );
 unary_op!(
+    /// Elementwise hyperbolic tangent (gemma logit softcapping,
+    /// `gelu_approx`).
+    tanh, mlx_tanh
+);
+unary_op!(
     /// Elementwise -x.
     negative, mlx_negative
 );
@@ -97,6 +102,15 @@ binary_op!(
     /// Dense matrix multiplication.
     matmul, mlx_matmul
 );
+
+/// Elementwise clamp to `[a_min, a_max]` (both bounds required — mlx-c
+/// accepts null bounds, but every Kiln call site clips on both sides).
+pub fn clip(a: &Array, a_min: &Array, a_max: &Array, s: &Stream) -> Result<Array> {
+    let mut out = Array::new_handle();
+    // SAFETY: live handles; checked status (see the macro safety note).
+    check(unsafe { sys::mlx_clip(out.raw_out(), a.raw(), a_min.raw(), a_max.raw(), s.raw()) })?;
+    Ok(out)
+}
 
 /// `condition ? x : y` elementwise.
 pub fn where_cond(condition: &Array, x: &Array, y: &Array, s: &Stream) -> Result<Array> {

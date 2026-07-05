@@ -111,7 +111,12 @@ where
     let mut caches = model.make_cache();
     let start = Instant::now();
 
-    // Chunked prefill over everything but the last prompt token.
+    // Chunked prefill over everything but the last prompt token, on the
+    // engine's canonical schedule INCLUDING its ADR 0002 padding rule:
+    // sub-32-row ragged pieces off the super-chunk grid run with pad rows
+    // (copies of the piece's last token; excluded from the caches by
+    // `forward_padded`) so both paths stay bit-identical to each other and
+    // to the mlx-lm reference at every prompt length.
     let total = prompt.len();
     let mut processed = 0;
     while total - processed > 1 {
@@ -121,8 +126,15 @@ where
             PREFILL_CHUNK,
             PREFILL_FINE_CHUNK,
         );
-        let chunk = Array::from_u32_slice(&prompt[processed..processed + n], &[1, n as i32])?;
-        drop(model.forward(&chunk, &mut caches, s)?);
+        let pad = if n < kiln_engine::PREFILL_PAD_MIN_ROWS && processed % PREFILL_CHUNK != 0 {
+            (kiln_engine::PREFILL_PAD_MIN_ROWS - n).min(processed)
+        } else {
+            0
+        };
+        let mut ids = prompt[processed..processed + n].to_vec();
+        ids.extend(std::iter::repeat_n(ids[n - 1], pad));
+        let chunk = Array::from_u32_slice(&ids, &[1, (n + pad) as i32])?;
+        drop(model.forward_padded(&chunk, pad as i32, &mut caches, s)?);
         let state: Vec<&Array> = caches.iter().flat_map(KvCache::state).collect();
         eval(&state)?;
         processed += n;

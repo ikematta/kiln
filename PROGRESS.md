@@ -1665,3 +1665,906 @@
 - Deviations: none.
 - Next: PM phase gate on Phase 5 (SPEC §13.4), then Phase 6 — Qwen +
   Gemma models, quantization matrix, worker="auto" routing (SPEC §12).
+
+## [2026-07-04] Phase 6 / Task 1 — Qwen2.5 + Qwen3 (fixtures first) — BLOCKED
+- What:
+  1. ADR 0001 B1 alignment re-verified before generating fixtures: worker
+     venv reports mlx.core 0.31.1 / mlx-lm 0.31.2 (gen-golden.py's hard
+     refusal also passed). Reference stack unchanged.
+  2. New pinned test model (no qwen2-arch model existed in the pinned set;
+     the acceptance matrix requires one): `qwen2.5-0.5b-4bit` =
+     mlx-community/Qwen2.5-0.5B-Instruct-4bit @ a5339a4131f1, appended to
+     fetch-test-model.sh. Existing pins untouched.
+  3. Fixtures first: tests/golden/qwen3-0.6b-4bit/ and
+     tests/golden/qwen2.5-0.5b-4bit/ (5 cases each, standard case list).
+  4. Implementation (all in working tree, uncommitted — see DECISION):
+     - `qwen2.rs`/`qwen3.rs`: op-for-op ports of mlx_lm.models.qwen2/qwen3.
+     - `config.rs`: Qwen2Config/Qwen3Config (field-for-field mlx-lm
+       defaults; qwen2 has no head_dim override, rope_theta 1e6 default),
+       `RopeScaling::Yarn`, `ArchConfig` model_type dispatch (this is the
+       `worker="auto"` predicate for task 4), SUPPORTED_ARCHITECTURES.
+     - Shared trunk: llama's Attention/Block/forward paths consolidated
+       into crate-private `nn::CausalLm`, parameterized by GQA geometry +
+       optional qwen3 qk-norm (RMSNorm slotted between the [B,L,H,D]
+       reshape and the head transpose, exactly the reference op order).
+       llama.rs/qwen2.rs/qwen3.rs are now thin config+loader modules; the
+       (green) llama golden suite pins the refactor bit-for-bit.
+     - Yarn RoPE: host f64 correction-range/mscale + f32 MLX graph
+       mirroring YarnRoPE; unit test asserts freqs + mscale bit-identical
+       to reference-generated constants (Qwen3 long-context recipe;
+       `nn::tests::yarn_freqs_match_reference_bit_for_bit`). `ops::clip`
+       added to kiln-mlx.
+     - `AnyModel` enum + worker loads it; golden harness generalized to
+       every tests/golden/<model>/ dir (missing local model now fails
+       loudly instead of skipping).
+- Result: single-stream parity is EXACT for all three architectures, but
+  the golden gate is red, and the cause is fully diagnosed as MLX kernel
+  dispatch at the pin — not model math:
+  - Gate state @ shipped engine defaults: llama 5/5 exact (both rounds);
+    qwen2.5 4/5 — raw-long-prefill (261 tok) diverges at generated token
+    10; qwen3 unreached (same 261-token fixture shape ⇒ same exposure).
+  - Prefill bisect (engine config only, same weights/prompt):
+    fine=off (single 260-tok tail = mlx-lm's shape) → exact;
+    fine=65 / fine=130 (uniform pieces) → exact;
+    fine=64 / 128 / 256 (ragged 4-token final piece) → diverges @10.
+    Prefix cache on/off: irrelevant.
+  - Root cause (vendored MLX v0.31.1,
+    mlx/backend/metal/quantized.cpp `get_qmv_batch_limit`): quantized
+    matmul dispatches a vector kernel below an M threshold that varies by
+    shape and GPU generation (6..32 per the table; measured here: ~18 for
+    K,N ≤ 2048, ~10-12 for the mlp/lm_head shapes). Row-bit probe over
+    real weights (all three models, every projection + tied lm_head):
+    rows are bit-identical WITHIN a kernel class (M=2..16 == M=1 small
+    shapes; M=24..260 mutually identical) and differ ACROSS the boundary
+    — every arch, every projection. mx.fast SDPA has the same two-class
+    structure: q-len 4 vs 260 differs; q-len 32 vs 260 bit-identical.
+  - Consequence 1 (fine-tail schedule, latent since Phase 5, arch-
+    independent): a ragged final piece of size limit%128 below the
+    threshold computes those positions' KV in the vector-kernel class
+    while the mlx-lm reference (monolithic ≤2048 tail) is in the matrix
+    class. Llama's fixtures pass only by remainder luck (5/46/120 — 5 is
+    vector-class on BOTH sides). A synthetic llama rem=3 prompt shows
+    bit-different KV (probe) though its 64 greedy tokens happened to
+    survive (margins).
+  - Consequence 2 (batched decode): trunk M = step token count, so widths
+    ≥ ~12 put mlp/lm_head matmuls in the matrix class vs the M=1
+    reference — logit ulp noise for EVERY arch. Llama's width-16 golden
+    rounds pass on argmax margins (its lm_head rows provably differ at
+    M=16); qwen fixtures flip: chat-basic diverges at token 28 (qwen3) /
+    33 (qwen2.5) at width 16. Bit-level "batching must not change greedy
+    outputs" is not achievable under this kernel pin for any arch; token
+    level it is fixture/margin/hardware dependent (CI's M1 has different
+    thresholds than this machine).
+- Decisions (within latitude): new pin appended, none bumped; trunk
+  consolidation into nn::CausalLm (llama golden green pins it); attention
+  scale computed in f64 then narrowed (matches Python; value identical
+  for every pinned model).
+- Deviations:
+  - fetch-test-model.sh gained a NEW pinned model (revisions themselves
+    frozen; adding was unavoidable for qwen2 coverage) — flagging.
+  - Golden harness: fixture-dir-without-local-model is now a failure, not
+    a skip (fetch script and fixtures must not drift).
+- Acceptance (real outputs, trimmed):
+  ```
+  $ uv run --project python/kiln_worker_py python -c "import mlx.core..."
+  mlx.core 0.31.1 / mlx_lm 0.31.2                       (B1 holds)
+  $ cargo test -p kiln-models --lib
+  11 passed (incl. yarn_freqs_match_reference_bit_for_bit)
+  $ cargo test -p kiln-models --test golden -- --nocapture   (THE GATE)
+  llama-3.2-1b-4bit: 5/5 exact + 5/5 exact at width 16
+  qwen2.5-0.5b-4bit: chat-basic/chat-code/chat-multibyte/raw-continuation
+    exact; raw-long-prefill FAILED (first divergence token 10)
+  -> test result: FAILED
+  single-stream cross-check, fine=off engine: 15/15 fixtures exact
+    (llama, qwen2.5, qwen3 — all five each)
+  width-16 probe (fine=off): qwen3 chat-basic diverges @28,
+    qwen2.5 chat-basic @33; llama all exact
+  $ cargo test --workspace --no-fail-fast -> 33/34 targets ok; only the
+    golden gate fails (batching, preemption, both leak gates, prefix
+    suites, worker rpc all green under the AnyModel/nn refactor)
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+  $ uv run --project python/kiln_worker_py pytest ... -> 28 passed
+  $ cargo fmt --check / clippy --all-targets (both CI shapes) -> clean
+  $ cargo build --workspace --no-default-features -> clean
+  ```
+- DECISION NEEDED: two coupled calls; neither is covered by SPEC §11.2 as
+  written (its relaxed bar — first divergence past token 48, logprob
+  delta < 1e-3, per-model ADR — does not admit these: width-16 divergence
+  starts at token 28). Per CLAUDE.md I am not weakening the test, not
+  changing the PM-approved F=128 default, and not committing a red gate.
+  A) Batched-decode parity bar:
+     A1. Redefine the width-16 golden rounds as the token-level canary
+         they empirically are; bit-exact bar applies to single-stream
+         only. Requires ADR + SPEC amendment naming qwen2/qwen3 (and
+         acknowledging llama passes on margins). Define a batched
+         tolerance/canary policy for qwen serving.
+     A2. Keep the bit-exact bar; rust worker serves qwen single-stream
+         parity-proven but batched-unproven — i.e. defer qwen enablement
+         until the quarterly mlx-c bump (note: dispatch-by-M is a perf
+         feature of MLX; a bump may not change this).
+     A3. Force one kernel class in the trunk (pad every decode step to
+         ≥ 32 rows / per-row lm_head): rejected on analysis — it makes
+         single-stream diverge from the M=1 reference instead, and/or
+         burns large bandwidth.
+     My read: A1 is the only workable shape; the tolerance definition is
+     yours.
+  B) Fine-tail ragged piece (single-stream, all archs):
+     B1. Pad sub-32-row ragged tail pieces to 32 rows (trunk matmuls) and
+         32 q-rows (SDPA) when the piece does not start on a 2048
+         boundary. Probes show both kernel families are row-stable and
+         reference-identical at ≥ 32 rows. Keeps F=128, all Option B
+         boundaries, warm==cold, and donation semantics intact (ragged
+         pieces are never donated). Est. ~100-150 lines (engine schedule,
+         StepBatch, CausalLm); needs a golden re-gate + a deliberate
+         tiny-remainder fixture.
+     B2. Stopgap: revert default to the single-tail-chunk schedule
+         (fine=off) — restores universal single-stream parity today,
+         forfeits Phase 5 multi-turn reuse below 2048.
+     My read: B1.
+  Nothing committed; the full change set sits in the working tree
+  (7 modified, 4 new source files, 2 new fixture dirs) for review.
+- Next: on the A/B rulings — finish Task 1 acceptance, then Gemma2/3,
+  the 8-bit/BF16 matrix, worker="auto" routing, /v1/completions
+  (Phase 6 SPEC §12 order).
+
+## [2026-07-04] Phase 6 / Task 1 (continued) — ADR 0002 + B1 padding — PARTIAL
+- What (implements the PM's A1/B1 rulings on the previous entry):
+  1. **ADR 0002** (docs/decisions/0002-parity-bars-under-mlx-kernel-dispatch.md):
+     MLX v0.31.1 dispatches distinct quantized-matmul kernels (qmv/qmm)
+     and a two-class SDPA path on M, bit-different but numerically close
+     across the threshold — a library/hardware characteristic, not a Kiln
+     defect. Bars: single-stream vs mlx-lm strictly bit-exact, no
+     exceptions; batched (M>1) parity = token-id equality with the
+     single-stream reference; revisit at every mlx-c/core-MLX bump per the
+     ADR 0001 quarterly process.
+  2. **Width-16 framing corrected** (golden.rs, batching.rs docs +
+     assertion messages). Correction to a previously overstated guarantee,
+     recorded per instruction: the Phase 4/5 "bit-exact at width 16 /
+     bit-identical under concurrency" wording was wrong as stated — those
+     tests always asserted token-id equality, and the logits at width 16
+     already differed from M=1 in ulps (lm_head/mlp cross their dispatch
+     threshold near M~10-12); the passes were argmax margin. **No
+     assertion was weakened**: every existing width-16/concurrency
+     assertion already compared token ids; only comments/docs claimed
+     more than was verified.
+  3. **B1** — ragged prefill tail pieces shorter than
+     `PREFILL_PAD_MIN_ROWS` (32 = max qmv threshold across the GPU
+     dispatch table, above the SDPA vector bound) and off the super-chunk
+     grid now run with kernel-class pad rows:
+     - kiln-engine: `StepBatch::pad_rows` + the rule at prefill
+       scheduling (pad capped at the piece offset so the SDPA query never
+       exceeds KV coverage); pieces starting ON a 2048 boundary are the
+       reference's own shape and are never padded.
+     - kiln-models: `CausalLm`/`Attention` honor pads on the paged AND
+       contiguous paths — pad rows ride the trunk matmuls, front-pad the
+       SDPA query (causal mask is bottom-right aligned, so real rows keep
+       their exact spans), are refilled as zero lanes for o_proj, are
+       never written to KV, and are never sampled. generate.rs's prefill
+       applies the same rule, keeping engine == contiguous by
+       construction (batching.rs now pins that with a deliberately ragged
+       prompt).
+     - Hazard tests (pipeline-discard analogy, per instruction):
+       kiln-engine/tests/prefill_pad.rs — checksum-mock contract: pads
+       flagged exactly per rule and only on lone prefill pieces; step
+       input ids and every K/V write run cover REAL rows only; never
+       sampled/emitted; containment rerun and extension resume warm==cold
+       with re-padded canonical shapes. kiln-models/tests/prefill_pad.rs —
+       real weights: bit-exact vs fixture THROUGH a padded piece,
+       containment rerun (hit 137) and extension resume (hit 128) exact.
+  4. **New llama fixture** `raw-tiny-remainder` (138 prompt tokens →
+     9-row ragged piece, below every dispatch threshold on every listed
+     GPU class): generated via scripts/gen-golden.py on the B1-verified
+     stack (mlx.core 0.31.1 / mlx-lm 0.31.2); the 5 existing llama
+     fixtures regenerated byte-identical in the same run (cmp-verified) —
+     no reference drift. Case added to gen-golden.py CASES with a sizing
+     note. This is what gives B1 committed CI coverage.
+- Result against the corrected bars:
+  - **Single-stream: 16/16 fixtures bit-exact** — llama 6 (incl. the new
+    tiny-remainder), qwen2.5 5, qwen3 5; the two 261-token qwen fixtures
+    that diverged at generated token 10 before B1 are now exact.
+  - **Width 16: llama 6/6 token-exact. qwen 6/10** — 4 flips, all decode-
+    side (trunk M=16 crosses the mlp/lm_head qmv/qmm threshold; knife-
+    edge argmax positions flip; B1 is prefill-only and cannot help):
+    ```
+    qwen2.5/chat-basic        div @33, EOS @28 -> post-EOS only (the
+                              entire user-visible answer is identical)
+    qwen2.5/raw-long-prefill  div @10  (pre-EOS)
+    qwen3/chat-basic          div @28  (pre-EOS, think-mode text)
+    qwen3/chat-code           div @42  (pre-EOS, think-mode text)
+    ```
+  - warm==cold under B1: prefix_cache + prefix_multiturn green; both pad
+    tests assert warm==cold through padded pieces explicitly.
+- Acceptance (real outputs, trimmed):
+  ```
+  $ cargo test -p kiln-models --test golden -- --nocapture  (commit shape)
+  llama-3.2-1b-4bit: 6 fixtures — exact match (batched/paged engine) x6,
+  token-id match at decode width 16 x6 -> ok
+  $ cargo test -p kiln-models --test golden  (with local qwen fixture dirs)
+  qwen2.5: 5/5 exact single-stream; FAILS at width-16 chat-basic per the
+  ADR 0002 token-equality bar (matrix above; qwen3 same pattern)
+  $ cargo test -p kiln-engine --test prefill_pad -> ok (pad contract)
+  $ cargo test -p kiln-models --test prefill_pad -> ok
+    "padded piece: cold == fixture, rerun hit 137, extension hit 128"
+  $ cargo test -p kiln-models --test batching -- --nocapture
+    "solo engine == contiguous path for 5 jobs" (incl. padded ragged job)
+  $ cargo test --workspace --no-fail-fast -> 35/36 targets ok (36th =
+    golden with the held qwen fixtures present locally)
+  $ cargo fmt --check / clippy --all-targets (both CI shapes) -> clean
+  $ cargo build --workspace --no-default-features -> clean
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+  $ pytest python/kiln_worker_py/tests -> 28 passed ; ruff -> clean
+  ```
+- Decisions: new fixture case via the sanctioned generator with existing
+  fixtures byte-verified untouched; PREFILL_PAD_MIN_ROWS=32 rationale in
+  the ADR and const docs.
+- Deviations: none.
+- Committed: kiln-mlx clip; ADR 0002 + engine pad plumbing + contract
+  test; qwen2/qwen3 models over shared CausalLm; worker AnyModel dispatch;
+  golden/batching reframing + tiny-remainder coverage; this entry. HELD
+  uncommitted pending the residual ruling below: tests/golden/qwen*/
+  fixture dirs and the fetch-test-model.sh qwen2.5 pin — committing them
+  turns the width-16 golden rounds red on main (4/10 qwen flips).
+- DECISION NEEDED (residual, narrow): the ADR 0002 batched bar (token-id
+  equality at width 16) measurably does not hold for qwen2/qwen3 at this
+  kernel pin, while llama holds on all fixtures. The instruction's
+  "full golden parity ... at width-16" is therefore not satisfiable for
+  qwen by any correct implementation at this pin. Options:
+  A) Per-arch batched enablement, encoded in the harness: land the qwen
+     fixtures; width-16 rounds assert token equality for batched-enabled
+     archs (llama) and assert the RECORDED nonconforming status for
+     qwen2/qwen3 (strict xfail: a kernel bump that fixes dispatch flips
+     the round to "must promote"). worker="auto" (Task 4) then gains a
+     principled input: qwen routes to rust for single-stream-safe use
+     only after the PM enables it, or to python. My read: this matches
+     ADR 0002's "batched-decode enablement per architecture is gated on
+     the width-16 golden rounds" — but it encodes an allowed failure, so
+     it needs your explicit approval.
+  B) Redefine the batched bar as token equality through the first EOS:
+     rescues only qwen2.5/chat-basic (1 of 4); qwen3's think-mode flips
+     are pre-EOS. Not recommended.
+  C) Cap qwen decode width below the smallest dispatch threshold
+     (12 here, 6 on some GPU classes): restores bit-equality wholesale
+     but forfeits the batch-16 throughput target for qwen. Not
+     recommended as a default.
+- Next: residual ruling (A/B/C) -> land held fixtures + per-arch gating,
+  close Task 1, then Task 2 (Gemma2/3, fixtures first).
+
+## [2026-07-04] Phase 6 / Task 1 — batched-bar investigation (PM-directed) — REPORT
+- Scope: investigation only, per instruction. No fixture, harness, or
+  source changes; all probes were scratch tests, removed after
+  measurement. Working tree still holds only the previously-HELD items
+  (qwen fixture dirs + fetch pin).
+- 1) Precision mitigation — no narrow high-precision path can close this
+  at the pin, for two independent reasons:
+  a. The root cause is not accumulation precision but ARGMAX TIES.
+     Reference-side top-2 logprob gaps at every observed flip position
+     (measured on the pinned mlx-lm stack, f32-read):
+     ```
+     qwen2.5/chat-basic  @33  gap = 0.015625  (one f16 ulp)
+     qwen2.5/raw-long    @10  gap = 0.000000  (EXACT f16 tie)
+     qwen3/chat-basic    @28  gap = 0.000000  (EXACT f16 tie)
+     qwen3/chat-code     @42  gap = 0.125
+     ```
+     At an exact tie the reference argmax picks by index order. ANY
+     perturbation — including a MORE accurate fp32 head — resolves the
+     tie by magnitude instead, which need not match that index-order
+     choice. Higher precision therefore cannot reproduce the reference
+     token except by being bit-identical; "compute-in-fp32-then-cast"
+     narrows nothing here. Llama is not structurally safer: its
+     chat-basic stream carries an exact 0.0 tie at position 24 and
+     simply has not flipped (verified through width 24) — fixture luck,
+     as ADR 0002 already frames it.
+  b. MLX v0.31.1 exposes NO dispatch control: the qmv/qmm split
+     (quantized.cpp, `M >= get_qmv_batch_limit(K, N, device)`) and the
+     SDPA vector/full split (`q_len <= 8`) are hard-coded; no env var or
+     API parameter reaches either. The only adjacent knob is
+     MLX_METAL_GPU_ARCH, which spoofs the GPU arch string — it can only
+     shift thresholds within the table's 6..32 range while perturbing
+     unrelated kernel selections; unusable. `mx.quantized_matmul` has no
+     kernel/mode argument at this pin; `env::enable_tf32` affects only
+     fp32 GEMMs. This is a real "no such control" answer.
+- 2) Empirical characterization (flip onset per decode width, fillers
+  pinning the batch; widths 1,2,4,6,8,10,12,14,16,20,24):
+  ```
+  qwen2.5/chat-basic        w<=8 ok | @33 from w10 (stable through w24)
+  qwen2.5/raw-long-prefill  w<=8 ok | @10 from w10
+  qwen3/chat-basic          w<=8 ok | @52 at w10, @28 from w12
+  qwen3/chat-code           w<=8 ok | @103 at w10, @42 from w12
+  llama/chat-basic          ok at every width tested
+  ```
+  - The cliff is exactly the dispatch ladder measured earlier on this
+    GPU: lm_head (limit 10) crosses first at w10; the MLP shapes
+    (limit 12) cross at w12 and MOVE the flip position (two independent
+    noise sources, visible in the qwen3 rows); attention projections
+    (limit 18) cross later and add nothing new on these fixtures. Below
+    the lowest threshold the trunk rows are BIT-identical to M=1 (qmv
+    row-stability, probe-verified) — token equality at w<=8 is
+    guaranteed by construction, not marginal.
+  - Weights vs structure: the flips are near-tie statistics, not qwen op
+    structure. Class-crossing exists identically for llama; whether a
+    fixture flips depends only on whether its greedy stream visits a
+    knife-edge position. A different qwen checkpoint/quantization would
+    flip elsewhere or not at all. Per-arch conformance inferred from
+    fixture passes is therefore statistically weak; the honest system
+    property is a per-DEVICE deterministic width bound.
+  - The bound is hardware-dependent: flips start at w10 here (safe
+    verified <= 8; <= 9 implied by the limit table's 10 minimum);
+    M1/M2-class large-shape limit is 6 (safe <= 5); 'd'-class is 12
+    (safe <= 11). A ~100ms startup calibration (row-stability probe per
+    weight shape) derives it robustly on unknown GPUs, vs replicating
+    MLX's device table.
+- 3) Cost of a load-bearing max-safe-batch-width:
+  - Proto: one additive WorkerInfo field (e.g.
+    `max_deterministic_decode_width`, 0 = "greedy determinism under
+    batching not guaranteed at this build") — additive fields are
+    explicitly allowed post-Phase-2; gateway plumbs it through for
+    observability/routing. Cheap (~50 lines both workers + gateway).
+  - Enforcement, two shapes:
+    (a) cap concurrent DECODING sequences at W: ~20 scheduler lines, but
+        aggregate throughput is then W-way batching, remainder queues.
+    (b) sub-batched decode: admit any width, split each decode forward
+        into <=W-row chunks (prefill already runs as its own forward;
+        the pipelined path folds in). This makes batched greedy ==
+        single-stream BIT-exact at any admitted width for every arch —
+        the whole fixture-luck problem disappears and llama's margin
+        stops being load-bearing. Est. 150-250 lines (run_iteration,
+        pipelined path, tests).
+  - Measured cost of (b) at width 16, qwen2.5-0.5B, release micro-bench
+    (per-op medians; absolutes inflated by per-op sync — ratios are the
+    signal): lm_head 2x(M=8) = 2.85x its qmm(M=16) time (~+5ms/step —
+    dominant: the 78MB packed head streams twice), gate/up +62%,
+    down +20%, attention projections neutral-to-faster (already qmv at
+    M=16 on this GPU). Net trunk-matmul delta ~+8% in the micro-bench;
+    on 14B-class production models the MLP share grows, trending the
+    penalty toward +20-60% at width 16 with W=8, and roughly doubling on
+    M1-class (W=5 -> 4 chunks). The Phase-4 3x batch-16 gate still
+    clears on the pinned test models (~8x single-stream equivalent at 2
+    chunks); the 14B target needs an engine-level bench before (b)
+    becomes the default.
+- Revised DECISION NEEDED:
+  A') Sub-batched deterministic decode (3b) as the default for all
+      archs: width-16 golden rounds become a hard BIT bar for every
+      model, qwen fixtures land green, and ADR 0002's batched token-id
+      bar is guaranteed by construction rather than empirical. First
+      implementation step is the engine-level width-16 throughput bench
+      on a large model, with (a)-style capping as the fallback if the
+      penalty misses the perf gate. Calibrated W per device (5
+      conservative constant; 9 measured here; 11 on 'd'-class).
+  B') A' scoped to deterministic traffic only: greedy and seeded
+      requests decode in <=W sub-batches, unseeded temperature>0 traffic
+      keeps full-width steps (its draws are not reproducible
+      run-to-run anyway). Keeps peak throughput for sampling workloads;
+      costs step-builder complexity (partitioning by determinism class).
+  C') The prior entry's options (per-arch xfail status / EOS-scoped bar /
+      blanket width cap) — all now strictly weaker: the first encodes
+      fixture luck, the second rescues 1 of 4 flips, the third is A'
+      with worse throughput at equal bandwidth.
+  My read: A' (with B' as a follow-on refinement if sampling throughput
+  matters before Phase 9): it is the only option that makes the SPEC
+  §6.6 invariant true by construction, on every arch and every GPU, and
+  the measured cost on the pinned test models is acceptable.
+- Next: PM ruling (A'/B'/fallback) -> implement + engine bench, land the
+  held qwen fixtures, close Task 1, then Task 2 (Gemma, fixtures first).
+
+## [2026-07-04] Phase 6 / Task 1 — B' design answers (recorded before implementation)
+- Ruling implemented: B' — sub-batched deterministic decode, scoped
+  per-request to `temperature == 0` or an explicit client seed. Two design
+  questions answered per instruction:
+- Q1 (mixed-batch mechanics): **selective partitioning, implemented as
+  multiple forwards per step — not whole-step sub-batching.** A row's
+  bits are a property of the FORWARD it rides in (MLX picks the kernel
+  per dispatch from the total row count M), so "selective treatment
+  inside one forward" does not exist: selectivity means partitioning the
+  step's decode rows into separate forwards. That is structurally
+  natural here because `StepBatch` already describes exactly one forward
+  and `run_iteration` already issues several per step (prefill runs
+  separately — the B1 padding relies on it). Decode rows partition into
+  deterministic groups of <= W rows (bit-identical to M=1 by qmv row
+  M-invariance) plus ONE unrestricted full-width group for
+  non-deterministic rows. Correctness: sequences only gather their own
+  history within a step (per-seq gather), so grouping and group order
+  are value-neutral for other sequences; post-preemption replay rows of
+  deterministic sequences ride <= W groups too, which is what keeps
+  resumed streams bit-exact (any group size <= W reproduces M=1 bits,
+  independent of the original group's size). The pipelined decode path
+  partitions identically (its Lazy input is a concat of per-seq [1,1]
+  arrays — trivially groupable). Trade-off accepted and stated:
+  non-deterministic rows pay NOTHING (one full-width forward, no weight
+  re-reads); deterministic rows pay ceil(det_rows/W) weight reads —
+  the price of the guarantee; mixed steps cost one extra dispatch chain
+  per group vs today's single batch. Whole-step sub-batching was
+  rejected precisely because it would tax non-deterministic rows with
+  the same re-read factor for no benefit.
+  - Corollary the design must also close: **prefix-cache donation.**
+    Generated-token rows of NON-deterministic sequences are computed at
+    arbitrary M (ulp-off from M=1); donating them would let a later
+    deterministic request reuse non-canonical KV and silently break its
+    bit guarantee (SPEC: prefix caching must not change greedy outputs).
+    Non-deterministic sequences therefore donate only their
+    prefill-covered blocks (prefill is its own forward — canonical at
+    any load); deterministic sequences keep donating everything, since
+    their decode rows ARE M=1 bits. No regression for the multi-turn
+    reuse story (greedy chat traffic is deterministic traffic).
+- Q2 (threshold portability): **startup calibration, no hardcoding.**
+  `AnyModel::calibrate_deterministic_width(stream)`: for each distinct
+  linear shape in the LOADED model (attention/MLP projections + the
+  (tied) lm_head, deduped by (K, N)), compute row 0 of the projection at
+  M=1 and at rising M = 2..=32 over a realistic activation row
+  (dequantized embedding row tiled to K); the first M whose row-0 bytes
+  differ from M=1 is that shape's dispatch threshold on THIS device;
+  W = min(thresholds) - 1, capped at 32 when nothing diverges. This
+  measures the exact property the guarantee relies on (row-bit
+  M-invariance) instead of replicating MLX's device table, so it is
+  robust on GPUs the table doesn't describe, and probing through the
+  same `Linear::forward`/`as_linear` code covers quantized and dense
+  (BF16) weights alike. Engines built WITHOUT calibration default to
+  W = 4 (safe under the smallest threshold, 6, anywhere in MLX's table)
+  so an uncalibrated engine is conservative-but-correct; the worker and
+  every real-model harness calibrate at load (expected: 9 on this
+  machine, 5 on M1/M2-class, 11 on 'd'-class). Test: calibration
+  self-consistency (rows bit-stable at W, divergent at W+1 — the
+  hardware-independent definition of a correct answer) plus the value
+  printed and recorded per run.
+
+## [2026-07-05] Phase 6 / Task 1 — B' implemented; Task 1 CLOSED except one perf ruling
+- What (implements the approved B' with the two recorded design answers):
+  1. **Selective partitioning** (Q1 answer, as recorded): deterministic
+     rows (temperature == 0 or explicit client seed —
+     `SamplingOptions::explicit_seed`, worker maps proto `seed != 0`)
+     decode in sub-batches of at most the calibrated width; NON-
+     deterministic rows ride one unrestricted full-width forward in the
+     same step. Both the synchronous and pipelined paths partition; the
+     prefix cache is kept coherent by capping non-deterministic donors at
+     their prefill-covered blocks (their decode rows carry arbitrary-
+     width bits and must never serve a deterministic warm run).
+  2. **Startup calibration** (Q2 answer, as recorded):
+     `AnyModel::calibrate_deterministic_width` probes each distinct
+     projection shape's row-bit stability boundary at model load — no
+     hardware table. Measured: **9** on this machine (llama-1B, qwen-0.5/
+     0.6B, and qwen3-8B all calibrate to 9; probe cost 100-480 ms).
+     tests/calibration.rs pins the result against an independent raw-ops
+     re-derivation (first divergence at M=10 -> width 9) — the hardware-
+     independent correctness definition, valid on CI's different GPUs.
+  3. WorkerInfo gains additive `max_deterministic_decode_width = 13`
+     (diagnostics; python worker reports 0 = not guaranteed); python
+     bindings regenerated.
+  4. kiln-engine/tests/deterministic_partition.rs (checksum mock): det
+     forwards <= W and closed-form through partitioning incl. pipelined
+     Lazy groups; non-det forwards full-width; mixed steps decompose as
+     det chunks + one full non-det forward; donation cap enforced (det
+     extension of a non-det donor resumes at the prefill bound,
+     warm == cold; det donors still donate generated rows). One-#[test]
+     convention after a parallel-thread SIGSEGV flake (two live engines
+     race the Metal stream) — fixed and re-run stable.
+  5. Held qwen fixtures + the fetch-test-model.sh qwen2.5 pin LANDED.
+- **Correctness result: the corrected bar holds everywhere.** All 16
+  fixtures (llama 6, qwen2.5 5, qwen3 5) are bit-exact single-stream AND
+  at decode width 16, all three architectures — the width-16 rounds are
+  now guaranteed by construction, not argmax margin. Full suite: 40/40
+  test targets, e2e 21, python worker 28, fmt/clippy/ruff + both CI
+  shapes clean. Non-deterministic traffic verified unregressed
+  (sampled-16: 334.1 pre-B' vs 331.6 tok/s under B' — noise).
+- **Throughput gate (the ordered mixed-load batch-16 >= 3x): MISSES under
+  B' for any load containing deterministic rows.** Attribution
+  (llama-3.2-1b-4bit, release, single-stream 123.8 tok/s):
+  ```
+  greedy16  unpartitioned  410.4 tok/s  3.31x   (the historical gate)
+  greedy16  B' (chunks 9+7) 259.9 tok/s 2.10x   B' cost -37%
+  mixed16   single-forward  346.6 tok/s 2.80x   (pre-B' equivalent)
+  mixed16   B' ([8]+[8])    222.3 tok/s 1.80x
+  sampled16 (non-det path)  331.6 tok/s 2.68x   (sampler-op cost, pre-existing)
+  ```
+  8B-class scaling point (qwen3-8b-4bit @545dc425, ~/.kiln/bench-models/,
+  loaded 10.2s, calibrated W=9 in 480ms, single-stream 19.5 tok/s):
+  ```
+  greedy16  unpartitioned   67.5 tok/s  3.46x
+  greedy16  B'              44.8 tok/s  2.30x   B' cost -34%
+  mixed16   B'              45.7 tok/s  2.34x
+  sampled16 (non-det)       62.1 tok/s  3.18x   >= 3x
+  ```
+  Reading: the B' penalty is ~-35% at width 16 at BOTH scales (the
+  MLP-share fear did not compound at 8B), non-deterministic loads clear
+  3x at 8B (the 1B sampled miss is a small-model sampler-op artifact),
+  and deterministic-containing loads sit at ~2.1-2.3x — the 3x gate is
+  structurally out of reach for them at W=9: two sub-batches per step
+  means every deterministic token pays roughly double the trunk weight
+  bandwidth. That is the physical price of bit-exact batched greedy under
+  this kernel pin, not an implementation inefficiency (the partition adds
+  exactly the predicted 2x weight reads and nothing else measurable).
+- **14B-class bench: DEFERRED — dev machine is 16GB.** The 14B-4bit
+  weights (7.7GB) plus KV pool fit only with a truncated pool and no
+  headroom; the download was additionally network-bound (~1MB/s shaped).
+  The number must come from an M4 Pro/Max-class box (>= 24GB); CI cannot
+  provide it either (GitHub macOS runners have less RAM than this
+  laptop). The 8B point above is the stand-in scaling datum; the 14B run
+  is a standing item for the first deployment-class hardware session.
+- Deviations: none beyond the above.
+- DECISION NEEDED (narrow, perf-only — correctness is closed): the
+  batch-16 >= 3x gate as written cannot hold for deterministic-heavy
+  traffic under B' (measured ~2.1-2.3x at 1B and 8B). Options:
+  A) Re-scope the gate: >= 3x for non-deterministic/mixed-majority load
+     (holds: 3.18x at 8B), with the deterministic-load number documented
+     as the B' price (~2.3x) in the ADR — batched greedy buys bit-exact
+     reproducibility with ~35% aggregate cost. RECOMMENDED: single-stream
+     latency and non-det throughput are untouched, and greedy batch
+     throughput still scales 2.3x.
+  B) Per-op chunking (only the shapes whose threshold < batch width
+     sub-batch; attention projections ride full width): recovers an
+     estimated ~10-15% of the loss for ~150 lines + per-shape calibration
+     plumbing. Can stack on (A) later; not a gate-saver alone.
+  C) Revisit at the quarterly mlx-c bump (dispatch may change; the
+     calibration adapts automatically).
+- Next: perf ruling (A/B/C) -> record in ADR 0002 and close Task 1
+  formally; then Task 2 (Gemma2/3, fixtures first). Qwen3-8B-4bit kept
+  under ~/.kiln/bench-models/ for future phase benches.
+
+## [2026-07-05] Phase 6 / Task 1 — op-level sub-batching investigation (PM-directed) — REPORT
+- Scope: investigation only, per instruction. No source, fixture, or test
+  changes; one scratch probe (crates/kiln-models/tests/opsplit_probe.rs)
+  written, run, and removed after measurement, like the 2026-07-04
+  batched-bar probes. Question: can splitting ONLY the threshold-crossing
+  matmuls (MLP gate/up/down, lm_head) inside one full-width deterministic
+  forward — attention, norms, and other threshold-safe ops shared at
+  width 16 — match whole-forward B' bit-exactness at lower cost?
+- 1) Threshold safety of the would-be full-width ops (measured):
+  - SDPA never sees decode width at all: the paged decode path
+    (nn.rs `Attention::forward_step`) slices per sequence and runs
+    qk-norm/RoPE/gather/SDPA per-seq at q_len=1 regardless of batch
+    width — width-invariant by construction, on every device. Its
+    two-class q_len structure matters only for prefill (closed by B1
+    padding). The "neutral" figure in the 2026-07-04 table was about
+    the attention PROJECTIONS' dispatch cost, not SDPA.
+  - Every other full-width non-matmul op is row-stable through M=32 on
+    this machine (probe value 33 = never diverged): rms_norm=33,
+    residual+swiglu elementwise=33, embed gather+dequant=33, both models.
+  - Attention projections are shape-dependent, not device-constant:
+    llama-1B shapes (K,N <= 2048) threshold 18 -> bit-safe at 16;
+    qwen3-8B shapes (4096x4096, 4096x1024) threshold 12 -> NOT safe at
+    width 16 even on this machine. MLP and lm_head: threshold 10 at both
+    scales (consistent with the calibrated W=9).
+- 2) Measured cost (release; each timing = median eval over one lazy
+  graph of 16-64 independent reps — no per-op sync; us/dispatch):
+  ```
+  llama-1b     thr    M=16      9+7     11+5
+  attn q/o      18   153.7    153.9    156.2   split-neutral
+  attn k/v      18    43.5     42.3     42.9   split-neutral
+  mlp gate/up   10   312.7    646.3   (11+5 inadmissible, thr 10)
+  mlp down      10   312.4    634.4   (      "        )
+  lm_head tied  10  4847.8   9952.1   (      "        )
+  qwen3-8b
+  attn q/o      12   338.0    647.4    596.9   NOT neutral; thr < 16
+  attn k/v      12    87.7    152.8    152.9
+  mlp gate/up   10   996.8   1963.7   (11+5 inadmissible, thr 10)
+  mlp down      10  1005.4   1929.9   (      "        )
+  lm_head       10 12326.1  23202.9   (      "        )
+  ```
+  Composed trunk time per width-16 step: 1B unpart 26.2 / whole-forward
+  47.1 / op-level 47.1 ms; 8B 151.0 / 291.7 / 288.1 ms. Cross-check
+  against the engine-measured B' deltas validates the attribution:
+  probe 20.9 vs engine 22.6 ms/step at 1B (93% — the ~1.7ms residual is
+  the doubled norm/embed/dispatch-chain overhead a single forward would
+  also save); probe 140.7 vs engine 120.1 at 8B (probe overestimates
+  there; conclusions below only get stronger).
+  **Op-level recovery: 1B -0.03 ms/step kernel-side, ~+3% total with the
+  residual overhead credited (predicted <= ~267 vs B' 259.9 tok/s);
+  8B +3.6 ms/step, ~+1% (predicted 45.3 vs 44.8 tok/s).**
+- 3) Why the intuition fails (and the earlier ~10-15% option-B estimate
+  was wrong):
+  a. Whole-forward splitting never RECOMPUTES attention — each sub-batch
+     computes only its own rows. The only duplication is per-dispatch
+     weight re-streaming plus small per-forward overhead; there is no
+     shared attention output for op-level splitting to reuse.
+  b. Where attention is split-neutral (1B: small, latency-bound
+     matrices), unsplitting it saves nothing. Where splitting attention
+     is expensive (8B: bandwidth-bound 4096-wide shapes, 1.9x), its own
+     threshold (12) is below 16, so bit-exactness forces it to chunk
+     anyway. The premise "attention is threshold-safe at width 16" fails
+     on production-scale shapes on THIS machine, before M1/M2-class
+     (lower thresholds still) even enters.
+  c. MLP + lm_head — 80%+ of streamed bytes — sit at threshold 10 at
+     both scales and chunk identically (<= 9 rows, 2 chunks at width 16)
+     under either scheme. The dominant cost is untouchable.
+  d. On M1/M2-class (W=5), all shapes compress toward the same bound:
+     op-level converges to whole-forward exactly where B' hurts most.
+  The B' penalty is the qmv-vs-qmm kernel-class efficiency gap on the
+  bandwidth-dominant matmuls; it attaches to the kernel class the bit
+  guarantee pins, not to how rows are grouped around it. No partition
+  arrangement at this mlx-c pin can close it. The only structural lever
+  is a kernel that streams weights once across row groups while keeping
+  qmv row bits — an upstream-MLX question for the quarterly bump, not a
+  Kiln scheduling question.
+- Decisions: none required within latitude (no changes made).
+- Deviations: none.
+- Acceptance (real output of the scratch probe, trimmed; probe deleted
+  after the run, `git status` clean save this entry):
+  ```
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-models \
+      --test opsplit_probe --release -- --nocapture
+  === llama-3.2-1b-4bit ===
+  full-width ops row-stability (33 = stable through M=32):
+    rms_norm=33 elementwise=33 embed_gather_dequant=33
+  trunk estimate/step @16: unpart 26.16ms | whole-forward 47.06ms |
+    op-level 47.09ms
+  cross-check: probe B' delta 20.90ms vs engine-measured 22.58ms
+  op-level recovery -0.03ms/step -> predicted 259.8 tok/s (B' 259.9)
+  === qwen3-8b-4bit ===
+  full-width ops row-stability: rms_norm=33 elementwise=33 embed=33
+  trunk estimate/step @16: unpart 150.95ms | whole-forward 291.69ms |
+    op-level 288.05ms
+  cross-check: probe B' delta 140.74ms vs engine-measured 120.11ms
+  op-level recovery 3.64ms/step -> predicted 45.3 tok/s (B' 44.8)
+  test result: ok. 1 passed
+  ```
+- DECISION NEEDED (supersedes the A/B/C perf ruling in the B' closeout
+  entry): option B (per-op chunking) is measured dead — 0% recovery at
+  1B, ~1% at 8B, best case ~3% crediting every avoidable overhead —
+  against ~200-300 lines of per-shape calibration plumbing plus a per-op
+  M-sensitivity classification that every future architecture (Gemma is
+  next) would have to maintain. Whole-forward B' is the honest floor;
+  ~2.1-2.3x at width 16 is the real, physical price of bit-exact batched
+  greedy at this kernel pin. Remaining options:
+  A) Re-scope the batch-16 >= 3x gate to non-deterministic/mixed-majority
+     load (holds: 3.18x at 8B) and record the deterministic-load figure
+     (~2.3x) in ADR 0002 as the documented B' price. RECOMMENDED.
+  C) Additionally record in ADR 0002 that the only structural lever is
+     kernel-level (a batched qmv streaming weights once across row
+     groups), to be re-evaluated at each quarterly mlx-c bump — the
+     startup calibration adapts automatically if dispatch changes. No
+     code change now. Compatible with A.
+  My read: A + C together, and strike B permanently.
+- Next: PM ruling -> record in ADR 0002, close Task 1 formally; then
+  Task 2 (Gemma2/3, fixtures first, SPEC §12 order).
+
+## [2026-07-05] Phase 6 / Task 1 — perf ruling recorded (ADR 0003) — Task 1 CLOSED
+- What (implements the PM ruling A + C on the two open DECISION NEEDED
+  items — the B' closeout entry and the op-level investigation entry;
+  both are hereby CLOSED):
+  1. **ADR 0003**
+     (docs/decisions/0003-throughput-bar-under-deterministic-sub-batching.md):
+     records the finding (B' costs ~2.1-2.3x vs unpartitioned at width 16,
+     attributable to qmv-vs-qmm weight re-streaming at the kernel-class
+     boundary — a property of the pinned dispatch table, not a defect;
+     op-level investigation measurements + the 93% methodology
+     cross-check cited as evidence it is not recoverable by
+     re-partitioning); amends the SPEC §11.3 batch-16 >= 3x target to
+     non-deterministic/mixed-majority load; records ~2.1-2.3x as the
+     deterministic-load measured FLOOR (not a target) with regressions
+     below it failing phase gates like any bench regression; sets the
+     revisit trigger at every mlx-c/core-MLX bump per ADR 0001's C1
+     process, figures stale the moment the pin moves.
+  2. New ADR vs appended ADR 0002 section (the call was delegated):
+     new ADR — docs/decisions/ is agent-read-only once landed (the
+     ADR 0001 addenda were explicit one-off PM instructions), and
+     ADR 0002 defines correctness bars while this amends a performance
+     acceptance target with its own revisit trigger; cross-referenced
+     both directions in the ADR text instead.
+  3. SPEC §11.3 perf bullet: doc-only amendment referencing ADR 0003
+     (acceptance clause only; section otherwise untouched).
+- Decisions: bench.sh phase runs to report det/non-det batch numbers
+  separately (recorded as an ADR consequence; implementation rides the
+  next bench.sh touch, no code change now).
+- Deviations: none.
+- Acceptance (doc-only change):
+  ```
+  $ ls docs/decisions/
+  0001-mlx-c-pin.md
+  0002-parity-bars-under-mlx-kernel-dispatch.md
+  0003-throughput-bar-under-deterministic-sub-batching.md
+  $ git diff --stat HEAD
+  PROGRESS.md | docs/SPEC.md (1 line) | docs/decisions/0003-... (new)
+  ```
+- **Phase 6 / Task 1 (Qwen2.5/Qwen3 + parity/throughput bars) is CLOSED.**
+- Next: Task 2 — Gemma2/Gemma3 impls, fixtures first (SPEC §12 Phase 6),
+  width-16 parity verified against the ADR 0002/0003 bars.
+
+## [2026-07-05] Phase 6 / Task 2 — Gemma2 + Gemma3 — DONE
+- What (fixtures first, then implementation, per CLAUDE.md):
+  1. **Golden fixtures** (sanctioned generator, pinned stack mlx.core
+     0.31.1 / mlx-lm 0.31.2): tests/golden/gemma-3-1b-it-4bit/ (6 cases)
+     and tests/golden/gemma-2-2b-it-4bit/ (6 cases), standard CASES list.
+     New pinned test model `gemma-2-2b-it-4bit`
+     (mlx-community @ 2c715097) — the smallest gemma-2 checkpoint that
+     exists; gemma3 uses the already-pinned gemma-3-1b-it-4bit.
+  2. **Shared-trunk extension** (nn.rs `TrunkOptions` — one parity-proven
+     CausalLm for all five archs): `NormStyle::OnePlus` (gemma `1+w`
+     RMSNorm, folded into the weights at load — same add, same bits,
+     fewer ops), `Activation::GeluApprox` (`mlx.nn.gelu_approx`
+     op-for-op in the reference's evaluation order), gemma sandwich
+     `Block` (post-attention/pre-/post-feedforward norms on sublayer
+     OUTPUTS), `clip_residual` (gemma3: f32 residual adds clipped to the
+     f16 range), embedding scaling (gemma3: bf16(sqrt(hidden)) cast
+     in-graph = f16 34.0 verified against the reference; gemma2: weak
+     f32 scalar), final logit softcapping (gemma2), per-layer
+     `mk_rope(layer)` (gemma3 local 10k / global 1M+scaling), qk-norm
+     with the trunk's norm style (gemma3), `scale_override` computed
+     with each arch's own f64 formula, and **manual softcapped
+     attention** for gemma2 (`tanh(scores/cap)*cap`, boolean causal mask
+     via `where`, `softmax(precise)` — `mx.fast` SDPA is unusable under
+     softcapping, so the reference matmuls scores/probs explicitly) on
+     BOTH decode paths. kiln-mlx gains `ops::tanh` (bindgen surface
+     already had it). `weak_scalar` helper mirrors MLX's Python-float
+     promotion (f32 value cast to the tensor dtype at the op) so scalar
+     ops run in the reference's dtype.
+  3. **Arch modules + dispatch**: gemma3.rs / gemma2.rs, Gemma2Config /
+     Gemma3Config (defaults mirror the reference ModelArgs; gemma3 tie
+     decided from the checkpoint like the reference's `sanitize` — the
+     1B ships an lm_head, so it runs untied), ArchConfig/AnyModel
+     variants, SUPPORTED_ARCHITECTURES += gemma2, gemma3_text
+     (multimodal "gemma3" stays python-routed).
+  4. **Parity envelopes, worker-enforced** (existing CTX_OVERFLOW path):
+     - gemma3: total context (prompt+generated) <= sliding_window (512).
+       The reference's RotatingKVCache(keep=0) is bit-for-bit a plain
+       temporal cache BELOW the window and its masks are plain causal;
+       ABOVE it the buffer rotates (ring order) and serving without
+       ring-order gather would silently diverge from the reference and
+       from the model's own window semantics. modelinfo.rs min's the
+       advertised max_context_len with the window.
+     - gemma2: prompt <= 2048 (one mlx-lm `prefill_step_size` chunk) +
+       the single-tail prefill schedule (worker engine_main and the
+       golden harness set `prefill_fine_chunk = prefill_chunk` when the
+       model declares `monolithic_prefill_required`). Manual-attention
+       score/prob matmul row bits depend on the key-axis length and the
+       reference's bool mask exists only at offset 0 (KVCache has no
+       `make_mask` at the pin), so only reference-shaped monolithic
+       pieces are parity-defined. New `StaticInfo.max_prompt_len` backs
+       the admission check.
+- **Result: 28/28 fixtures bit-exact** — llama 6, qwen2.5 5, qwen3 5,
+  gemma2 6, gemma3 6 — single-stream AND at decode width 16 under B'
+  (both gemmas calibrate deterministic width 9 on this machine, probing
+  through the untied 262k-vocab gemma3 head and gemma2's tied embedding
+  alike). Both models were bit-exact on the FIRST harness run.
+- Decisions (within latitude):
+  - gemma3 window-crossing support deferred behind a hard cap rather
+    than shipped semantically wrong (unwindowed attention past 512).
+    Lifting it = ring-order decode gather (slot = closed-form rotation
+    of the reference buffer) + reference-shaped >window prefill masks +
+    a dedicated >512-token fixture; recorded as the follow-up item.
+  - gemma2 fine grid off is the Phase-5-B2 tradeoff scoped to one arch
+    (forfeits sub-2048 multi-turn prefill reuse for gemma2 only) —
+    required for mask semantics, not a perf preference.
+  - qk-norm slot: the reference norms after the head transpose, Kiln
+    norms before it (identical row content either way, both reduce over
+    head_dim) — kept Kiln's existing slot; verified empirically by the
+    bit-exact fixtures.
+- Deviations: fetch-test-model.sh gained the gemma-2-2b-it-4bit pin (new
+  entry; existing pins untouched) — same shape as the Phase 6 qwen2.5
+  addition, unavoidable for gemma2 coverage. Flagging per protocol.
+- Known issue (pre-existing, NOT addressed here):
+  `cargo test -p kiln-engine --test sampler --release` dies with
+  SIGBUS/SIGSEGV — reproduced on clean HEAD cce71d7 (pre-gemma), debug
+  mode passes, and the CI gates run debug, which is why it was never
+  seen. Discovered via an exploratory --release suite run. Needs its own
+  session; test not weakened, nothing skipped.
+- Acceptance (real outputs, trimmed):
+  ```
+  $ uv run ... python scripts/gen-golden.py --model gemma-3-1b-it-4bit ...
+  wrote 6 fixtures  (chat-basic 21 tok ... raw-long-prefill 242 tok)
+  $ uv run ... python scripts/gen-golden.py --model gemma-2-2b-it-4bit ...
+  wrote 6 fixtures  (prompts 6..241 tok; all within both parity caps)
+  $ cargo test -p kiln-models --test golden --release -- --nocapture
+  == gemma-3-1b-it-4bit: model_type=gemma3_text, 6 fixture(s), det width 9
+  6x "exact match (batched/paged engine)" + 6x "exact match at decode
+  width 16 (B' deterministic sub-batching)"
+  == gemma-2-2b-it-4bit: model_type=gemma2, 6 fixture(s), det width 9
+  6x exact + 6x exact at width 16
+  (llama 6, qwen2.5 5, qwen3 5 all still exact both rounds)
+  test result: ok
+  $ cargo test --workspace --no-fail-fast   (debug = CI shape)
+  38/38 test targets ok (golden, calibration, deterministic_partition,
+  batching, prefill_pad, prefix suites, both leak gates, worker rpc)
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+  clean (also clean with --no-default-features; linux compile-check builds)
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+  $ KILN_TEST_MODELS=... pytest python/kiln_worker_py/tests -> 28 passed
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order);
+  standing items: gemma3 window-crossing (ring-order gather + fixture),
+  release-mode sampler crash (separate session).
+
+## [2026-07-05] Phase 6 — release-mode sampler SIGBUS root-caused + fixed (pre-Task-3 blocker) — DONE
+- Scope: the crash flagged in the Task 2 entry
+  (`cargo test -p kiln-engine --test sampler --release`: SIGBUS/SIGSEGV,
+  release-only, reproduced on clean pre-gemma HEAD). PM-directed:
+  backtrace-first diagnosis, soundness verdict on kiln-mlx, fix,
+  release-exercised regression coverage, close the CI debug-only blind
+  spot. (A chip session was independently started on this bug; this
+  session's fix is the authoritative one — the two will conflict if both
+  land.)
+- Diagnosis (evidence chain, no guessing):
+  1. lldb: fault inside MLX `ArrayDesc::~ArrayDesc` — an atomic refcount
+     op through a garbage control-block pointer. Downstream symptom, not
+     the source (unwinder could not walk further).
+  2. Guard Malloc (`libgmalloc`) moved the FIRST fault to
+     `mlx::core::random::split` reading the key array's descriptor: the
+     key handle's C++ object was freed memory. Use-after-free, not
+     misalignment.
+  3. Section bisect (temporary markers): sampler A finishes its 16
+     seeded draws; the crash is sampler B's FIRST draw. Reduced to a
+     ~30-line kiln-mlx-only reproducer: struct-held `Option<Array>` key
+     chain, sampler passed BY VALUE into a closure, two samplers drawn
+     back to back. kiln-engine exonerated.
+  4. Env-gated Drop logging under gmalloc (no address reuse there): the
+     fatal split consumed exactly the box freed by sampler A's own —
+     correct — drop. Sampler B, freshly constructed with `key: None`,
+     `take()`-returned `Some(<A's dangling key>)`.
+  5. lldb at the closure's two entries: call 1 argument slot =
+     `{0, 0}` (proper None); call 2, SAME slot = `{1, <dangling>}` —
+     the second by-value temporary was never re-initialized.
+  6. `--emit=mir` (stable): `KeyOnly { key: None }` is built ONCE
+     (`_22`/`_21`); call 1 receives `copy _21`, call 2 `move _21`.
+     rustc's MIR GVN merged the two identical constant argument
+     temporaries; under the indirect by-value ABI the callee mutates and
+     drops IN the caller's slot, so call 1 tears the memory that call
+     2's `move` then reads.
+- **Verdict (the soundness call, per instruction): NOT a Kiln soundness
+  hole and NOT a latent flaw an existing SAFETY comment failed to cover.**
+  Every corrupted state transition (`Option::take`, `Some(next)`
+  assignment, drop) is safe Rust; every FFI call received pointers valid
+  at call time (kiln-mlx handle ownership re-reviewed against mlx-c's
+  vendored `mlx_array_new_/set_/free_` — holds). This is a **rustc
+  1.96.1 (aarch64-apple-darwin) miscompilation**, reproducible at every
+  opt-level >= 1 and absent at opt-0 — which is exactly why the
+  debug-only CI lane never saw it. Trigger shape: a
+  constant-constructible aggregate with drop glue and no niche
+  (`Option<Array>` behind a raw-pointer handle) passed by value twice
+  from one frame.
+- Fix (workaround in Kiln; the compiler bug itself is upstream):
+  1. **`Sampler.key` is now eager** — `key: Array` created from the seed
+     at construction (`Sampler::new`/`greedy` return `Result`); the
+     opaque FFI call makes the constructed value unprovable-identical
+     (GVN cannot merge) and deletes the stale-discriminant layout
+     entirely. Sampling behavior is bit-identical: the first draw still
+     splits `key(seed)` exactly as before (same-seed/different-seed
+     tests pin it; full determinism suite green).
+  2. `Engine::submit`: sampler construction failure emits the proto's
+     in-band `Finished{error}` pre-admission (no engine resources exist
+     yet).
+  3. Exposure survey: `Sampler` was the workspace's only
+     constant-constructible by-value-passable `Option<Array>` aggregate
+     (kv_cache/Linear-bias/Block-norms/TrunkOptions are load-time or
+     heap state, never constant argument temps). Production `submit`
+     builds samplers from runtime options (not GVN-mergeable), so
+     serving output was almost certainly unaffected — the landmine was
+     test-shaped today, refactor-shaped tomorrow; it is gone either way.
+  4. ADR 0003's release-measured throughput figures stand: the engine
+     bench paths never construct constant sampler temporaries, and the
+     entire workspace suite now passes in release, including golden
+     parity (a stronger statement than was ever true before).
+- Regression coverage (release-only failure => release-exercised test):
+  `same_seed_same_tokens` IS the trigger shape and crashed in release
+  before the fix; it now carries a REGRESSION SHAPE doc contract (keep
+  the constant options + by-value closure structure) and runs under the
+  new CI release lane, where it fails on any reintroduction of a
+  constant-constructible sampler on an affected toolchain.
+- CI blind spot closed: new `test-macos-release` job runs the full
+  `cargo test --workspace --release` on Apple Silicon (job comment
+  records why: optimized builds are what ship and what every ADR 0003
+  benchmark measured).
+- Upstream: minimal-repro recipe + MIR evidence recorded here for a
+  rust-lang/rust report; a kiln-free minimization needs care (naive
+  reductions were defeated by niche layouts and IPSCCP — the reproducer
+  needs a no-niche Drop aggregate, opaque callees, and constant
+  construction). Standing item: file upstream + re-test the workaround at
+  every toolchain bump.
+- Deviations: none. All scratch diagnostics (two scratch test files;
+  temporary eprintlns in random.rs/array.rs/sampler.rs; the Drop
+  backtrace hook) removed — the committed diff is the fix, the test
+  updates, and the CI lane only.
+- Acceptance (real outputs, trimmed):
+  ```
+  $ cargo test -p kiln-engine --test sampler --release   (was: SIGBUS 100%)
+  test sampler_behavior ... ok        (x3 consecutive runs + debug run ok)
+  $ cargo test --workspace --no-fail-fast                (debug, CI shape)
+  zero "failures:" / "test result: FAILED" across all targets; exit 0
+  $ cargo test --workspace --release --no-fail-fast      (NEW bar)
+  zero failures; exit 0 — golden parity, leak gates, engine suites all
+  green in release for the first time
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+  clean (also --no-default-features clippy + build: clean)
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+  $ KILN_TEST_MODELS=... pytest python/kiln_worker_py/tests -> 28 passed
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order).
+  Standing items: gemma3 window-crossing (ring-order gather + fixture),
+  rustc miscompile upstream report.

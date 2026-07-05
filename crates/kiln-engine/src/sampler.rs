@@ -24,6 +24,13 @@ pub struct SamplingOptions {
     pub top_k: u32,
     pub min_p: f32,
     pub seed: u64,
+    /// The CLIENT set the seed (as opposed to a worker-generated one).
+    /// Seeded requests promise reproducibility per worker version
+    /// (SPEC §6.6), so they ride the deterministic decode path (ADR 0002
+    /// B': sub-batched trunk, bit-identical to single-stream) together
+    /// with greedy requests. The engine cannot infer this from `seed`
+    /// alone — the worker fills unset seeds with random ones.
+    pub explicit_seed: bool,
 }
 
 impl Default for SamplingOptions {
@@ -34,25 +41,51 @@ impl Default for SamplingOptions {
             top_k: 0,
             min_p: 0.0,
             seed: 0,
+            explicit_seed: false,
         }
     }
 }
 
+impl SamplingOptions {
+    /// Whether a request with these options carries a determinism promise:
+    /// greedy decoding, or a client-chosen seed (SPEC §6.6 reproducibility).
+    pub fn deterministic(&self) -> bool {
+        self.temperature == 0.0 || self.explicit_seed
+    }
+}
+
 /// Stateful sampler: holds the PRNG key chain for one request.
+///
+/// The key is EAGER — created at construction from the seed, even for
+/// greedy samplers that never draw — as the workaround for a rustc 1.96
+/// MIR-GVN miscompilation (PROGRESS 2026-07-05, release-mode sampler
+/// SIGBUS): with the previous `key: Option<Array>`, a `Sampler` was a
+/// constant-constructible aggregate with drop glue, and rustc merged two
+/// identical by-value `Sampler` argument temporaries in one caller
+/// (`copy`/`move` of one MIR local). The callee mutates and drops its
+/// by-value argument in place (indirect ABI), so the second call received
+/// the first sampler's freed key behind a stale `Some` discriminant — a
+/// use-after-free in safe code, reproducible at any opt-level >= 1. An
+/// opaque FFI call in the constructor makes the value unprovable-identical
+/// (blocking the merge), and removing the `Option` removes the stale
+/// discriminant entirely. Do not reintroduce a lazily-populated key.
 #[derive(Debug)]
 pub struct Sampler {
     options: SamplingOptions,
-    key: Option<Array>,
+    key: Array,
 }
 
 impl Sampler {
     /// Greedy argmax sampler (temperature 0).
-    pub fn greedy() -> Self {
+    pub fn greedy() -> Result<Self, MlxError> {
         Self::new(SamplingOptions::default())
     }
 
-    pub fn new(options: SamplingOptions) -> Self {
-        Self { options, key: None }
+    pub fn new(options: SamplingOptions) -> Result<Self, MlxError> {
+        Ok(Self {
+            key: random::key(options.seed)?,
+            options,
+        })
     }
 
     /// Samples one token id (`[1]` u32) from logprobs `[1, vocab]`.
@@ -82,12 +115,8 @@ impl Sampler {
 
     /// Splits the request key chain and returns this draw's subkey.
     fn next_key(&mut self, s: &Stream) -> Result<Array, MlxError> {
-        let key = match self.key.take() {
-            Some(key) => key,
-            None => random::key(self.options.seed)?,
-        };
-        let (next, sub) = random::split(&key, s)?;
-        self.key = Some(next);
+        let (next, sub) = random::split(&self.key, s)?;
+        self.key = next;
         Ok(sub)
     }
 }

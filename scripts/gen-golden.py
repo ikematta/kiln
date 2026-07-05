@@ -67,6 +67,29 @@ CASES = [
         64,
     ),
     (
+        # Sized so the llama-3.2 prefill limit lands a few tokens past a
+        # fine-grid boundary (137 prefill tokens = 128 + 9): the ragged
+        # tail piece is shorter than the qmv/qmm dispatch thresholds and
+        # must be kernel-class padded (ADR 0002 / PREFILL_PAD_MIN_ROWS) to
+        # reproduce this fixture. Other tokenizers land where they land —
+        # the case is still a valid probe there, just not necessarily a
+        # padded one.
+        "raw-tiny-remainder",
+        "A kiln firing passes through several stages. First the water smokes "
+        "off below two hundred degrees, then the clay body dehydrates as its "
+        "chemically bound water escapes, then quartz inversion stresses the "
+        "ware near five hundred seventy degrees, and finally sintering begins "
+        "to fuse the particles. The potter watches the cones bend in the spy "
+        "hole because each cone is formulated to soften at a known heat work, "
+        "not a bare temperature. When cone six touches down the firing is "
+        "complete and the long cooling starts, during which cristobalite "
+        "inversion demands patience below two hundred twenty degrees or the "
+        "ware will dunt and crack. Experienced potters therefore plan the "
+        "whole schedule in advance:",
+        False,
+        64,
+    ),
+    (
         "raw-long-prefill",
         "Pottery is one of the oldest human inventions, originating before the "
         "Neolithic period. Ceramic objects like figurines were made as early as "

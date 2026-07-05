@@ -48,6 +48,9 @@ class WorkerServicer(worker_pb2_grpc.WorkerServicer):
             worker_version=_WORKER_VERSION,
             capabilities=[pb.CAPABILITY_TOKENIZER_OWNED],
             kv_block_size=0,
+            # ADR 0002 B': 0 = greedy determinism under batching is not
+            # guaranteed by this worker (mlx-lm path, no sub-batching).
+            max_deterministic_decode_width=0,
         )
         if info is not None:
             resp.model_path = info.model_path
