@@ -1502,3 +1502,33 @@
   ```
 - Next: PM decision on the granularity options above; Phase 5 merge
   gate otherwise unchanged (previous entry).
+
+## [2026-07-04] Phase 5 / Option B step 2 — golden gate on the fine-tail schedule — DONE (GATE PASSED)
+- What: ran the full golden-token parity harness against the F=64
+  canonical schedule (previous commit). Under the new schedule every
+  fixture's prefill is re-chunked — e.g. raw-long-prefill's 248 prefill
+  positions run as 64+64+64+56 instead of one 248-token chunk — while
+  the committed fixture ids remain mlx-lm's single-2048-chunk reference.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --test golden -- --nocapture   (THE GATE)
+  golden chat-basic:        48 prompt, 64 gen  — exact match (batched/paged engine)
+  golden chat-code:         47 prompt, 128 gen — exact match
+  golden chat-multibyte:    51 prompt, 64 gen  — exact match
+  golden raw-continuation:   6 prompt, 64 gen  — exact match
+  golden raw-long-prefill: 249 prompt, 64 gen  — exact match
+  (all five again) — exact match at decode width 16   <- mlx#3120 rounds
+  test result: ok. 1 passed in 23.14s
+  $ cargo test -p kiln-models --test batching -- --nocapture
+  solo engine == contiguous path; 4-way == solo x2; late-join;
+  stop-token; pool-pressure — all ok (generate path and engine share
+  the new schedule; batch-1 parity holds)
+  ```
+- Read: token-id parity survives the 64-grid re-chunking of every
+  sub-2k prompt on this model/pin/hardware. This does NOT prove KV
+  bit-equality across schedules (the e2e divergence proved bits can
+  move); it proves the schedule change stays inside golden's token-id
+  bar. The cache-hit path (next commit) does not rely on either fact:
+  warm resumes recompute only in shapes the same prompt's cold schedule
+  produces, per the resume-invariance unit test.
+- Next: step 3 — serve cache hits from F-aligned boundaries.
