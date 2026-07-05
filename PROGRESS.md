@@ -2650,3 +2650,136 @@
 - Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
   unchanged. Standing items unchanged (gemma3 window-crossing fixture,
   rustc miscompile upstream report).
+
+## [2026-07-05] Phase 6 — sampler SIGBUS: independent verification (chip session) + kiln-free upstream repro — DONE
+- Scope: this is the independently-started chip session anticipated in
+  the 2026-07-05 sampler-SIGBUS entry ("the two will conflict if both
+  land"). The authoritative fix (495bc3c, eager PRNG key) had already
+  merged to main via PR #6 when this session ran, so this session lands
+  NO code change: this branch was fast-forwarded onto main (4c74379)
+  and this entry records an independent re-derivation of the diagnosis
+  from scratch — plus the kiln-free minimization the original entry
+  left as a standing item for the upstream report.
+- What (verification, all evidence re-derived without consulting the
+  original session's intermediate artifacts):
+  1. Reproduced the crash at the pre-fix base: restored
+     `crates/kiln-engine` to cce71d7 inside the main checkout —
+     `cargo test -p kiln-engine --test sampler --release` SIGSEGVs
+     deterministically; lldb: fault in `mlx::core::array::~array()` via
+     `mlx_array_free` inside `Sampler::sample`, called from the
+     `same_seed_same_tokens` closure, freeing a garbage handle
+     (`0x573b0916…`). Matches the original entry's frames 1-3. Checkout
+     restored to HEAD afterwards (`git status` clean).
+  2. **Kiln-free zero-unsafe reproducer** (closes the original entry's
+     upstream-report standing item — their naive reductions were
+     defeated by niche layouts/IPSCCP; this shape survives both):
+     `Sampler { options: Options, key: Option<Box<Key>> }` where
+     `Options` mirrors SamplingOptions' field mix, `Key` carries a Drop
+     impl with new/drop counters, `new()` returns the constant
+     `Self { options, key: None }`, a closure takes the sampler BY
+     VALUE and advances the key chain 16x via `take()`/`Some(...)`
+     reassignment, and is called twice with `Sampler::new(opts)` from
+     one constant local. rustc 1.96.1 (31fca3adb, aarch64-apple-darwin),
+     no unsafe, no FFI: opt-level 0/1 pass; **opt-level 2/3 die in
+     libsystem_malloc `mfm_free.cold.4` (double free)** — safe Rust
+     double-freeing is a compiler bug by definition. (Note: the kiln
+     shape triggered at >= 1 per the original entry; the kiln-free
+     Box-niche shape needs >= 2 — inlining-threshold difference, same
+     defect.) Source preserved below for the rust-lang/rust filing.
+  3. **Pass-level isolation** (new evidence, not in the original
+     chain): `RUSTC_BOOTSTRAP=1 rustc -C opt-level=3
+     -Zmir-enable-passes=-GVN` on the identical source runs clean
+     ("ok: streams match, 34 keys minted, 34 dropped"). Disabling the
+     single MIR GVN pass removes the double free — the miscompiling
+     pass is pinned, not inferred.
+  4. MIR confirmation on the kiln-free shape (`--emit=mir`, opt 3):
+     one construction `_6 = Sampler { options: copy _1, key: const
+     Option::<Box<Key>>::None }` feeds both closure calls through one
+     tuple local — call 1 `copy _5`, call 2 `move _5` — exactly the
+     merged-argument-temporary structure the original entry read out of
+     the kiln reproducer's MIR (`_22`/`_21`).
+  5. Fix verification at HEAD (4c74379): the previously-crashing test
+     passes in release x3 consecutive runs (plus the earlier pre-revert
+     run: x4 total). Test NOT weakened — confirmed the committed test
+     preserves the trigger structure (constant options, by-value
+     closure, back-to-back draws per the REGRESSION SHAPE contract) and
+     the same assertions, and the new `test-macos-release` CI lane
+     executes it in the miscompiling configuration.
+- Verdict: the 495bc3c diagnosis is CONFIRMED from an independent
+  angle — rustc 1.96.1 MIR-GVN miscompilation of safe code; kiln-mlx
+  FFI surface exonerated (wrapper audit of array/ops/random/stream/error
+  found the SAFETY contracts sound). The eager-key workaround is the
+  right shape: an opaque FFI call in the constructor is exactly what
+  GVN cannot prove identical.
+- Upstream-report payload (standing item now unblocked; file against
+  rust-lang/rust with: rustc 1.96.1 aarch64-apple-darwin, opt-level>=2,
+  disappears under -Zmir-enable-passes=-GVN):
+  ```rust
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  static NEWS: AtomicUsize = AtomicUsize::new(0);
+  static DROPS: AtomicUsize = AtomicUsize::new(0);
+  struct Key(u64);
+  impl Key {
+      fn mint(v: u64) -> Box<Key> {
+          NEWS.fetch_add(1, Ordering::SeqCst);
+          Box::new(Key(v))
+      }
+  }
+  impl Drop for Key {
+      fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); }
+  }
+  #[derive(Clone, Copy)]
+  struct Options { temperature: f32, top_p: f32, top_k: u32,
+                   min_p: f32, seed: u64, explicit_seed: bool }
+  struct Sampler { options: Options, key: Option<Box<Key>> }
+  impl Sampler {
+      fn new(options: Options) -> Self { Self { options, key: None } }
+      fn sample(&mut self) -> u64 {
+          let key = match self.key.take() {
+              Some(key) => key,
+              None => Key::mint(self.options.seed),
+          };
+          let v = key.0;
+          self.key = Some(Key::mint(v + 1));
+          v
+      }
+  }
+  fn main() {
+      let opts = Options { temperature: 1.0, top_p: 0.95, top_k: 0,
+                           min_p: 0.0, seed: 42, explicit_seed: false };
+      let draw = |mut sampler: Sampler| -> Vec<u64> {
+          (0..16).map(|_| sampler.sample()).collect()
+      };
+      let a = draw(Sampler::new(opts));
+      let b = draw(Sampler::new(opts)); // double free at opt-level >= 2
+      assert_eq!(a, b);
+      assert_eq!(NEWS.load(Ordering::SeqCst), DROPS.load(Ordering::SeqCst));
+      println!("ok");
+  }
+  ```
+- Decisions: fast-forwarded this session branch onto main instead of
+  re-implementing on the stale cce71d7 base — avoids the double-land
+  conflict the original entry predicted; PROGRESS stays append-only.
+- Deviations: none (no code touched; diagnosis used the main checkout
+  read-only plus one temporary `git restore --source=cce71d7` of
+  crates/kiln-engine, reverted and verified clean).
+- Acceptance (real output, trimmed):
+  ```
+  $ git -C ~/KILN checkout cce71d7 -- crates/kiln-engine
+  $ cargo test -p kiln-engine --test sampler --release
+  process didn't exit successfully: (signal: 11, SIGSEGV)
+  lldb: frame #0 mlx::core::array::~array() +36
+        frame #1 mlx_array_free  frame #2 kiln_engine::sampler::Sampler::sample
+        frame #3 sampler::same_seed_same_tokens::{{closure}}
+  $ git -C ~/KILN restore --source=HEAD --staged --worktree crates/kiln-engine
+  $ rustc -C opt-level=3 repro.rs && ./repro          # kiln-free, no unsafe
+  EXC_BREAKPOINT libsystem_malloc mfm_free.cold.4 (double free); opt 0/1 ok
+  $ RUSTC_BOOTSTRAP=1 rustc -C opt-level=3 -Zmir-enable-passes=-GVN repro.rs && ./repro
+  ok: streams match, 34 keys minted, 34 dropped
+  $ cargo test -p kiln-engine --test sampler --release   (HEAD 4c74379, x3)
+  test sampler_behavior ... ok   |   test result: ok. 1 passed (x3)
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
+  unchanged. Standing item updated: rustc miscompile upstream report is
+  ready to file (payload above); re-test the eager-key workaround at
+  every toolchain bump.
