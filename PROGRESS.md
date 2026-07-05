@@ -2776,3 +2776,92 @@
     release lane exists because of the release-only rustc GVN miscompile
     (PROGRESS 2026-07-05) — model-path coverage there has independent
     value, at roughly double the added minutes.
+
+## [2026-07-05] Phase 6 — CI Option B implemented: model-gated tier blocking, fixture parity advisory — DONE
+- What:
+  - `.github/workflows/ci.yml` `test-macos`: model cache/fetch moved ABOVE
+    the cargo steps (fixing the ordering bug — `cargo test --workspace`
+    previously ran before models existed, so every gated suite silently
+    skipped in every CI run to date). Two new steps after the env-less
+    workspace run: a BLOCKING "Model-gated suites (device-independent)"
+    step (kiln-tokenize tokenizer+detok, kiln-models batching/calibration/
+    leak/leak_batched/preemption/prefill_pad/prefix_cache/prefix_multiturn,
+    kiln-worker rpc; `KILN_TEST_MODELS` exported, `KILN_FIXTURE_PARITY=skip`)
+    and a `continue-on-error` ADVISORY "Golden parity vs committed
+    fixtures" step (golden harness + `KILN_FIXTURE_PARITY=only` runs of
+    preemption/prefill_pad; both halves run regardless of which fails).
+    `test-macos-release` untouched per the ruling.
+  - `KILN_FIXTURE_PARITY` (unset|empty = everything, `skip` =
+    device-independent only, `only` = committed-fixture comparisons only;
+    anything else panics) added to `tests/preemption.rs` (scenario 4 is
+    the fixture side; 1–3, 5–8 the device-independent side) and
+    `tests/prefill_pad.rs` (cold-vs-fixture assert is the fixture side;
+    the cold run itself always executes as the local reference).
+  - `prefill_pad` rerun/extension now compare against the same-process
+    cold run instead of the fixture ids (assertion-equivalent when the
+    cold-vs-fixture assert holds, and the actual containment invariant —
+    valid on any GPU); the extension prompt extends with the cold run's
+    tokens for the same reason.
+- Decisions:
+  - Env-var scenario split over splitting into multiple `#[test]`s: the
+    files are single-`#[test]` by design (process-global live-object
+    counter; libtest would run sibling tests in parallel threads).
+    Unset = run everything, so the dev-machine bar is unchanged; every
+    assertion still runs by default and in exactly one CI step. No bar
+    weakened.
+  - Helper duplicated across the two test files (integration tests can't
+    share code without a common-mod file; two 15-line copies beat that
+    machinery). Cross-referenced keep-in-sync comments.
+- Deviations: none.
+- Acceptance:
+  ```
+  Local (dev machine), both split suites, all three modes:
+  $ cargo test -p kiln-models --test prefill_pad            -> ok (5.43s)
+  $ KILN_FIXTURE_PARITY=skip ... --test prefill_pad         -> ok; "cold-vs-fixture
+    compare deferred"; rerun hit 137, extension hit 128 — warm == cold exact
+  $ KILN_FIXTURE_PARITY=only ... --test prefill_pad         -> ok; "cold == committed
+    fixture, exact"; rerun/extension skipped
+  $ cargo test -p kiln-models --test preemption             -> ok (17.86s, all 8 scenarios)
+  $ KILN_FIXTURE_PARITY=skip ... --test preemption          -> ok (scenarios 1-3,5-8)
+  $ KILN_FIXTURE_PARITY=only ... --test preemption          -> ok (scenario 4 only)
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+  clean (also --no-default-features clippy, ruff check + format: clean)
+
+  CI: PR #8, run 28753659372 (commit e5b3f47) -> conclusion SUCCESS.
+  Blocking step: ALL GREEN on the clean macos-14 runner — 15 tests / 11
+  binaries: detok 2, tokenizer 4, batching 20.1s, calibration 1.2s,
+  leak 15.7s, leak_batched 104.3s, preemption 30.0s, prefill_pad 4.9s,
+  prefix_cache 10.5s (incl. the >=5x TTFT assert), prefix_multiturn
+  38.3s, rpc 2 tests 6.7s. Step ~4m21s; test-macos total 11m03s
+  (was 9m19s on main). Model cache hit (fetch skipped).
+  ```
+- FIRST CROSS-DEVICE EVIDENCE (advisory step, run 28753659372 — the
+  golden harness's first-ever CI execution): **FAILED**, exactly the
+  ADR 0002 class. Detail:
+  - gemma-2-2b-it-4bit: all 12 rounds EXACT on the paravirtual GPU
+    (6 fixtures single-stream + 6 at width 16, calibrated width 9).
+  - gemma-3-1b-it-4bit/chat-basic, single-stream: identical for the
+    first 49 generated tokens, diverges at token 50 of 64 — CI sampled
+    188797 where the fixture has 195597 (golden.rs:284). Divergence
+    position is BEYOND token 48, i.e. within the position clause of the
+    SPEC §11.2 relaxed bar; the logprob-delta clause is unmeasured (the
+    harness has no logprob instrumentation). The harness fails fast, so
+    the remaining gemma-3 fixtures and all llama/qwen2.5/qwen3 golden
+    rounds are still UNPROBED cross-device.
+  - Partial llama evidence via the `only`-mode runs, both EXACT on CI:
+    preemption scenario 4 (chat-code fixture, preempt+resume path) and
+    prefill_pad cold-vs-fixture (raw-tiny-remainder).
+  - Advisory-step red is visible only in the step log/annotation — the
+    job and run stay green (continue-on-error). Anyone assessing golden
+    status on CI must read the step log, not the run conclusion.
+  This is evidence FOR the open golden-bar device-scope ruling (the
+  DECISION NEEDED in the analysis entry above): a real single-stream
+  argmax flip from per-device Metal ulp differences, on the committed
+  fixtures, with no Kiln code change implicated (same commit is 12/12
+  exact on gemma-2 and exact on both llama probes). Resolution options
+  are ADR-level per SPEC §11.2; no test or bar was touched in response.
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
+  unchanged. The golden-bar device-scope ruling remains open, now with
+  concrete evidence. Standing items unchanged (gemma3 window-crossing
+  fixture — note the cross-device flip is also gemma-3 — rustc miscompile
+  upstream report).
