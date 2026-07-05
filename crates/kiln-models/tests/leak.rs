@@ -45,7 +45,7 @@ fn thousand_iteration_decode_returns_to_baseline() {
             .encode("Pottery is one of the oldest human inventions", true)
             .expect("encodes");
 
-        let mut sampler = Sampler::greedy();
+        let mut sampler = Sampler::greedy().expect("sampler");
         let output = generate(
             &model,
             &prompt,

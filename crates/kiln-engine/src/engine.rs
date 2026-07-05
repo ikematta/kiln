@@ -959,8 +959,28 @@ impl<M: StepModel> Engine<M> {
             stop_tokens,
             priority,
             cancel,
-            on_event,
+            mut on_event,
         } = request;
+        // Key creation is a host-side mlx allocation; a failure (never seen
+        // in practice) is the proto's in-band error. No engine resources
+        // exist for the request yet, so the summary is emitted directly.
+        let sampler = match Sampler::new(sampling) {
+            Ok(sampler) => sampler,
+            Err(err) => {
+                let _ = on_event(SeqEvent::Finished(FinishSummary {
+                    reason: FinishKind::Error,
+                    completion_tokens: 0,
+                    matched_stop_token: None,
+                    error: Some(format!("sampler key init failed: {err}")),
+                    error_cause: Some(ErrorCause::Internal),
+                    preemptions: 0,
+                    cached_prompt_tokens: 0,
+                    prefill_seconds: 0.0,
+                    decode_seconds: 0.0,
+                }));
+                return;
+            }
+        };
         let arrival = self.next_arrival;
         self.next_arrival += 1;
         let mut seq = Seq {
@@ -968,7 +988,7 @@ impl<M: StepModel> Engine<M> {
             max_tokens,
             stop_tokens,
             deterministic: sampling.deterministic(),
-            sampler: Sampler::new(sampling),
+            sampler,
             penalties,
             penalty_window,
             priority,

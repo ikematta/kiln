@@ -185,7 +185,7 @@ fn batch16_aggregate_is_3x_single_stream() {
     let gen_single = median(
         (0..ROUNDS)
             .map(|_| {
-                let mut sampler = kiln_engine::Sampler::greedy();
+                let mut sampler = kiln_engine::Sampler::greedy().expect("sampler");
                 let out = generate(
                     &model,
                     &prompt,

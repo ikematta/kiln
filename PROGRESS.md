@@ -2461,3 +2461,110 @@
 - Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order);
   standing items: gemma3 window-crossing (ring-order gather + fixture),
   release-mode sampler crash (separate session).
+
+## [2026-07-05] Phase 6 — release-mode sampler SIGBUS root-caused + fixed (pre-Task-3 blocker) — DONE
+- Scope: the crash flagged in the Task 2 entry
+  (`cargo test -p kiln-engine --test sampler --release`: SIGBUS/SIGSEGV,
+  release-only, reproduced on clean pre-gemma HEAD). PM-directed:
+  backtrace-first diagnosis, soundness verdict on kiln-mlx, fix,
+  release-exercised regression coverage, close the CI debug-only blind
+  spot. (A chip session was independently started on this bug; this
+  session's fix is the authoritative one — the two will conflict if both
+  land.)
+- Diagnosis (evidence chain, no guessing):
+  1. lldb: fault inside MLX `ArrayDesc::~ArrayDesc` — an atomic refcount
+     op through a garbage control-block pointer. Downstream symptom, not
+     the source (unwinder could not walk further).
+  2. Guard Malloc (`libgmalloc`) moved the FIRST fault to
+     `mlx::core::random::split` reading the key array's descriptor: the
+     key handle's C++ object was freed memory. Use-after-free, not
+     misalignment.
+  3. Section bisect (temporary markers): sampler A finishes its 16
+     seeded draws; the crash is sampler B's FIRST draw. Reduced to a
+     ~30-line kiln-mlx-only reproducer: struct-held `Option<Array>` key
+     chain, sampler passed BY VALUE into a closure, two samplers drawn
+     back to back. kiln-engine exonerated.
+  4. Env-gated Drop logging under gmalloc (no address reuse there): the
+     fatal split consumed exactly the box freed by sampler A's own —
+     correct — drop. Sampler B, freshly constructed with `key: None`,
+     `take()`-returned `Some(<A's dangling key>)`.
+  5. lldb at the closure's two entries: call 1 argument slot =
+     `{0, 0}` (proper None); call 2, SAME slot = `{1, <dangling>}` —
+     the second by-value temporary was never re-initialized.
+  6. `--emit=mir` (stable): `KeyOnly { key: None }` is built ONCE
+     (`_22`/`_21`); call 1 receives `copy _21`, call 2 `move _21`.
+     rustc's MIR GVN merged the two identical constant argument
+     temporaries; under the indirect by-value ABI the callee mutates and
+     drops IN the caller's slot, so call 1 tears the memory that call
+     2's `move` then reads.
+- **Verdict (the soundness call, per instruction): NOT a Kiln soundness
+  hole and NOT a latent flaw an existing SAFETY comment failed to cover.**
+  Every corrupted state transition (`Option::take`, `Some(next)`
+  assignment, drop) is safe Rust; every FFI call received pointers valid
+  at call time (kiln-mlx handle ownership re-reviewed against mlx-c's
+  vendored `mlx_array_new_/set_/free_` — holds). This is a **rustc
+  1.96.1 (aarch64-apple-darwin) miscompilation**, reproducible at every
+  opt-level >= 1 and absent at opt-0 — which is exactly why the
+  debug-only CI lane never saw it. Trigger shape: a
+  constant-constructible aggregate with drop glue and no niche
+  (`Option<Array>` behind a raw-pointer handle) passed by value twice
+  from one frame.
+- Fix (workaround in Kiln; the compiler bug itself is upstream):
+  1. **`Sampler.key` is now eager** — `key: Array` created from the seed
+     at construction (`Sampler::new`/`greedy` return `Result`); the
+     opaque FFI call makes the constructed value unprovable-identical
+     (GVN cannot merge) and deletes the stale-discriminant layout
+     entirely. Sampling behavior is bit-identical: the first draw still
+     splits `key(seed)` exactly as before (same-seed/different-seed
+     tests pin it; full determinism suite green).
+  2. `Engine::submit`: sampler construction failure emits the proto's
+     in-band `Finished{error}` pre-admission (no engine resources exist
+     yet).
+  3. Exposure survey: `Sampler` was the workspace's only
+     constant-constructible by-value-passable `Option<Array>` aggregate
+     (kv_cache/Linear-bias/Block-norms/TrunkOptions are load-time or
+     heap state, never constant argument temps). Production `submit`
+     builds samplers from runtime options (not GVN-mergeable), so
+     serving output was almost certainly unaffected — the landmine was
+     test-shaped today, refactor-shaped tomorrow; it is gone either way.
+  4. ADR 0003's release-measured throughput figures stand: the engine
+     bench paths never construct constant sampler temporaries, and the
+     entire workspace suite now passes in release, including golden
+     parity (a stronger statement than was ever true before).
+- Regression coverage (release-only failure => release-exercised test):
+  `same_seed_same_tokens` IS the trigger shape and crashed in release
+  before the fix; it now carries a REGRESSION SHAPE doc contract (keep
+  the constant options + by-value closure structure) and runs under the
+  new CI release lane, where it fails on any reintroduction of a
+  constant-constructible sampler on an affected toolchain.
+- CI blind spot closed: new `test-macos-release` job runs the full
+  `cargo test --workspace --release` on Apple Silicon (job comment
+  records why: optimized builds are what ship and what every ADR 0003
+  benchmark measured).
+- Upstream: minimal-repro recipe + MIR evidence recorded here for a
+  rust-lang/rust report; a kiln-free minimization needs care (naive
+  reductions were defeated by niche layouts and IPSCCP — the reproducer
+  needs a no-niche Drop aggregate, opaque callees, and constant
+  construction). Standing item: file upstream + re-test the workaround at
+  every toolchain bump.
+- Deviations: none. All scratch diagnostics (two scratch test files;
+  temporary eprintlns in random.rs/array.rs/sampler.rs; the Drop
+  backtrace hook) removed — the committed diff is the fix, the test
+  updates, and the CI lane only.
+- Acceptance (real outputs, trimmed):
+  ```
+  $ cargo test -p kiln-engine --test sampler --release   (was: SIGBUS 100%)
+  test sampler_behavior ... ok        (x3 consecutive runs + debug run ok)
+  $ cargo test --workspace --no-fail-fast                (debug, CI shape)
+  zero "failures:" / "test result: FAILED" across all targets; exit 0
+  $ cargo test --workspace --release --no-fail-fast      (NEW bar)
+  zero failures; exit 0 — golden parity, leak gates, engine suites all
+  green in release for the first time
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+  clean (also --no-default-features clippy + build: clean)
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+  $ KILN_TEST_MODELS=... pytest python/kiln_worker_py/tests -> 28 passed
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order).
+  Standing items: gemma3 window-crossing (ring-order gather + fixture),
+  rustc miscompile upstream report.

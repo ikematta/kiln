@@ -24,6 +24,10 @@ fn logprobs(scores: &[f32], s: &Stream) -> Array {
     ops::subtract(&raw, &lse, s).unwrap()
 }
 
+fn new_sampler(options: SamplingOptions) -> Sampler {
+    Sampler::new(options).expect("sampler key init")
+}
+
 #[test]
 fn sampler_behavior() {
     let baseline = debug::live_objects();
@@ -43,6 +47,7 @@ fn sampler_behavior() {
 fn greedy_is_argmax(s: &Stream) {
     let lp = logprobs(&[0.1, 2.5, -1.0, 2.4], s);
     let token = Sampler::greedy()
+        .expect("sampler")
         .sample(&lp, s)
         .unwrap()
         .item_u32()
@@ -53,7 +58,7 @@ fn greedy_is_argmax(s: &Stream) {
 fn top_k_one_is_greedy(s: &Stream) {
     let lp = logprobs(&[-3.0, 1.0, 4.0, 2.0, -1.0], s);
     for seed in 0..8 {
-        let mut sampler = Sampler::new(SamplingOptions {
+        let mut sampler = new_sampler(SamplingOptions {
             temperature: 5.0, // deliberately hot: only the filter saves us
             top_k: 1,
             seed,
@@ -67,7 +72,7 @@ fn tight_top_p_is_greedy(s: &Stream) {
     // Top token holds ~88% of the mass; top_p=0.5 keeps only it.
     let lp = logprobs(&[0.0, 3.0, 0.5, 0.2], s);
     for seed in 0..8 {
-        let mut sampler = Sampler::new(SamplingOptions {
+        let mut sampler = new_sampler(SamplingOptions {
             temperature: 5.0,
             top_p: 0.5,
             seed,
@@ -81,7 +86,7 @@ fn min_p_one_is_greedy(s: &Stream) {
     // min_p = 1.0 keeps only tokens at least as probable as the max.
     let lp = logprobs(&[1.0, 2.0, 0.0, 1.9], s);
     for seed in 0..8 {
-        let mut sampler = Sampler::new(SamplingOptions {
+        let mut sampler = new_sampler(SamplingOptions {
             temperature: 5.0,
             min_p: 1.0,
             seed,
@@ -91,6 +96,15 @@ fn min_p_one_is_greedy(s: &Stream) {
     }
 }
 
+/// REGRESSION SHAPE — keep the structure of this section exactly: two
+/// samplers built from the same constant options, each passed BY VALUE
+/// into the same closure, drawn back to back. With the pre-2026-07-05
+/// lazy `key: Option<Array>` field, rustc 1.96's MIR GVN merged the two
+/// by-value argument temporaries and the second draw inherited the first
+/// sampler's freed key — SIGSEGV/SIGBUS in release builds only (see the
+/// `Sampler` docs and PROGRESS 2026-07-05). The eager-key Sampler passes;
+/// this section (run under the CI release lane) is the canary against
+/// reintroducing a constant-constructible sampler.
 fn same_seed_same_tokens(s: &Stream) {
     let lp = logprobs(&[1.0, 1.1, 0.9, 1.05, 0.8, 1.2], s);
     let opts = SamplingOptions {
@@ -104,8 +118,8 @@ fn same_seed_same_tokens(s: &Stream) {
             .map(|_| sampler.sample(&lp, s).unwrap().item_u32().unwrap())
             .collect()
     };
-    let a = draw(Sampler::new(opts));
-    let b = draw(Sampler::new(opts));
+    let a = draw(new_sampler(opts));
+    let b = draw(new_sampler(opts));
     assert_eq!(a, b, "same seed must reproduce the same token stream");
     // The key chain advances between draws: not all 16 draws identical.
     assert!(
@@ -117,7 +131,7 @@ fn same_seed_same_tokens(s: &Stream) {
 fn different_seeds_eventually_differ(s: &Stream) {
     let lp = logprobs(&[1.0, 1.1, 0.9, 1.05, 0.8, 1.2], s);
     let draw = |seed: u64| -> Vec<u32> {
-        let mut sampler = Sampler::new(SamplingOptions {
+        let mut sampler = new_sampler(SamplingOptions {
             temperature: 1.5,
             seed,
             ..SamplingOptions::default()

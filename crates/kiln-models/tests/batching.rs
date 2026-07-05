@@ -182,7 +182,7 @@ fn batched_greedy_matches_single_stream() {
         // 1) Engine (paged, batch of 1) == Phase-3 contiguous path, with
         //    the production chunk size.
         let reference = |prompt: &[u32], max_tokens: usize| -> Vec<u32> {
-            let mut sampler = kiln_engine::Sampler::greedy();
+            let mut sampler = kiln_engine::Sampler::greedy().expect("sampler");
             generate(
                 &model,
                 prompt,
