@@ -1665,3 +1665,266 @@
 - Deviations: none.
 - Next: PM phase gate on Phase 5 (SPEC §13.4), then Phase 6 — Qwen +
   Gemma models, quantization matrix, worker="auto" routing (SPEC §12).
+
+## [2026-07-04] Phase 6 / Task 1 — Qwen2.5 + Qwen3 (fixtures first) — BLOCKED
+- What:
+  1. ADR 0001 B1 alignment re-verified before generating fixtures: worker
+     venv reports mlx.core 0.31.1 / mlx-lm 0.31.2 (gen-golden.py's hard
+     refusal also passed). Reference stack unchanged.
+  2. New pinned test model (no qwen2-arch model existed in the pinned set;
+     the acceptance matrix requires one): `qwen2.5-0.5b-4bit` =
+     mlx-community/Qwen2.5-0.5B-Instruct-4bit @ a5339a4131f1, appended to
+     fetch-test-model.sh. Existing pins untouched.
+  3. Fixtures first: tests/golden/qwen3-0.6b-4bit/ and
+     tests/golden/qwen2.5-0.5b-4bit/ (5 cases each, standard case list).
+  4. Implementation (all in working tree, uncommitted — see DECISION):
+     - `qwen2.rs`/`qwen3.rs`: op-for-op ports of mlx_lm.models.qwen2/qwen3.
+     - `config.rs`: Qwen2Config/Qwen3Config (field-for-field mlx-lm
+       defaults; qwen2 has no head_dim override, rope_theta 1e6 default),
+       `RopeScaling::Yarn`, `ArchConfig` model_type dispatch (this is the
+       `worker="auto"` predicate for task 4), SUPPORTED_ARCHITECTURES.
+     - Shared trunk: llama's Attention/Block/forward paths consolidated
+       into crate-private `nn::CausalLm`, parameterized by GQA geometry +
+       optional qwen3 qk-norm (RMSNorm slotted between the [B,L,H,D]
+       reshape and the head transpose, exactly the reference op order).
+       llama.rs/qwen2.rs/qwen3.rs are now thin config+loader modules; the
+       (green) llama golden suite pins the refactor bit-for-bit.
+     - Yarn RoPE: host f64 correction-range/mscale + f32 MLX graph
+       mirroring YarnRoPE; unit test asserts freqs + mscale bit-identical
+       to reference-generated constants (Qwen3 long-context recipe;
+       `nn::tests::yarn_freqs_match_reference_bit_for_bit`). `ops::clip`
+       added to kiln-mlx.
+     - `AnyModel` enum + worker loads it; golden harness generalized to
+       every tests/golden/<model>/ dir (missing local model now fails
+       loudly instead of skipping).
+- Result: single-stream parity is EXACT for all three architectures, but
+  the golden gate is red, and the cause is fully diagnosed as MLX kernel
+  dispatch at the pin — not model math:
+  - Gate state @ shipped engine defaults: llama 5/5 exact (both rounds);
+    qwen2.5 4/5 — raw-long-prefill (261 tok) diverges at generated token
+    10; qwen3 unreached (same 261-token fixture shape ⇒ same exposure).
+  - Prefill bisect (engine config only, same weights/prompt):
+    fine=off (single 260-tok tail = mlx-lm's shape) → exact;
+    fine=65 / fine=130 (uniform pieces) → exact;
+    fine=64 / 128 / 256 (ragged 4-token final piece) → diverges @10.
+    Prefix cache on/off: irrelevant.
+  - Root cause (vendored MLX v0.31.1,
+    mlx/backend/metal/quantized.cpp `get_qmv_batch_limit`): quantized
+    matmul dispatches a vector kernel below an M threshold that varies by
+    shape and GPU generation (6..32 per the table; measured here: ~18 for
+    K,N ≤ 2048, ~10-12 for the mlp/lm_head shapes). Row-bit probe over
+    real weights (all three models, every projection + tied lm_head):
+    rows are bit-identical WITHIN a kernel class (M=2..16 == M=1 small
+    shapes; M=24..260 mutually identical) and differ ACROSS the boundary
+    — every arch, every projection. mx.fast SDPA has the same two-class
+    structure: q-len 4 vs 260 differs; q-len 32 vs 260 bit-identical.
+  - Consequence 1 (fine-tail schedule, latent since Phase 5, arch-
+    independent): a ragged final piece of size limit%128 below the
+    threshold computes those positions' KV in the vector-kernel class
+    while the mlx-lm reference (monolithic ≤2048 tail) is in the matrix
+    class. Llama's fixtures pass only by remainder luck (5/46/120 — 5 is
+    vector-class on BOTH sides). A synthetic llama rem=3 prompt shows
+    bit-different KV (probe) though its 64 greedy tokens happened to
+    survive (margins).
+  - Consequence 2 (batched decode): trunk M = step token count, so widths
+    ≥ ~12 put mlp/lm_head matmuls in the matrix class vs the M=1
+    reference — logit ulp noise for EVERY arch. Llama's width-16 golden
+    rounds pass on argmax margins (its lm_head rows provably differ at
+    M=16); qwen fixtures flip: chat-basic diverges at token 28 (qwen3) /
+    33 (qwen2.5) at width 16. Bit-level "batching must not change greedy
+    outputs" is not achievable under this kernel pin for any arch; token
+    level it is fixture/margin/hardware dependent (CI's M1 has different
+    thresholds than this machine).
+- Decisions (within latitude): new pin appended, none bumped; trunk
+  consolidation into nn::CausalLm (llama golden green pins it); attention
+  scale computed in f64 then narrowed (matches Python; value identical
+  for every pinned model).
+- Deviations:
+  - fetch-test-model.sh gained a NEW pinned model (revisions themselves
+    frozen; adding was unavoidable for qwen2 coverage) — flagging.
+  - Golden harness: fixture-dir-without-local-model is now a failure, not
+    a skip (fetch script and fixtures must not drift).
+- Acceptance (real outputs, trimmed):
+  ```
+  $ uv run --project python/kiln_worker_py python -c "import mlx.core..."
+  mlx.core 0.31.1 / mlx_lm 0.31.2                       (B1 holds)
+  $ cargo test -p kiln-models --lib
+  11 passed (incl. yarn_freqs_match_reference_bit_for_bit)
+  $ cargo test -p kiln-models --test golden -- --nocapture   (THE GATE)
+  llama-3.2-1b-4bit: 5/5 exact + 5/5 exact at width 16
+  qwen2.5-0.5b-4bit: chat-basic/chat-code/chat-multibyte/raw-continuation
+    exact; raw-long-prefill FAILED (first divergence token 10)
+  -> test result: FAILED
+  single-stream cross-check, fine=off engine: 15/15 fixtures exact
+    (llama, qwen2.5, qwen3 — all five each)
+  width-16 probe (fine=off): qwen3 chat-basic diverges @28,
+    qwen2.5 chat-basic @33; llama all exact
+  $ cargo test --workspace --no-fail-fast -> 33/34 targets ok; only the
+    golden gate fails (batching, preemption, both leak gates, prefix
+    suites, worker rpc all green under the AnyModel/nn refactor)
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+  $ uv run --project python/kiln_worker_py pytest ... -> 28 passed
+  $ cargo fmt --check / clippy --all-targets (both CI shapes) -> clean
+  $ cargo build --workspace --no-default-features -> clean
+  ```
+- DECISION NEEDED: two coupled calls; neither is covered by SPEC §11.2 as
+  written (its relaxed bar — first divergence past token 48, logprob
+  delta < 1e-3, per-model ADR — does not admit these: width-16 divergence
+  starts at token 28). Per CLAUDE.md I am not weakening the test, not
+  changing the PM-approved F=128 default, and not committing a red gate.
+  A) Batched-decode parity bar:
+     A1. Redefine the width-16 golden rounds as the token-level canary
+         they empirically are; bit-exact bar applies to single-stream
+         only. Requires ADR + SPEC amendment naming qwen2/qwen3 (and
+         acknowledging llama passes on margins). Define a batched
+         tolerance/canary policy for qwen serving.
+     A2. Keep the bit-exact bar; rust worker serves qwen single-stream
+         parity-proven but batched-unproven — i.e. defer qwen enablement
+         until the quarterly mlx-c bump (note: dispatch-by-M is a perf
+         feature of MLX; a bump may not change this).
+     A3. Force one kernel class in the trunk (pad every decode step to
+         ≥ 32 rows / per-row lm_head): rejected on analysis — it makes
+         single-stream diverge from the M=1 reference instead, and/or
+         burns large bandwidth.
+     My read: A1 is the only workable shape; the tolerance definition is
+     yours.
+  B) Fine-tail ragged piece (single-stream, all archs):
+     B1. Pad sub-32-row ragged tail pieces to 32 rows (trunk matmuls) and
+         32 q-rows (SDPA) when the piece does not start on a 2048
+         boundary. Probes show both kernel families are row-stable and
+         reference-identical at ≥ 32 rows. Keeps F=128, all Option B
+         boundaries, warm==cold, and donation semantics intact (ragged
+         pieces are never donated). Est. ~100-150 lines (engine schedule,
+         StepBatch, CausalLm); needs a golden re-gate + a deliberate
+         tiny-remainder fixture.
+     B2. Stopgap: revert default to the single-tail-chunk schedule
+         (fine=off) — restores universal single-stream parity today,
+         forfeits Phase 5 multi-turn reuse below 2048.
+     My read: B1.
+  Nothing committed; the full change set sits in the working tree
+  (7 modified, 4 new source files, 2 new fixture dirs) for review.
+- Next: on the A/B rulings — finish Task 1 acceptance, then Gemma2/3,
+  the 8-bit/BF16 matrix, worker="auto" routing, /v1/completions
+  (Phase 6 SPEC §12 order).
+
+## [2026-07-04] Phase 6 / Task 1 (continued) — ADR 0002 + B1 padding — PARTIAL
+- What (implements the PM's A1/B1 rulings on the previous entry):
+  1. **ADR 0002** (docs/decisions/0002-parity-bars-under-mlx-kernel-dispatch.md):
+     MLX v0.31.1 dispatches distinct quantized-matmul kernels (qmv/qmm)
+     and a two-class SDPA path on M, bit-different but numerically close
+     across the threshold — a library/hardware characteristic, not a Kiln
+     defect. Bars: single-stream vs mlx-lm strictly bit-exact, no
+     exceptions; batched (M>1) parity = token-id equality with the
+     single-stream reference; revisit at every mlx-c/core-MLX bump per the
+     ADR 0001 quarterly process.
+  2. **Width-16 framing corrected** (golden.rs, batching.rs docs +
+     assertion messages). Correction to a previously overstated guarantee,
+     recorded per instruction: the Phase 4/5 "bit-exact at width 16 /
+     bit-identical under concurrency" wording was wrong as stated — those
+     tests always asserted token-id equality, and the logits at width 16
+     already differed from M=1 in ulps (lm_head/mlp cross their dispatch
+     threshold near M~10-12); the passes were argmax margin. **No
+     assertion was weakened**: every existing width-16/concurrency
+     assertion already compared token ids; only comments/docs claimed
+     more than was verified.
+  3. **B1** — ragged prefill tail pieces shorter than
+     `PREFILL_PAD_MIN_ROWS` (32 = max qmv threshold across the GPU
+     dispatch table, above the SDPA vector bound) and off the super-chunk
+     grid now run with kernel-class pad rows:
+     - kiln-engine: `StepBatch::pad_rows` + the rule at prefill
+       scheduling (pad capped at the piece offset so the SDPA query never
+       exceeds KV coverage); pieces starting ON a 2048 boundary are the
+       reference's own shape and are never padded.
+     - kiln-models: `CausalLm`/`Attention` honor pads on the paged AND
+       contiguous paths — pad rows ride the trunk matmuls, front-pad the
+       SDPA query (causal mask is bottom-right aligned, so real rows keep
+       their exact spans), are refilled as zero lanes for o_proj, are
+       never written to KV, and are never sampled. generate.rs's prefill
+       applies the same rule, keeping engine == contiguous by
+       construction (batching.rs now pins that with a deliberately ragged
+       prompt).
+     - Hazard tests (pipeline-discard analogy, per instruction):
+       kiln-engine/tests/prefill_pad.rs — checksum-mock contract: pads
+       flagged exactly per rule and only on lone prefill pieces; step
+       input ids and every K/V write run cover REAL rows only; never
+       sampled/emitted; containment rerun and extension resume warm==cold
+       with re-padded canonical shapes. kiln-models/tests/prefill_pad.rs —
+       real weights: bit-exact vs fixture THROUGH a padded piece,
+       containment rerun (hit 137) and extension resume (hit 128) exact.
+  4. **New llama fixture** `raw-tiny-remainder` (138 prompt tokens →
+     9-row ragged piece, below every dispatch threshold on every listed
+     GPU class): generated via scripts/gen-golden.py on the B1-verified
+     stack (mlx.core 0.31.1 / mlx-lm 0.31.2); the 5 existing llama
+     fixtures regenerated byte-identical in the same run (cmp-verified) —
+     no reference drift. Case added to gen-golden.py CASES with a sizing
+     note. This is what gives B1 committed CI coverage.
+- Result against the corrected bars:
+  - **Single-stream: 16/16 fixtures bit-exact** — llama 6 (incl. the new
+    tiny-remainder), qwen2.5 5, qwen3 5; the two 261-token qwen fixtures
+    that diverged at generated token 10 before B1 are now exact.
+  - **Width 16: llama 6/6 token-exact. qwen 6/10** — 4 flips, all decode-
+    side (trunk M=16 crosses the mlp/lm_head qmv/qmm threshold; knife-
+    edge argmax positions flip; B1 is prefill-only and cannot help):
+    ```
+    qwen2.5/chat-basic        div @33, EOS @28 -> post-EOS only (the
+                              entire user-visible answer is identical)
+    qwen2.5/raw-long-prefill  div @10  (pre-EOS)
+    qwen3/chat-basic          div @28  (pre-EOS, think-mode text)
+    qwen3/chat-code           div @42  (pre-EOS, think-mode text)
+    ```
+  - warm==cold under B1: prefix_cache + prefix_multiturn green; both pad
+    tests assert warm==cold through padded pieces explicitly.
+- Acceptance (real outputs, trimmed):
+  ```
+  $ cargo test -p kiln-models --test golden -- --nocapture  (commit shape)
+  llama-3.2-1b-4bit: 6 fixtures — exact match (batched/paged engine) x6,
+  token-id match at decode width 16 x6 -> ok
+  $ cargo test -p kiln-models --test golden  (with local qwen fixture dirs)
+  qwen2.5: 5/5 exact single-stream; FAILS at width-16 chat-basic per the
+  ADR 0002 token-equality bar (matrix above; qwen3 same pattern)
+  $ cargo test -p kiln-engine --test prefill_pad -> ok (pad contract)
+  $ cargo test -p kiln-models --test prefill_pad -> ok
+    "padded piece: cold == fixture, rerun hit 137, extension hit 128"
+  $ cargo test -p kiln-models --test batching -- --nocapture
+    "solo engine == contiguous path for 5 jobs" (incl. padded ragged job)
+  $ cargo test --workspace --no-fail-fast -> 35/36 targets ok (36th =
+    golden with the held qwen fixtures present locally)
+  $ cargo fmt --check / clippy --all-targets (both CI shapes) -> clean
+  $ cargo build --workspace --no-default-features -> clean
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+  $ pytest python/kiln_worker_py/tests -> 28 passed ; ruff -> clean
+  ```
+- Decisions: new fixture case via the sanctioned generator with existing
+  fixtures byte-verified untouched; PREFILL_PAD_MIN_ROWS=32 rationale in
+  the ADR and const docs.
+- Deviations: none.
+- Committed: kiln-mlx clip; ADR 0002 + engine pad plumbing + contract
+  test; qwen2/qwen3 models over shared CausalLm; worker AnyModel dispatch;
+  golden/batching reframing + tiny-remainder coverage; this entry. HELD
+  uncommitted pending the residual ruling below: tests/golden/qwen*/
+  fixture dirs and the fetch-test-model.sh qwen2.5 pin — committing them
+  turns the width-16 golden rounds red on main (4/10 qwen flips).
+- DECISION NEEDED (residual, narrow): the ADR 0002 batched bar (token-id
+  equality at width 16) measurably does not hold for qwen2/qwen3 at this
+  kernel pin, while llama holds on all fixtures. The instruction's
+  "full golden parity ... at width-16" is therefore not satisfiable for
+  qwen by any correct implementation at this pin. Options:
+  A) Per-arch batched enablement, encoded in the harness: land the qwen
+     fixtures; width-16 rounds assert token equality for batched-enabled
+     archs (llama) and assert the RECORDED nonconforming status for
+     qwen2/qwen3 (strict xfail: a kernel bump that fixes dispatch flips
+     the round to "must promote"). worker="auto" (Task 4) then gains a
+     principled input: qwen routes to rust for single-stream-safe use
+     only after the PM enables it, or to python. My read: this matches
+     ADR 0002's "batched-decode enablement per architecture is gated on
+     the width-16 golden rounds" — but it encodes an allowed failure, so
+     it needs your explicit approval.
+  B) Redefine the batched bar as token equality through the first EOS:
+     rescues only qwen2.5/chat-basic (1 of 4); qwen3's think-mode flips
+     are pre-EOS. Not recommended.
+  C) Cap qwen decode width below the smallest dispatch threshold
+     (12 here, 6 on some GPU classes): restores bit-equality wholesale
+     but forfeits the batch-16 throughput target for qwen. Not
+     recommended as a default.
+- Next: residual ruling (A/B/C) -> land held fixtures + per-arch gating,
+  close Task 1, then Task 2 (Gemma2/3, fixtures first).
