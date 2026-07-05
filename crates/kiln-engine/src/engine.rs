@@ -83,8 +83,10 @@ pub const DEFAULT_NUM_BLOCKS: usize = 512;
 
 /// Fine grid of the canonical prefill schedule's final super-chunk
 /// (PROGRESS 2026-07-04 Option B): default for
-/// `EngineConfig::prefill_fine_chunk`.
-pub const DEFAULT_PREFILL_FINE_CHUNK: usize = 64;
+/// `EngineConfig::prefill_fine_chunk`. 128 per the step-4 tuning curve:
+/// +2.9% miss-path TTFT at the worst-case prompt size (vs +13.9% at 64)
+/// while warm-turn recompute grows by at most 64 extra tokens.
+pub const DEFAULT_PREFILL_FINE_CHUNK: usize = 128;
 
 /// Canonical prefill schedule (SPEC §6.2 + Phase 5 Option B, PROGRESS
 /// 2026-07-04): positions `0..limit` are prefilled in bulk chunks of
@@ -147,8 +149,8 @@ pub struct EngineConfig {
     pub max_batch_tokens: usize,
     pub prefill_chunk: usize,
     /// Fine grid of the final partial super-chunk (see
-    /// [`canonical_prefill_len`]); values `>= prefill_chunk` restore the
-    /// single-tail-chunk schedule.
+    /// [`canonical_prefill_len`], default 128); values `>= prefill_chunk`
+    /// restore the single-tail-chunk schedule.
     pub prefill_fine_chunk: usize,
     /// Radix prefix cache (SPEC §6.3); on by default.
     pub prefix_cache: bool,

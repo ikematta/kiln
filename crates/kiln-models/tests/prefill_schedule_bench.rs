@@ -106,12 +106,15 @@ fn fine_tail_schedule_miss_path_cost() {
     ids.truncate(2048);
     assert_eq!(ids.len(), 2048);
 
-    eprintln!("prompt | tail fwds | fine=64 TTFT | old sched TTFT | delta");
+    let default_fine = kiln_engine::DEFAULT_PREFILL_FINE_CHUNK;
+    eprintln!("prompt | tail fwds | default F={default_fine} TTFT | old sched TTFT | delta");
     for &prompt_len in &[257_usize, 512, 1024, 2048] {
         let prompt = &ids[..prompt_len];
         // Warm-up (kernel caches, pool allocation) once per size.
-        cold_ttft(&model, prompt, 64);
-        let fine: Vec<f64> = (0..RUNS).map(|_| cold_ttft(&model, prompt, 64)).collect();
+        cold_ttft(&model, prompt, default_fine);
+        let fine: Vec<f64> = (0..RUNS)
+            .map(|_| cold_ttft(&model, prompt, default_fine))
+            .collect();
         let old: Vec<f64> = (0..RUNS)
             .map(|_| cold_ttft(&model, prompt, usize::MAX))
             .collect();
@@ -119,8 +122,8 @@ fn fine_tail_schedule_miss_path_cost() {
         let limit = prompt_len - 1;
         let tail = limit - limit / 2048 * 2048;
         eprintln!(
-            "{prompt_len:>6} | {:>9} | {fine_ms:>9.1}ms | {old_ms:>11.1}ms | {:>+7.1}ms ({:+.1}%)",
-            tail.div_ceil(64),
+            "{prompt_len:>6} | {:>9} | {fine_ms:>13.1}ms | {old_ms:>11.1}ms | {:>+7.1}ms ({:+.1}%)",
+            tail.div_ceil(default_fine),
             fine_ms - old_ms,
             100.0 * (fine_ms - old_ms) / old_ms,
         );

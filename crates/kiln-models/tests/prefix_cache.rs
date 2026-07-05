@@ -196,15 +196,16 @@ fn prefix_cache_and_ssd_tier() {
         // sub-chunk reuse at all (recomputing it in non-canonical shapes
         // could change KV bits) — both must be bit-identical to cold runs.
         {
-            // Long enough that the settled range spans several 32-token
-            // blocks (a sub-block prompt has nothing donatable).
+            // Long enough that the settled range crosses a fine-grid
+            // (prefill_fine_chunk) boundary, so the divergent-extension
+            // case below exercises a real fine-aligned resume.
             let seed_prompt = tokenizer
                 .encode(
-                    &"The quick brown fox jumps over the lazy dog. ".repeat(8),
+                    &"The quick brown fox jumps over the lazy dog. ".repeat(16),
                     true,
                 )
                 .expect("encodes");
-            assert!(seed_prompt.len() > 80);
+            assert!(seed_prompt.len() > kiln_engine::DEFAULT_PREFILL_FINE_CHUNK + 32);
             let mut probe_engine =
                 Engine::new(&model, model.kv_dims(), config.clone(), Stream::gpu())
                     .expect("engine builds");

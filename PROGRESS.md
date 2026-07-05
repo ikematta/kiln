@@ -1613,3 +1613,55 @@
 - Next: PM phase gate on Phase 5 (SPEC §13.4) including the F-default
   choice above, then Phase 6 — Qwen + Gemma, quantization matrix,
   worker="auto" routing (SPEC §12).
+
+## [2026-07-04] Phase 5 / Option B follow-up — default fine grid 64 -> 128 — DONE
+- What: per the step-4 tuning curve and PM approval,
+  `DEFAULT_PREFILL_FINE_CHUNK` changed 64 -> 128 (one-line default; the
+  schedule machinery is untouched). Test adaptations only: the
+  prefix_cache divergent-extension scenario's seed prompt lengthened so
+  its donor overlap still crosses a fine boundary (it keys off the
+  constant), and the schedule bench's first table now measures the
+  shipped default rather than a hardcoded 64.
+- Acceptance (same gates, same order):
+  ```
+  $ cargo test -p kiln-models --test golden -- --nocapture   (THE GATE)
+  all 5 fixtures — exact match (batched/paged engine)
+  all 5 fixtures — exact match at decode width 16            (mlx#3120 rounds)
+  test result: ok. 1 passed in 22.50s
+  $ cargo test -p kiln-models --test prefix_multiturn -- --nocapture
+  turn | prompt | reused | skip%  | warm TTFT | cold TTFT
+     1 |    844 |    640 |  75.8% |   162.5ms |    560.7ms
+     2 |   1028 |    896 |  87.2% |   110.3ms |    668.3ms
+     3 |   1252 |   1024 |  81.8% |   184.0ms |    828.6ms
+     4 |   1406 |   1280 |  91.0% |   105.2ms |    916.8ms
+     5 |   1670 |   1408 |  84.3% |   206.6ms |   1055.7ms
+     6 |   1884 |   1664 |  88.3% |   170.2ms |   1190.4ms
+     7 |   2088 |      0 |   0.0% |  (super-chunk crossing, unchanged seam)
+  vs F=64: turns 3 and 6 reuse exactly 64 fewer tokens; the rest are
+  identical. Short-increment check: turn 4 (90-token increment) reused
+  1280 (91.0%) — every turn advances donor coverage by increment + 64
+  generated >= 154 > 128, so the resumable boundary advances every
+  turn; nothing stalls just short of 128. (Stalling would need
+  increment + generation < 128 in a single turn — possible with very
+  short replies, costs that turn one boundary, self-heals next turn.)
+  $ cargo test -p kiln-models --release --test prefill_schedule_bench -- --ignored
+  prompt | tail fwds | default F=128 TTFT | old sched | delta
+     257 |         2 |        164.2ms |   161.7ms |  +2.5ms (+1.5%)
+     512 |         4 |        320.2ms |   318.5ms |  +1.7ms (+0.5%)
+    1024 |         8 |        672.1ms |   639.9ms | +32.2ms (+5.0%)
+    2048 |        16 |       1401.2ms |  1371.5ms | +29.7ms (+2.2%)
+  curve re-sample @2048: F=64 +16.9% | F=128 +3.9% | F=256 +1.3%
+  -> the exploratory +2.9% figure holds as the real number within the
+  run-to-run noise band (+2.2%/+3.9% across two samplings); single-digit
+  at every prompt size, vs +14-17% at F=64.
+  $ cargo test --workspace -> 34/34 test targets ok, zero failures
+    (batching, preemption exact counts, both leak gates 0 -> 0, all
+     prefix suites, worker rpc)
+  $ cargo fmt --all --check / clippy (both shapes) -> clean
+  $ cargo build --workspace --no-default-features -> clean
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+    (incl. the greedy-reproducibility canary, both worker kinds)
+  ```
+- Deviations: none.
+- Next: PM phase gate on Phase 5 (SPEC §13.4), then Phase 6 — Qwen +
+  Gemma models, quantization matrix, worker="auto" routing (SPEC §12).
