@@ -4,6 +4,7 @@ description = "Tokenizer loading, chat templates (minijinja), incremental detoke
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 chrono.workspace = true

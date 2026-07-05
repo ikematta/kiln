@@ -4,6 +4,7 @@ description = "Gateway binary: axum HTTP server, API adapters, router, worker su
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 argon2.workspace = true

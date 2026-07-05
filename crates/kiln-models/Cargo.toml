@@ -4,6 +4,7 @@ description = "Model implementations (llama, qwen*, gemma*) and config.json pars
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
 
 [features]
 default = ["metal"]

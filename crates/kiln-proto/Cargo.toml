@@ -4,6 +4,7 @@ description = "Generated protobuf/gRPC types and shared enums for the Kiln worke
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 prost.workspace = true

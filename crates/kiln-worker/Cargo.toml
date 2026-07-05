@@ -4,6 +4,7 @@ description = "Rust worker binary: gRPC server wiring kiln-engine + kiln-models 
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
 
 [features]
 default = ["metal"]

@@ -4,5 +4,6 @@ description = "Job runner binary: Hugging Face downloads and quantization (wraps
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
 
 [dependencies]

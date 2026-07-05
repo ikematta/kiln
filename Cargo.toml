@@ -15,6 +15,11 @@ members = [
 version = "0.0.1"
 edition = "2024"
 publish = false
+# MSRV, enforced by cargo in every crate (rust-version.workspace = true).
+# Must move in lockstep with rust-toolchain.toml and the four CI toolchain
+# pins — see rust-toolchain.toml for the bump protocol and the rustc
+# 1.95/1.96 GVN miscompilation context (rust-lang/rust#158830).
+rust-version = "1.96.1"
 
 [workspace.dependencies]
 # IPC contract codegen (SPEC §5): prost/tonic runtime + build-time protoc driver.

@@ -2833,3 +2833,69 @@
   unchanged. Standing item updated: upstream report FILED (#158830);
   at every toolchain bump re-run the release suite and check #158830
   for the fix/backport landing.
+
+## [2026-07-05] Phase 6 — MSRV history audit + retroactive toolchain pin (1.96.1) — DONE
+- History audit (PM-directed; whether "MSRV 1.96.1" was ever enforced):
+  - `git log --all -- rust-toolchain.toml` (+ `rust-toolchain*` glob,
+    `--follow`): the file exists in exactly ONE commit — d726468
+    (2026-07-05, this session), which created it with `channel =
+    "stable"`. No pin was ever committed before, on any ref.
+  - Ruled out every disappearance mechanism: not reverted (nothing to
+    revert), not history-rewritten (all 7 `git fsck` unreachable
+    commits scanned — none contain the file), not stashed (no stashes),
+    not gitignored (no matching pattern ever), not sitting uncommitted
+    in the primary checkout (absent).
+  - Origin of the gap: Phase 0 entry (2026-07-02), Decisions: "MSRV
+    left unset — SPEC §14 lists it as an open pre-Phase-0 PM decision.
+    Non-blocking; flagging for review." The flag was never picked up:
+    zero MSRV mentions in PROGRESS between that line and 2026-07-05,
+    no ADR touches it, no `rust-version` in any manifest, all four CI
+    jobs floated on dtolnay/rust-toolchain@stable.
+  - **Plainly: MSRV was an unenforced assumption from Phase 0 through
+    this pin landing — ~3 days, Phases 0 through 6 — coincidentally
+    stable at 1.96.1 only because the project is young and upstream
+    stable did not move in that window, not because anything enforced
+    it.** 1.96.1 is simply the stable that was current when the Phase 0
+    session installed rustup on this machine.
+- What (the pin, now formalized in all three layers):
+  1. rust-toolchain.toml: `channel = "1.96.1"` (hard pin, replacing
+     "stable"); comment records the retroactive formalization date +
+     this entry, the rust-lang/rust#158830 context, and the lockstep
+     rule.
+  2. Cargo.toml `[workspace.package] rust-version = "1.96.1"` +
+     `rust-version.workspace = true` in all 8 crate manifests — cargo
+     itself now gates the floor (verified via `cargo metadata`: all 8
+     packages report 1.96.1). Belt-and-suspenders: rust-toolchain.toml
+     controls what rustup fetches; rust-version is what the crates
+     declare they need.
+  3. ci.yml: explicit `toolchain: 1.96.1` input on all four
+     dtolnay/rust-toolchain steps. Confirmed the action does NOT read
+     rust-toolchain.toml (toolchain comes from the action ref or the
+     `toolchain:` input); rustup's directory override would still have
+     enforced the pin on every cargo invocation once the file exists,
+     but the explicit input removes the dead-weight stable install and
+     makes the pinned version visible in the action step log.
+- Standing practice (bump protocol, same tier as ADR 0001's C1 quarterly
+  process): toolchain bumps are deliberate — (a) update the pin in all
+  three places (rust-toolchain.toml, workspace rust-version, 4 CI
+  steps), (b) re-run the full workspace suite in debug AND release
+  (test-macos-release lane), (c) check rust-lang/rust#158830 and its
+  resolution/backport status before trusting a new stable on the
+  GVN-affected shape.
+- Deviations: none.
+- Acceptance (local, real output trimmed; CI matrix run + 1.96.1
+  visibility verified on this branch's PR — run ids and confirmation in
+  the PR thread, per the PR #7 precedent):
+  ```
+  $ rustup show active-toolchain        (in repo, after pin)
+  1.96.1-aarch64-apple-darwin (overridden by '.../rust-toolchain.toml')
+  $ cargo metadata --no-deps | ... rust_version
+  all 8 kiln crates -> 1.96.1
+  $ cargo fmt --all --check -> clean
+  $ cargo build --workspace --no-default-features -> Finished dev 21.70s
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean
+  $ uv run ... ruff check python/ tests/e2e -> All checks passed!
+  $ uv run ... ruff format --check python/ tests/e2e -> 16 files already formatted
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
+  unchanged.
