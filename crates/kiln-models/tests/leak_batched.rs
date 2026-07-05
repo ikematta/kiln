@@ -112,9 +112,13 @@ fn thousand_iteration_batched_engine_returns_to_baseline() {
         // Pool 42 blocks: a 16-request wave (14 short + 2 long) peaks at
         // ~54 blocks, so the youngest requests are preempted and resumed
         // every wave; chunk 48 keeps the long prompts multi-chunk.
+        let det_width = model
+            .calibrate_deterministic_width(&stream)
+            .expect("calibrates");
         let config = EngineConfig {
             num_blocks: 42,
             prefill_chunk: 48,
+            deterministic_decode_width: det_width,
             ..EngineConfig::default()
         };
         let mut engine =

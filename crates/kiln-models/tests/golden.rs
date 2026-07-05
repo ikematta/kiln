@@ -6,19 +6,20 @@
 //! Since Phase 4 the fixtures run through the continuous-batching engine
 //! (paged KV + gather-based paged attention, SPEC §6.2/§7.4 v0) — the
 //! production decode path — with the production chunk size (2048, matching
-//! mlx-lm's `prefill_step_size`). Each model runs twice, against the two
-//! ADR 0002 bars:
-//! - request by request (single-stream): **bit-exact** — the M=1 decode and
-//!   the (pad-aligned, ADR 0002) prefill build reference-class kernels, so
-//!   any token difference is a model bug;
-//! - with the decode batch pinned at width 16: **token-id equality** with
-//!   the same reference. At width 16 the trunk matmuls cross MLX's
-//!   qmv/qmm dispatch threshold, so the logits differ from single-stream
-//!   in ulps by library design — a pass here means greedy argmax absorbed
-//!   that noise on every fixture token (the SPEC §6.6/§11.3 invariant:
-//!   batching must not change greedy *output*), not that the math is
-//!   bit-identical. `tests/batching.rs` separately pins engine == Phase-3
-//!   contiguous path.
+//! mlx-lm's `prefill_step_size`). Each model runs twice, and under
+//! ADR 0002 B' BOTH rounds are bit-exact bars:
+//! - request by request (single-stream): M=1 decode plus the pad-aligned
+//!   prefill build reference-class kernels, so any token difference is a
+//!   model bug;
+//! - with the decode batch pinned at width 16: the fixtures are greedy —
+//!   deterministic traffic — so the engine sub-batches their decode rows
+//!   below the device-calibrated kernel-dispatch threshold
+//!   (`calibrate_deterministic_width`), making every row bit-identical to
+//!   single-stream BY CONSTRUCTION at any width (the SPEC §6.6/§11.3
+//!   invariant, no longer argmax-margin luck). `tests/batching.rs`
+//!   separately pins engine == Phase-3 contiguous path, and the
+//!   kiln-engine `deterministic_partition` test pins the sub-batching
+//!   contract itself.
 //!
 //! Fixture semantics (mirrored from `scripts/gen-golden.py` — keep in sync):
 //! - `chat_template: true`  -> render the model's template for one user
@@ -133,10 +134,12 @@ fn engine_generate(
 /// Safety bound for the batch-16 rounds (~200 steps expected each).
 const MAX_STEPS: usize = 4000;
 
-/// Runs one fixture request with its decode batch pinned at width 16 (the
-/// Phase-4 / mlx#3120 checkpoint: trunk-matmul kernel dispatch depends on
-/// M, so bit-parity at M=1 does not extend to M=16 — the assertion this
-/// feeds is the ADR 0002 token-id bar, not a bit bar).
+/// Runs one fixture request with its decode batch pinned at width 16.
+/// Under ADR 0002 B' the greedy rows sub-batch below the calibrated
+/// dispatch threshold, so this round is bit-exact by construction — it
+/// exists to prove that under real 16-wide admission (fillers, block
+/// recycling, staggered prefill) the deterministic path still reproduces
+/// the single-stream reference exactly.
 ///
 /// 15 filler requests are submitted (and, being FIFO, admitted) first and
 /// sized to outlive the fixture, so every sampled position of the fixture
@@ -213,8 +216,13 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
     let model = AnyModel::load(model_dir, &stream).expect("model loads");
     let tokenizer = Tokenizer::from_model_dir(model_dir).expect("tokenizer loads");
     let template = ChatTemplate::from_model_dir(model_dir).expect("template loads");
+    // Production posture (ADR 0002 B'): the worker calibrates the
+    // deterministic width at load; the harness does the same.
+    let det_width = model
+        .calibrate_deterministic_width(&stream)
+        .expect("calibrates");
     eprintln!(
-        "== {model_name}: model_type={}, {} fixture(s)",
+        "== {model_name}: model_type={}, {} fixture(s), deterministic width {det_width}",
         model.model_type(),
         fixture_paths.len()
     );
@@ -226,6 +234,7 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
         model.kv_dims(),
         EngineConfig {
             num_blocks: 256,
+            deterministic_decode_width: det_width,
             ..EngineConfig::default()
         },
         Stream::gpu(),
@@ -285,13 +294,11 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
         );
     }
 
-    // Width-16 rounds: the same fixtures under the ADR 0002 batched bar —
-    // token-id equality with the single-stream reference. The logits at
-    // width 16 differ from M=1 in ulps by MLX kernel-dispatch design
-    // (qmv/qmm classes); greedy argmax must absorb that noise on every
-    // token. A failure here with the sequential rounds green is therefore
-    // a *batched-enablement* gate for this architecture at this pin, not
-    // evidence of a model-math bug (ADR 0002 "Consequences").
+    // Width-16 rounds: greedy fixtures are deterministic traffic, so the
+    // ADR 0002 B' sub-batched decode makes them bit-identical to
+    // single-stream at any admitted width. A divergence here with the
+    // sequential rounds green means the deterministic partition itself is
+    // broken (grouping, calibration, or replay), not kernel noise.
     let filler_prompt = tokenizer
         .encode("Pottery is one of the oldest human inventions", true)
         .expect("encodes");
@@ -301,14 +308,14 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
         assert_eq!(
             output,
             fixture.expected_token_ids,
-            "greedy token-id divergence on fixture {model_name}/{name} at decode width 16 \
-             (prompt tokens: {}) — batched decode fails the ADR 0002 token-equality bar \
-             for this architecture at this kernel pin",
+            "greedy divergence on fixture {model_name}/{name} at decode width 16 \
+             (prompt tokens: {}) — the ADR 0002 B' deterministic path must be \
+             bit-exact at every width",
             prompt_ids.len()
         );
         eprintln!(
-            "golden {model_name}/{name}: {} prompt tokens, {} generated — token-id match \
-             at decode width 16 (bit-exactness not implied at M>1; ADR 0002)",
+            "golden {model_name}/{name}: {} prompt tokens, {} generated — exact match \
+             at decode width 16 (B' deterministic sub-batching)",
             prompt_ids.len(),
             fixture.max_tokens
         );

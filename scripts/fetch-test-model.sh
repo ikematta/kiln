@@ -20,6 +20,9 @@ PINS=(
   "qwen3-0.6b-4bit     mlx-community/Qwen3-0.6B-4bit             73e3e38d981303bc594367cd910ea6eb48349da8"
   "gemma-3-1b-it-4bit  mlx-community/gemma-3-1b-it-4bit          2d44e83dc9e80843d22fb941d3d699a0b1351aa6"
   "smollm2-135m-bf16   mlx-community/SmolLM2-135M-Instruct       422de227b90002f443a21a58b1087f6ee7632731"
+  # Phase 6 additions (new pins, existing pins untouched): qwen2 arch
+  # coverage and the 8-bit quantization path (SPEC §12 Phase 6 matrix).
+  "qwen2.5-0.5b-4bit   mlx-community/Qwen2.5-0.5B-Instruct-4bit  a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3"
 )
 
 DEST="${KILN_TEST_MODELS:-$HOME/.kiln/test-models}"

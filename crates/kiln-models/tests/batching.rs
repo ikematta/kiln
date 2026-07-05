@@ -134,6 +134,10 @@ fn batched_greedy_matches_single_stream() {
         let model = LlamaModel::load(&model_dir, &stream).expect("model loads");
         let tokenizer = Tokenizer::from_model_dir(&model_dir).expect("tokenizer loads");
         let encode = |text: &str| tokenizer.encode(text, true).expect("encodes");
+        // Production posture (ADR 0002 B'): calibrate like the worker does.
+        let det_width = model
+            .calibrate_deterministic_width(&stream)
+            .expect("calibrates");
 
         let short = encode("The capital of France is");
         let medium = encode(
@@ -165,11 +169,13 @@ fn batched_greedy_matches_single_stream() {
 
         let config = EngineConfig {
             num_blocks: 64,
+            deterministic_decode_width: det_width,
             ..EngineConfig::default()
         };
         let chunked = EngineConfig {
             num_blocks: 64,
             prefill_chunk: 48,
+            deterministic_decode_width: det_width,
             ..EngineConfig::default()
         };
 
