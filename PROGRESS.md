@@ -2314,3 +2314,45 @@
   My read: A + C together, and strike B permanently.
 - Next: PM ruling -> record in ADR 0002, close Task 1 formally; then
   Task 2 (Gemma2/3, fixtures first, SPEC §12 order).
+
+## [2026-07-05] Phase 6 / Task 1 — perf ruling recorded (ADR 0003) — Task 1 CLOSED
+- What (implements the PM ruling A + C on the two open DECISION NEEDED
+  items — the B' closeout entry and the op-level investigation entry;
+  both are hereby CLOSED):
+  1. **ADR 0003**
+     (docs/decisions/0003-throughput-bar-under-deterministic-sub-batching.md):
+     records the finding (B' costs ~2.1-2.3x vs unpartitioned at width 16,
+     attributable to qmv-vs-qmm weight re-streaming at the kernel-class
+     boundary — a property of the pinned dispatch table, not a defect;
+     op-level investigation measurements + the 93% methodology
+     cross-check cited as evidence it is not recoverable by
+     re-partitioning); amends the SPEC §11.3 batch-16 >= 3x target to
+     non-deterministic/mixed-majority load; records ~2.1-2.3x as the
+     deterministic-load measured FLOOR (not a target) with regressions
+     below it failing phase gates like any bench regression; sets the
+     revisit trigger at every mlx-c/core-MLX bump per ADR 0001's C1
+     process, figures stale the moment the pin moves.
+  2. New ADR vs appended ADR 0002 section (the call was delegated):
+     new ADR — docs/decisions/ is agent-read-only once landed (the
+     ADR 0001 addenda were explicit one-off PM instructions), and
+     ADR 0002 defines correctness bars while this amends a performance
+     acceptance target with its own revisit trigger; cross-referenced
+     both directions in the ADR text instead.
+  3. SPEC §11.3 perf bullet: doc-only amendment referencing ADR 0003
+     (acceptance clause only; section otherwise untouched).
+- Decisions: bench.sh phase runs to report det/non-det batch numbers
+  separately (recorded as an ADR consequence; implementation rides the
+  next bench.sh touch, no code change now).
+- Deviations: none.
+- Acceptance (doc-only change):
+  ```
+  $ ls docs/decisions/
+  0001-mlx-c-pin.md
+  0002-parity-bars-under-mlx-kernel-dispatch.md
+  0003-throughput-bar-under-deterministic-sub-batching.md
+  $ git diff --stat HEAD
+  PROGRESS.md | docs/SPEC.md (1 line) | docs/decisions/0003-... (new)
+  ```
+- **Phase 6 / Task 1 (Qwen2.5/Qwen3 + parity/throughput bars) is CLOSED.**
+- Next: Task 2 — Gemma2/Gemma3 impls, fixtures first (SPEC §12 Phase 6),
+  width-16 parity verified against the ADR 0002/0003 bars.
