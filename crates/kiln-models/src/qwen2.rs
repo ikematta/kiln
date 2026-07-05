@@ -61,6 +61,12 @@ impl Qwen2Model {
             head_dim: self.config.head_dim() as i32,
         }
     }
+
+    /// ADR 0002 B' startup calibration (see
+    /// `CausalLm::calibrate_deterministic_width`).
+    pub fn calibrate_deterministic_width(&self, s: &Stream) -> Result<usize, ModelError> {
+        self.lm.calibrate_deterministic_width(s)
+    }
 }
 
 impl StepModel for Qwen2Model {

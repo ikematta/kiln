@@ -99,6 +99,17 @@ impl Linear {
             None => Ok(y),
         }
     }
+
+    /// `(in_features, out_features)` — the shape key for the calibration
+    /// probe's dedup.
+    fn io_features(&self) -> (i32, i32) {
+        match self {
+            Linear::Quantized {
+                scales, group_size, ..
+            } => (scales.dim(1) * group_size, scales.dim(0)),
+            Linear::Dense { weight, .. } => (weight.dim(1), weight.dim(0)),
+        }
+    }
 }
 
 /// Token embedding, quantized (mlx-lm `QuantizedEmbedding`) or dense; also
@@ -210,6 +221,38 @@ impl Mlp {
         let silu = ops::multiply(&gate, &ops::sigmoid(&gate, s)?, s)?;
         self.down_proj.forward(&ops::multiply(&silu, &up, s)?, s)
     }
+}
+
+/// Finds the smallest M in `2..=32` at which `f`'s row 0 stops being
+/// bit-identical to its M=1 result (33 when it never diverges) — one
+/// shape's contribution to [`CausalLm::calibrate_deterministic_width`].
+/// `base` is a `[1, 1, hidden]` activation row, tiled to `k` features.
+fn probe_row_stability(
+    k: i32,
+    base: &Array,
+    s: &Stream,
+    f: impl Fn(&Array) -> Result<Array, MlxError>,
+) -> Result<usize, ModelError> {
+    let reps = ((k + base.dim(2) - 1) / base.dim(2)) as usize;
+    let cats: Vec<&Array> = std::iter::repeat_n(base, reps).collect();
+    let wide = ops::concatenate(&cats, 2, s)?;
+    let x1 = ops::contiguous(&ops::slice(&wide, &[0, 0, 0], &[1, 1, k], s)?, s)?;
+    x1.eval()?;
+    let row0 = |y: &Array| -> Result<Vec<u8>, MlxError> {
+        let n = y.dim(2);
+        let row = ops::contiguous(&ops::slice(y, &[0, 0, 0], &[1, 1, n], s)?, s)?;
+        row.eval()?;
+        row.data_raw_bytes()
+    };
+    let reference = row0(&f(&x1)?)?;
+    for m in 2..=32 {
+        let rows: Vec<&Array> = std::iter::repeat_n(&x1, m).collect();
+        let xm = ops::contiguous(&ops::concatenate(&rows, 1, s)?, s)?;
+        if row0(&f(&xm)?)? != reference {
+            return Ok(m);
+        }
+    }
+    Ok(33)
 }
 
 /// Prepends `pad` zero rows along `axis` (ADR 0002 kernel-class padding);
@@ -683,6 +726,64 @@ impl CausalLm {
 
     pub(crate) fn num_layers(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// ADR 0002 B' startup calibration: the widest per-forward row count
+    /// at which every projection in this model still produces rows
+    /// bit-identical to M=1 on THIS device.
+    ///
+    /// For each distinct linear shape (layer-0 attention + MLP
+    /// projections and the (tied) lm_head, deduped by `(K, N)`), row 0 of
+    /// the projection is computed at M = 1 and at rising M = 2..=32 over
+    /// a realistic activation row (the token-0 embedding tiled to K); the
+    /// first M whose row-0 bytes differ marks that shape's kernel-class
+    /// dispatch threshold. The result is `min(thresholds) - 1`, capped at
+    /// 32 when nothing diverges. Measuring the property directly (rather
+    /// than replicating MLX's `get_qmv_batch_limit` device table) keeps
+    /// the bound correct on GPUs the table does not describe, and probing
+    /// through the same `Linear::forward`/`as_linear` code covers
+    /// quantized and dense weights alike.
+    pub(crate) fn calibrate_deterministic_width(&self, s: &Stream) -> Result<usize, ModelError> {
+        let block = self.blocks.first().ok_or_else(|| {
+            ModelError::Mismatch("no layers to calibrate a deterministic width from".to_owned())
+        })?;
+        // Realistic activation row: the embedding of token 0.
+        let ids = Array::from_u32_slice(&[0], &[1, 1])?;
+        let base = self.embed_tokens.lookup(&ids, s)?;
+        base.eval()?;
+
+        let attn = &block.self_attn;
+        let mut linears: Vec<&Linear> = vec![
+            &attn.q_proj,
+            &attn.k_proj,
+            &attn.v_proj,
+            &attn.o_proj,
+            &block.mlp.gate_proj,
+            &block.mlp.up_proj,
+            &block.mlp.down_proj,
+        ];
+        if let Some(head) = &self.lm_head {
+            linears.push(head);
+        }
+        let mut seen: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        let mut min_threshold: usize = 33;
+        for linear in linears {
+            if seen.insert(linear.io_features()) {
+                let threshold = probe_row_stability(linear.io_features().0, &base, s, |x| {
+                    linear.forward(x, s)
+                })?;
+                min_threshold = min_threshold.min(threshold);
+            }
+        }
+        if self.lm_head.is_none() {
+            // Tied head: QuantizedEmbedding.as_linear is its own dispatch
+            // site (same kernels, embedding-owned tensors).
+            let hidden = base.dim(2);
+            let threshold =
+                probe_row_stability(hidden, &base, s, |x| self.embed_tokens.as_linear(x, s))?;
+            min_threshold = min_threshold.min(threshold);
+        }
+        Ok(min_threshold.saturating_sub(1).clamp(1, 32))
     }
 
     /// Forward pass: `tokens [B, L]` (u32) -> logits `[B, L, vocab]`.

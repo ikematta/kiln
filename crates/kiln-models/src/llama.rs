@@ -72,6 +72,13 @@ impl LlamaModel {
         (0..self.lm.num_layers()).map(|_| KvCache::new()).collect()
     }
 
+    /// ADR 0002 B' startup calibration (see
+    /// `CausalLm::calibrate_deterministic_width`): feeds
+    /// `EngineConfig::deterministic_decode_width`.
+    pub fn calibrate_deterministic_width(&self, s: &Stream) -> Result<usize, ModelError> {
+        self.lm.calibrate_deterministic_width(s)
+    }
+
     /// Forward pass: `tokens [B, L]` (u32) -> logits `[B, L, vocab]`
     /// (contiguous Phase-3 cache; see [`CausalLm::forward`]).
     pub fn forward(

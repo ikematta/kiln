@@ -61,6 +61,19 @@ impl AnyModel {
             Self::Qwen3(m) => m.kv_dims(),
         }
     }
+
+    /// ADR 0002 B' startup calibration: the widest per-forward row count
+    /// whose rows stay bit-identical to M=1 on this device, across every
+    /// projection shape in the loaded model. Feeds
+    /// `EngineConfig::deterministic_decode_width` and the informational
+    /// `WorkerInfo.max_deterministic_decode_width`.
+    pub fn calibrate_deterministic_width(&self, s: &Stream) -> Result<usize, ModelError> {
+        match self {
+            Self::Llama(m) => m.calibrate_deterministic_width(s),
+            Self::Qwen2(m) => m.calibrate_deterministic_width(s),
+            Self::Qwen3(m) => m.calibrate_deterministic_width(s),
+        }
+    }
 }
 
 impl StepModel for AnyModel {
