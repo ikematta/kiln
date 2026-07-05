@@ -2197,3 +2197,120 @@
 - Next: perf ruling (A/B/C) -> record in ADR 0002 and close Task 1
   formally; then Task 2 (Gemma2/3, fixtures first). Qwen3-8B-4bit kept
   under ~/.kiln/bench-models/ for future phase benches.
+
+## [2026-07-05] Phase 6 / Task 1 — op-level sub-batching investigation (PM-directed) — REPORT
+- Scope: investigation only, per instruction. No source, fixture, or test
+  changes; one scratch probe (crates/kiln-models/tests/opsplit_probe.rs)
+  written, run, and removed after measurement, like the 2026-07-04
+  batched-bar probes. Question: can splitting ONLY the threshold-crossing
+  matmuls (MLP gate/up/down, lm_head) inside one full-width deterministic
+  forward — attention, norms, and other threshold-safe ops shared at
+  width 16 — match whole-forward B' bit-exactness at lower cost?
+- 1) Threshold safety of the would-be full-width ops (measured):
+  - SDPA never sees decode width at all: the paged decode path
+    (nn.rs `Attention::forward_step`) slices per sequence and runs
+    qk-norm/RoPE/gather/SDPA per-seq at q_len=1 regardless of batch
+    width — width-invariant by construction, on every device. Its
+    two-class q_len structure matters only for prefill (closed by B1
+    padding). The "neutral" figure in the 2026-07-04 table was about
+    the attention PROJECTIONS' dispatch cost, not SDPA.
+  - Every other full-width non-matmul op is row-stable through M=32 on
+    this machine (probe value 33 = never diverged): rms_norm=33,
+    residual+swiglu elementwise=33, embed gather+dequant=33, both models.
+  - Attention projections are shape-dependent, not device-constant:
+    llama-1B shapes (K,N <= 2048) threshold 18 -> bit-safe at 16;
+    qwen3-8B shapes (4096x4096, 4096x1024) threshold 12 -> NOT safe at
+    width 16 even on this machine. MLP and lm_head: threshold 10 at both
+    scales (consistent with the calibrated W=9).
+- 2) Measured cost (release; each timing = median eval over one lazy
+  graph of 16-64 independent reps — no per-op sync; us/dispatch):
+  ```
+  llama-1b     thr    M=16      9+7     11+5
+  attn q/o      18   153.7    153.9    156.2   split-neutral
+  attn k/v      18    43.5     42.3     42.9   split-neutral
+  mlp gate/up   10   312.7    646.3   (11+5 inadmissible, thr 10)
+  mlp down      10   312.4    634.4   (      "        )
+  lm_head tied  10  4847.8   9952.1   (      "        )
+  qwen3-8b
+  attn q/o      12   338.0    647.4    596.9   NOT neutral; thr < 16
+  attn k/v      12    87.7    152.8    152.9
+  mlp gate/up   10   996.8   1963.7   (11+5 inadmissible, thr 10)
+  mlp down      10  1005.4   1929.9   (      "        )
+  lm_head       10 12326.1  23202.9   (      "        )
+  ```
+  Composed trunk time per width-16 step: 1B unpart 26.2 / whole-forward
+  47.1 / op-level 47.1 ms; 8B 151.0 / 291.7 / 288.1 ms. Cross-check
+  against the engine-measured B' deltas validates the attribution:
+  probe 20.9 vs engine 22.6 ms/step at 1B (93% — the ~1.7ms residual is
+  the doubled norm/embed/dispatch-chain overhead a single forward would
+  also save); probe 140.7 vs engine 120.1 at 8B (probe overestimates
+  there; conclusions below only get stronger).
+  **Op-level recovery: 1B -0.03 ms/step kernel-side, ~+3% total with the
+  residual overhead credited (predicted <= ~267 vs B' 259.9 tok/s);
+  8B +3.6 ms/step, ~+1% (predicted 45.3 vs 44.8 tok/s).**
+- 3) Why the intuition fails (and the earlier ~10-15% option-B estimate
+  was wrong):
+  a. Whole-forward splitting never RECOMPUTES attention — each sub-batch
+     computes only its own rows. The only duplication is per-dispatch
+     weight re-streaming plus small per-forward overhead; there is no
+     shared attention output for op-level splitting to reuse.
+  b. Where attention is split-neutral (1B: small, latency-bound
+     matrices), unsplitting it saves nothing. Where splitting attention
+     is expensive (8B: bandwidth-bound 4096-wide shapes, 1.9x), its own
+     threshold (12) is below 16, so bit-exactness forces it to chunk
+     anyway. The premise "attention is threshold-safe at width 16" fails
+     on production-scale shapes on THIS machine, before M1/M2-class
+     (lower thresholds still) even enters.
+  c. MLP + lm_head — 80%+ of streamed bytes — sit at threshold 10 at
+     both scales and chunk identically (<= 9 rows, 2 chunks at width 16)
+     under either scheme. The dominant cost is untouchable.
+  d. On M1/M2-class (W=5), all shapes compress toward the same bound:
+     op-level converges to whole-forward exactly where B' hurts most.
+  The B' penalty is the qmv-vs-qmm kernel-class efficiency gap on the
+  bandwidth-dominant matmuls; it attaches to the kernel class the bit
+  guarantee pins, not to how rows are grouped around it. No partition
+  arrangement at this mlx-c pin can close it. The only structural lever
+  is a kernel that streams weights once across row groups while keeping
+  qmv row bits — an upstream-MLX question for the quarterly bump, not a
+  Kiln scheduling question.
+- Decisions: none required within latitude (no changes made).
+- Deviations: none.
+- Acceptance (real output of the scratch probe, trimmed; probe deleted
+  after the run, `git status` clean save this entry):
+  ```
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-models \
+      --test opsplit_probe --release -- --nocapture
+  === llama-3.2-1b-4bit ===
+  full-width ops row-stability (33 = stable through M=32):
+    rms_norm=33 elementwise=33 embed_gather_dequant=33
+  trunk estimate/step @16: unpart 26.16ms | whole-forward 47.06ms |
+    op-level 47.09ms
+  cross-check: probe B' delta 20.90ms vs engine-measured 22.58ms
+  op-level recovery -0.03ms/step -> predicted 259.8 tok/s (B' 259.9)
+  === qwen3-8b-4bit ===
+  full-width ops row-stability: rms_norm=33 elementwise=33 embed=33
+  trunk estimate/step @16: unpart 150.95ms | whole-forward 291.69ms |
+    op-level 288.05ms
+  cross-check: probe B' delta 140.74ms vs engine-measured 120.11ms
+  op-level recovery 3.64ms/step -> predicted 45.3 tok/s (B' 44.8)
+  test result: ok. 1 passed
+  ```
+- DECISION NEEDED (supersedes the A/B/C perf ruling in the B' closeout
+  entry): option B (per-op chunking) is measured dead — 0% recovery at
+  1B, ~1% at 8B, best case ~3% crediting every avoidable overhead —
+  against ~200-300 lines of per-shape calibration plumbing plus a per-op
+  M-sensitivity classification that every future architecture (Gemma is
+  next) would have to maintain. Whole-forward B' is the honest floor;
+  ~2.1-2.3x at width 16 is the real, physical price of bit-exact batched
+  greedy at this kernel pin. Remaining options:
+  A) Re-scope the batch-16 >= 3x gate to non-deterministic/mixed-majority
+     load (holds: 3.18x at 8B) and record the deterministic-load figure
+     (~2.3x) in ADR 0002 as the documented B' price. RECOMMENDED.
+  C) Additionally record in ADR 0002 that the only structural lever is
+     kernel-level (a batched qmv streaming weights once across row
+     groups), to be re-evaluated at each quarterly mlx-c bump — the
+     startup calibration adapts automatically if dispatch changes. No
+     code change now. Compatible with A.
+  My read: A + C together, and strike B permanently.
+- Next: PM ruling -> record in ADR 0002, close Task 1 formally; then
+  Task 2 (Gemma2/3, fixtures first, SPEC §12 order).
