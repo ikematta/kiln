@@ -89,6 +89,7 @@ fn request(prompt: &[u32], max_tokens: usize, priority: Priority) -> (EngineRequ
         on_event: Box::new(move |event| {
             match event {
                 SeqEvent::Token(token) => t.borrow_mut().push(token),
+                SeqEvent::PrefixHit { .. } => {}
                 SeqEvent::Finished(summary) => *f.borrow_mut() = Some(summary),
             }
             true
@@ -163,17 +164,22 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
         // Pool: 6 blocks x 32 = 192 slots. senior(160) + junior(96 worst
         // case) exceed it mid-decode, but each fits alone — preemption,
         // never an error.
+        // Cache off: this suite pins exact preemption counts and pool
+        // arithmetic; donated blocks (evictable, SPEC §6.3) would shift
+        // when OutOfBlocks fires. Cache-on preemption interplay is covered
+        // by kiln-models/tests/prefix_cache.rs.
         let squeeze = EngineConfig {
             num_blocks: 6,
+            prefix_cache: false,
             ..EngineConfig::default()
         };
-        let solo_senior = solo(&model, squeeze, senior, 60);
-        let solo_junior = solo(&model, squeeze, junior, 48);
+        let solo_senior = solo(&model, squeeze.clone(), senior, 60);
+        let solo_junior = solo(&model, squeeze.clone(), junior, 48);
 
         // 1) Same priority: the most recently admitted request is the
         //    victim; it resumes and both streams stay bit-exact.
         {
-            let mut engine = new_engine(&model, squeeze);
+            let mut engine = new_engine(&model, squeeze.clone());
             let (a, a_out) = request(senior, 60, Priority::Interactive);
             let (b, b_out) = request(junior, 48, Priority::Interactive);
             engine.submit(a);
@@ -201,7 +207,7 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
         //    even though it is senior to the INTERACTIVE one (SPEC §6.1:
         //    lowest priority first, then most recently admitted).
         {
-            let mut engine = new_engine(&model, squeeze);
+            let mut engine = new_engine(&model, squeeze.clone());
             let (a, a_out) = request(senior, 60, Priority::Batch);
             let (b, b_out) = request(junior, 48, Priority::Interactive);
             engine.submit(a);
@@ -226,7 +232,7 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
 
         // 3a) Cancel mid-stream stops within the proto's 2-step budget.
         {
-            let mut engine = new_engine(&model, squeeze);
+            let mut engine = new_engine(&model, squeeze.clone());
             let (a, a_out) = request(junior, 60, Priority::Interactive);
             engine.submit(a);
             while a_out.tokens.borrow().len() < 3 {
@@ -253,7 +259,7 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
 
         // 3b) Cancel lands while the request sits preempted in WAITING.
         {
-            let mut engine = new_engine(&model, squeeze);
+            let mut engine = new_engine(&model, squeeze.clone());
             let (a, a_out) = request(senior, 60, Priority::Interactive);
             let (b, b_out) = request(junior, 48, Priority::Interactive);
             engine.submit(a);
@@ -340,9 +346,10 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
             // pressure request finishes.
             let pressured = EngineConfig {
                 num_blocks: 8,
+                prefix_cache: false,
                 ..EngineConfig::default()
             };
-            let mut engine = new_engine(&model, pressured);
+            let mut engine = new_engine(&model, pressured.clone());
             let (p, p_out) = request(senior, 60, Priority::Interactive);
             let (g, g_out) = request(&fixture_ids, fixture.max_tokens, Priority::Interactive);
             engine.submit(p);
@@ -370,7 +377,7 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
         //    and it resumes onto its solo stream (drain()'s MAX_STEPS
         //    guard is the liveness bound).
         {
-            let mut engine = new_engine(&model, squeeze);
+            let mut engine = new_engine(&model, squeeze.clone());
             let (b, b_out) = request(senior, 60, Priority::Batch);
             let (i1, i1_out) = request(junior, 48, Priority::Interactive);
             engine.submit(b);
@@ -417,8 +424,8 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
         //    would mark J newest and victimize it again.
         {
             let kprompt = &ids[133..198]; // 65 tokens; grows to 113 slots (4 blocks)
-            let solo_k = solo(&model, squeeze, kprompt, 48);
-            let mut engine = new_engine(&model, squeeze);
+            let solo_k = solo(&model, squeeze.clone(), kprompt, 48);
+            let mut engine = new_engine(&model, squeeze.clone());
             let (a, a_out) = request(senior, 60, Priority::Interactive);
             let (j, j_out) = request(junior, 48, Priority::Interactive);
             engine.submit(a);
@@ -468,13 +475,14 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
             let chunked = EngineConfig {
                 num_blocks: 9,
                 prefill_chunk: 8,
+                prefix_cache: false,
                 ..EngineConfig::default()
             };
             let a7prompt = &ids[..120]; // 120 tokens -> 180 slots total
             let jprompt = &ids[133..283]; // 150 tokens -> 174 slots total
-            let solo_chunk_senior = solo(&model, chunked, a7prompt, 60);
-            let solo_chunk_j = solo(&model, chunked, jprompt, 24);
-            let mut engine = new_engine(&model, chunked);
+            let solo_chunk_senior = solo(&model, chunked.clone(), a7prompt, 60);
+            let solo_chunk_j = solo(&model, chunked.clone(), jprompt, 24);
+            let mut engine = new_engine(&model, chunked.clone());
             let (a, a_out) = request(a7prompt, 60, Priority::Interactive);
             let (j, j_out) = request(jprompt, 24, Priority::Interactive);
             engine.submit(a);
@@ -523,11 +531,12 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
             let b_prompt = &ids[64..160];
             let wide = EngineConfig {
                 num_blocks: 54,
+                prefix_cache: false,
                 ..EngineConfig::default()
             };
-            let solo_a = solo(&model, wide, a_prompt, 48);
-            let solo_b = solo(&model, wide, b_prompt, 32);
-            let mut engine = new_engine(&model, wide);
+            let solo_a = solo(&model, wide.clone(), a_prompt, 48);
+            let solo_b = solo(&model, wide.clone(), b_prompt, 32);
+            let mut engine = new_engine(&model, wide.clone());
             let outs: Vec<Collected> = (0..16)
                 .map(|k| {
                     let (req, out) = if k % 2 == 0 {

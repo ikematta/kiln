@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kiln_proto::v1::worker_client::WorkerClient;
-use kiln_proto::v1::{HealthRequest, InfoRequest, WorkerState};
+use kiln_proto::v1::{HealthRequest, InfoRequest, StatsRequest, WorkerState};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
@@ -65,7 +65,23 @@ impl Supervisor {
         let mut tasks = Vec::new();
         for (entry, status_tx) in registry.iter().zip(senders) {
             let argv = match entry.worker_kind {
-                crate::config::WorkerKind::Rust => config.server.rust_worker_argv.clone(),
+                crate::config::WorkerKind::Rust => {
+                    let mut argv = config.server.rust_worker_argv.clone();
+                    // SPEC §10 [defaults]: SSD tier flags for the rust
+                    // worker (it derives `<cache_dir>/<fingerprint>/blocks`
+                    // itself). The python worker has no cold tier.
+                    if config.defaults.ssd_tier {
+                        argv.push("--ssd-dir".to_owned());
+                        argv.push(
+                            crate::registry::expand_tilde(&config.server.cache_dir)
+                                .display()
+                                .to_string(),
+                        );
+                        argv.push("--ssd-max-gb".to_owned());
+                        argv.push(config.defaults.ssd_cache_max_gb.to_string());
+                    }
+                    argv
+                }
                 _ => config.server.python_worker_argv.clone(),
             };
             let ctx = SuperviseCtx {
@@ -225,6 +241,10 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
     let mut poll = interval(HEALTH_POLL_INTERVAL);
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_ok = Instant::now();
+    // SPEC §5/§2.3: Stats is polled alongside Health and re-exported with
+    // a `model` label. A worker without it (the python worker today)
+    // answers UNIMPLEMENTED once and is not asked again this lifetime.
+    let mut stats_supported = true;
     loop {
         tokio::select! {
             status = child.wait() => {
@@ -247,6 +267,21 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
                             return RunExit::Crashed { ready_for: Some(ready_at.elapsed()) };
                         }
                         last_ok = Instant::now();
+                        if stats_supported {
+                            match timeout(HEALTH_RPC_TIMEOUT, client.stats(StatsRequest {})).await {
+                                Ok(Ok(resp)) => {
+                                    ctx.metrics.worker_stats.record(&entry.id, &resp.into_inner());
+                                }
+                                Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+                                    tracing::debug!(model = %entry.id,
+                                        "worker does not implement Stats; skipping re-export");
+                                    stats_supported = false;
+                                }
+                                // Transient failures: Health owns crash
+                                // detection; stats just misses a sample.
+                                _ => {}
+                            }
+                        }
                     }
                     _ => {
                         if last_ok.elapsed() > HEALTH_MISSED_DEADLINE {

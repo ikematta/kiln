@@ -54,16 +54,20 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use kiln_mlx::{Array, MlxError, Stream, async_eval, eval, memory, ops};
+use kiln_mlx::{Array, Dtype, MlxError, Stream, async_eval, eval, memory, ops};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::block::{BlockError, BlockManager, BlockTable};
+use crate::block::{BlockError, BlockId, BlockManager, BlockTable};
 use crate::paged::{KvSpec, PagedKv, WriteRun};
+use crate::radix::{ChainHash, ROOT, RadixCache};
 use crate::sampler::{PenaltyOptions, Sampler, SamplingOptions, apply_penalties};
+use crate::ssd::{SlabGeometry, SsdStore};
 use crate::step::{SeqStep, StepBatch, StepInput, StepModel};
 
 /// SPEC §10 `[defaults]` block_size.
@@ -77,16 +81,81 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
 /// part 3+): 512 blocks × 32 tokens = 16k tokens of KV.
 pub const DEFAULT_NUM_BLOCKS: usize = 512;
 
+/// Fine grid of the canonical prefill schedule's final super-chunk
+/// (PROGRESS 2026-07-04 Option B): default for
+/// `EngineConfig::prefill_fine_chunk`. 128 per the step-4 tuning curve:
+/// +2.9% miss-path TTFT at the worst-case prompt size (vs +13.9% at 64)
+/// while warm-turn recompute grows by at most 64 extra tokens.
+pub const DEFAULT_PREFILL_FINE_CHUNK: usize = 128;
+
+/// Canonical prefill schedule (SPEC §6.2 + Phase 5 Option B, PROGRESS
+/// 2026-07-04): positions `0..limit` are prefilled in bulk chunks of
+/// `prefill_chunk` split at absolute multiples of `prefill_chunk`, and
+/// the final partial super-chunk is split at absolute multiples of
+/// `fine` (plus the final sub-`fine` remainder). Returns the length of
+/// the chunk starting at `at` (`at < limit`).
+///
+/// Every (offset, length) pair this yields for a given `limit` is a
+/// function of the absolute grid alone — independent of where prefill
+/// started — so a warm prefix-cache resume at any boundary recomputes
+/// its segments in exactly the shapes a cold run of the same prompt
+/// uses. That is the bit-exactness requirement for cache hits: KV bits
+/// are chunk-shape dependent (kernel dispatch varies with query
+/// length), so no position may ever be computed in a shape the
+/// cache-off run would not use. `fine >= prefill_chunk` degenerates to
+/// the pre-Phase-5 single-tail-chunk schedule (used to bench the miss
+/// path cost of the fine grid).
+pub fn canonical_prefill_len(at: usize, limit: usize, prefill_chunk: usize, fine: usize) -> usize {
+    debug_assert!(at < limit, "no prefill remains at {at} of {limit}");
+    let fine = fine.clamp(1, prefill_chunk);
+    let tail_start = limit / prefill_chunk * prefill_chunk;
+    if at < tail_start {
+        // Bulk: run to the next absolute super-chunk boundary.
+        prefill_chunk - at % prefill_chunk
+    } else {
+        // Final partial super-chunk: run to the next absolute fine
+        // boundary, or to the end.
+        (fine - at % fine).min(limit - at)
+    }
+}
+
 /// Cache maintenance cadence in decode iterations (mirrors the Phase-3
 /// loop's `clear_cache` every 256 steps).
 const MAINTENANCE_INTERVAL: u64 = 256;
 
-#[derive(Debug, Clone, Copy)]
+/// SSD captures per synchronous step — bounds the host-copy stall the
+/// write-behind flush adds to any one iteration.
+const FLUSH_BATCH: usize = 2;
+
+/// SSD cold tier settings (SPEC §6.4).
+#[derive(Debug, Clone)]
+pub struct SsdParams {
+    /// Slab directory (the worker derives it from `$KILN_CACHE_DIR` and
+    /// its model fingerprint).
+    pub dir: PathBuf,
+    /// `ssd_cache_max_gb`, in bytes.
+    pub max_bytes: u64,
+    /// Model identity material folded into the slab fingerprint and every
+    /// chain hash — the worker passes its `weights_fingerprint`, which
+    /// already binds weights, architecture, and config dtype; the slab
+    /// header additionally pins the KV geometry and element dtype.
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub block_size: usize,
     pub num_blocks: usize,
     pub max_batch_tokens: usize,
     pub prefill_chunk: usize,
+    /// Fine grid of the final partial super-chunk (see
+    /// [`canonical_prefill_len`], default 128); values `>= prefill_chunk`
+    /// restore the single-tail-chunk schedule.
+    pub prefill_fine_chunk: usize,
+    /// Radix prefix cache (SPEC §6.3); on by default.
+    pub prefix_cache: bool,
+    /// SSD cold tier (SPEC §6.4); requires `prefix_cache`.
+    pub ssd: Option<SsdParams>,
 }
 
 impl Default for EngineConfig {
@@ -96,8 +165,27 @@ impl Default for EngineConfig {
             num_blocks: DEFAULT_NUM_BLOCKS,
             max_batch_tokens: DEFAULT_MAX_BATCH_TOKENS,
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
+            prefill_fine_chunk: DEFAULT_PREFILL_FINE_CHUNK,
+            prefix_cache: true,
+            ssd: None,
         }
     }
+}
+
+/// Cache observability snapshot (drives `WorkerStats`, SPEC §5).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PrefixCacheStats {
+    pub enabled: bool,
+    pub hits_total: u64,
+    pub tokens_reused_total: u64,
+    pub tokens_reused_ssd_total: u64,
+    pub resident_blocks: u64,
+    pub ssd_blocks_stored: u64,
+    pub ssd_bytes_stored: u64,
+    pub ssd_reads_total: u64,
+    pub ssd_writes_total: u64,
+    pub ssd_writes_failed_total: u64,
+    pub ssd_fingerprint_rejects_total: u64,
 }
 
 /// KV geometry of the model being served.
@@ -167,6 +255,9 @@ pub struct FinishSummary {
     /// Times this request was preempted (and later resumed) under memory
     /// pressure (SPEC §6.1).
     pub preemptions: u32,
+    /// Prompt tokens served from the prefix cache instead of prefilled
+    /// (proto `Finished.cached_prompt_tokens`).
+    pub cached_prompt_tokens: u32,
     /// Submit → first sampled token readable.
     pub prefill_seconds: f64,
     /// First sampled token → finish.
@@ -178,6 +269,14 @@ pub struct FinishSummary {
 /// request); the return value of a `Finished` delivery is ignored.
 pub enum SeqEvent {
     Token(u32),
+    /// Proto `PrefixCacheHit` (SPEC §5, observability): `tokens` prompt
+    /// tokens were reused from the radix cache at admission — skipped in
+    /// prefill — `from_ssd` when any block was pulled from the cold tier.
+    /// May repeat if a preemption resume re-matches.
+    PrefixHit {
+        tokens: u32,
+        from_ssd: bool,
+    },
     Finished(FinishSummary),
 }
 
@@ -239,6 +338,11 @@ struct Seq {
     /// Preempted during the current iteration; moved back to `waiting`
     /// (and reset) once the step completes.
     preempted: bool,
+    /// The prefix cache was consulted for the current (re-)admission;
+    /// cleared by preemption so a resume re-matches.
+    cache_checked: bool,
+    /// Prompt tokens served from the prefix cache (max across resumes).
+    cached_tokens: u32,
     submitted_at: Instant,
     first_token_at: Option<Instant>,
     finished: bool,
@@ -257,19 +361,179 @@ impl Seq {
     }
 
     /// Pool blocks this request needs to reach its next sampled token:
-    /// full prefill plus (after a preemption) the replay of everything
-    /// generated so far. The §6.4 admission projection — a request is
-    /// admitted only once this fits in free blocks, so admission cannot
-    /// thrash straight back into preemption.
+    /// the prefill still owed (a prefix-cache match already covers
+    /// `processed` tokens with blocks the table holds) plus (after a
+    /// preemption) the replay of everything generated so far. The §6.4
+    /// admission projection — a request is admitted only once this fits
+    /// in free blocks, so admission cannot thrash straight back into
+    /// preemption.
     fn admission_blocks(&self, block_size: usize) -> usize {
-        (self.prompt.len() - 1 + self.history.len().max(1)).div_ceil(block_size)
+        (self.prompt.len() - 1 - self.processed + self.history.len().max(1)).div_ceil(block_size)
     }
 }
 
-/// Emits the terminal event and releases the sequence's blocks.
+/// Prefix-cache state owned by the engine: the radix tree, the optional
+/// SSD store, and the write-behind flush queue between them.
+struct CacheState {
+    radix: RadixCache,
+    store: Option<SsdStore>,
+    /// Donated nodes awaiting capture + flush (`(node, generation)`).
+    flush_queue: VecDeque<(usize, u64)>,
+    hits_total: u64,
+    tokens_reused_total: u64,
+    tokens_reused_ssd_total: u64,
+}
+
+impl CacheState {
+    /// Evicts the LRU sole-owned leaf, freeing its pool block (SPEC §6.3
+    /// eviction). A node without a confirmed SSD copy is pruned — the
+    /// flush-else-lose policy keeps the engine from ever blocking on IO.
+    fn evict_one(&mut self, mgr: &mut BlockManager) -> bool {
+        let Some(node) = self.radix.evict_candidate(mgr) else {
+            return false;
+        };
+        self.radix.evict(mgr, node).is_some()
+    }
+
+    /// Moves a finished sequence's settled full blocks into the radix
+    /// tree and releases the rest.
+    ///
+    /// This is the pipeline-discarded-row invariant (see the module docs
+    /// of `crate::radix`): exactly `processed + fed` rows are settled —
+    /// forced by a token readback or a step-boundary eval — and a
+    /// discarded speculative row sits at slot `processed + fed`, so
+    /// donation stops at the last block fully inside the settled range.
+    /// Whatever holds the in-flight row goes back to the free list, where
+    /// only writers can reacquire it.
+    fn donate(&mut self, mgr: &mut BlockManager, seq: &Seq, table: BlockTable) {
+        let block_size = self.radix.block_size();
+        let settled = seq.processed + seq.fed;
+        let blocks = table.into_blocks();
+        let full = (settled / block_size).min(blocks.len());
+        let token_at = |pos: usize| {
+            if pos < seq.processed {
+                seq.prompt[pos]
+            } else {
+                seq.history[pos - seq.processed]
+            }
+        };
+        let mut cur = ROOT;
+        let mut chunk = Vec::with_capacity(block_size);
+        for (i, &block) in blocks.iter().enumerate() {
+            if i > full || (i == full && settled.is_multiple_of(block_size)) {
+                let released = mgr.release(block);
+                debug_assert!(released.is_ok(), "finish released a foreign block");
+                continue;
+            }
+            chunk.clear();
+            for pos in i * block_size..((i + 1) * block_size).min(settled) {
+                chunk.push(token_at(pos));
+            }
+            if i == full {
+                // Settled sub-block tail: a pool-only partial leaf, so a
+                // full-containment rerun recomputes nothing (see
+                // `match_head_prefix`). Never flushed to SSD.
+                self.donate_partial(mgr, cur, block, &chunk);
+                continue;
+            }
+            cur = match self.radix.child(cur, &chunk) {
+                Some(node) => {
+                    if self.radix.node_block(node).is_some() {
+                        // Shared prefix already resident (typically the
+                        // donor's own cache hit): drop the duplicate ref.
+                        let released = mgr.release(block);
+                        debug_assert!(released.is_ok(), "finish released a foreign block");
+                    } else {
+                        // Known (SSD-backed) node re-warmed for free.
+                        self.radix.set_resident(node, block);
+                    }
+                    self.radix.touch(node);
+                    node
+                }
+                None => {
+                    let node = self.radix.insert_child(cur, &chunk);
+                    self.radix.set_resident(node, block);
+                    if let Some(store) = &self.store
+                        && store.contains(&self.radix.node_hash(node))
+                    {
+                        // A previous run already persisted this block.
+                        self.radix.set_on_ssd(node);
+                    }
+                    // Partial siblings fully covered by this block are
+                    // redundant now (their rows are a bit-identical
+                    // prefix of it).
+                    let covered: Vec<usize> = self
+                        .radix
+                        .partial_children(cur)
+                        .iter()
+                        .copied()
+                        .filter(|&partial| chunk.starts_with(self.radix.node_tokens(partial)))
+                        .collect();
+                    for partial in covered {
+                        self.radix.prune_subtree(mgr, partial);
+                    }
+                    node
+                }
+            };
+            if self.store.is_some()
+                && !self.radix.node_on_ssd(cur)
+                && !self.radix.flush_pending(cur)
+            {
+                self.flush_queue
+                    .push_back((cur, self.radix.node_generation(cur)));
+            }
+        }
+    }
+
+    /// Places one settled partial tail under `parent`: deduplicated
+    /// against full children and other partials, upgrading a shorter
+    /// partial in place when this donor settled further.
+    fn donate_partial(
+        &mut self,
+        mgr: &mut BlockManager,
+        parent: usize,
+        block: BlockId,
+        tokens: &[u32],
+    ) {
+        let release = |mgr: &mut BlockManager, block| {
+            let released = mgr.release(block);
+            debug_assert!(released.is_ok(), "finish released a foreign block");
+        };
+        // A resident full child already covers these rows bit-identically.
+        let covered = self.radix.full_children(parent).any(|node| {
+            self.radix.node_block(node).is_some()
+                && self.radix.node_tokens(node).starts_with(tokens)
+        });
+        if covered {
+            release(mgr, block);
+            return;
+        }
+        let partials: Vec<usize> = self.radix.partial_children(parent).to_vec();
+        for node in partials {
+            if self.radix.node_tokens(node).starts_with(tokens) {
+                // An equal-or-longer settled tail is already cached.
+                release(mgr, block);
+                return;
+            }
+            if tokens.starts_with(self.radix.node_tokens(node)) {
+                // This donor settled further along the same tail.
+                if let Some(old) = self.radix.upgrade_partial(node, tokens, block) {
+                    release(mgr, old);
+                }
+                return;
+            }
+        }
+        let node = self.radix.insert_partial_child(parent, tokens);
+        self.radix.set_resident(node, block);
+    }
+}
+
+/// Emits the terminal event and disposes of the sequence's blocks —
+/// donated into the prefix cache for clean finishes, released otherwise.
 fn finish(
     seq: &mut Seq,
     mgr: &mut BlockManager,
+    cache: Option<&mut CacheState>,
     reason: FinishKind,
     matched_stop_token: Option<u32>,
     error: Option<(ErrorCause, String)>,
@@ -291,12 +555,21 @@ fn finish(
         error,
         error_cause,
         preemptions: seq.preemptions,
+        cached_prompt_tokens: seq.cached_tokens,
         prefill_seconds: first.duration_since(seq.submitted_at).as_secs_f64(),
         decode_seconds: now.duration_since(first).as_secs_f64(),
     };
     let _ = (seq.on_event)(SeqEvent::Finished(summary));
-    let released = std::mem::take(&mut seq.table).release(mgr);
-    debug_assert!(released.is_ok(), "finish released a foreign block");
+    let table = std::mem::take(&mut seq.table);
+    match cache {
+        // Error finishes never donate: an engine fault mid-step leaves no
+        // settled-rows guarantee to stand on.
+        Some(state) if reason != FinishKind::Error => state.donate(mgr, seq, table),
+        _ => {
+            let released = table.release(mgr);
+            debug_assert!(released.is_ok(), "finish released a foreign block");
+        }
+    }
 }
 
 /// One planned decode/replay segment (index into `running` + its step).
@@ -343,7 +616,12 @@ fn sample_from_row(
 /// then the cancel/stop/emission/length checks (SPEC §6.2 steps 3-4).
 /// Identical on the synchronous and pipelined paths — only *when* it
 /// runs differs (immediately vs at the next `step()` call).
-fn settle_sampled(seq: &mut Seq, mgr: &mut BlockManager, token: u32) {
+fn settle_sampled(
+    seq: &mut Seq,
+    mgr: &mut BlockManager,
+    cache: Option<&mut CacheState>,
+    token: u32,
+) {
     if seq.finished {
         return;
     }
@@ -354,15 +632,15 @@ fn settle_sampled(seq: &mut Seq, mgr: &mut BlockManager, token: u32) {
     seq.history.push(token);
     seq.fed += 1;
     if seq.cancel.load(Ordering::Acquire) {
-        finish(seq, mgr, FinishKind::Cancelled, None, None);
+        finish(seq, mgr, cache, FinishKind::Cancelled, None, None);
     } else if seq.stop_tokens.contains(&token) {
         // Counted in usage but not emitted: stop text is excluded from
         // the stream by contract.
-        finish(seq, mgr, FinishKind::Stop, Some(token), None);
+        finish(seq, mgr, cache, FinishKind::Stop, Some(token), None);
     } else if !(seq.on_event)(SeqEvent::Token(token)) {
-        finish(seq, mgr, FinishKind::Cancelled, None, None);
+        finish(seq, mgr, cache, FinishKind::Cancelled, None, None);
     } else if seq.generated as usize >= seq.max_tokens {
-        finish(seq, mgr, FinishKind::Length, None, None);
+        finish(seq, mgr, cache, FinishKind::Length, None, None);
     }
 }
 
@@ -382,8 +660,14 @@ pub struct Engine<M> {
     /// The scheduled-but-unread decode step, when pipelining (never
     /// `Some` while the synchronous path plans/preempts/admits).
     inflight: Option<InFlight>,
+    /// Radix prefix cache + SSD tier (SPEC §6.3/§6.4), when enabled.
+    cache: Option<CacheState>,
+    /// Why the SSD tier is off despite being configured, if it failed to
+    /// open (silent-skip policy; the worker logs it once).
+    ssd_error: Option<String>,
     next_arrival: u64,
     preemptions_total: u64,
+    pipelined_total: u64,
     iterations: u64,
 }
 
@@ -420,6 +704,46 @@ impl<M: StepModel> Engine<M> {
             num_blocks: config.num_blocks,
             block_size: config.block_size,
         });
+        let mut ssd_error = None;
+        let cache = config.prefix_cache.then(|| {
+            let material = config
+                .ssd
+                .as_ref()
+                .map(|params| params.fingerprint.as_str())
+                .unwrap_or("");
+            let mut hasher = Sha256::new();
+            hasher.update(b"kiln-prefix-cache-v1;");
+            hasher.update(material.as_bytes());
+            let seed: ChainHash = hasher.finalize().into();
+            let store = config.ssd.as_ref().and_then(|params| {
+                let geometry = SlabGeometry {
+                    layers: dims.layers as u32,
+                    kv_heads: dims.kv_heads as u32,
+                    head_dim: dims.head_dim as u32,
+                    block_size: config.block_size as u32,
+                };
+                match SsdStore::open(&params.dir, seed, geometry, params.max_bytes) {
+                    Ok(store) => Some(store),
+                    Err(err) => {
+                        // SPEC §6.4 failure policy: the tier silently
+                        // degrades; requests are never affected.
+                        ssd_error = Some(format!(
+                            "ssd tier disabled: {err} ({})",
+                            params.dir.display()
+                        ));
+                        None
+                    }
+                }
+            });
+            CacheState {
+                radix: RadixCache::new(config.block_size, seed),
+                store,
+                flush_queue: VecDeque::new(),
+                hits_total: 0,
+                tokens_reused_total: 0,
+                tokens_reused_ssd_total: 0,
+            }
+        });
         Ok(Self {
             model,
             stream,
@@ -429,8 +753,11 @@ impl<M: StepModel> Engine<M> {
             waiting: VecDeque::new(),
             running: Vec::new(),
             inflight: None,
+            cache,
+            ssd_error,
             next_arrival: 0,
             preemptions_total: 0,
+            pipelined_total: 0,
             iterations: 0,
         })
     }
@@ -460,6 +787,74 @@ impl<M: StepModel> Engine<M> {
         self.preemptions_total
     }
 
+    /// Engine iterations since start (proto `WorkerStats.engine_steps_total`).
+    pub fn steps(&self) -> u64 {
+        self.iterations
+    }
+
+    /// Iterations that ran on the async_eval pipelined decode path.
+    pub fn pipelined_steps(&self) -> u64 {
+        self.pipelined_total
+    }
+
+    /// Why the configured SSD tier is inactive, if it failed to open.
+    pub fn ssd_error(&self) -> Option<&str> {
+        self.ssd_error.as_deref()
+    }
+
+    /// Prefix-cache observability snapshot (SPEC §5 `WorkerStats`).
+    pub fn cache_stats(&self) -> PrefixCacheStats {
+        let Some(state) = &self.cache else {
+            return PrefixCacheStats::default();
+        };
+        let mut stats = PrefixCacheStats {
+            enabled: true,
+            hits_total: state.hits_total,
+            tokens_reused_total: state.tokens_reused_total,
+            tokens_reused_ssd_total: state.tokens_reused_ssd_total,
+            resident_blocks: state.radix.resident_blocks() as u64,
+            ..PrefixCacheStats::default()
+        };
+        if let Some(store) = &state.store {
+            let counters = store.counters();
+            stats.ssd_blocks_stored = store.blocks_stored();
+            stats.ssd_bytes_stored = store.bytes_stored();
+            stats.ssd_reads_total = counters.reads_total;
+            stats.ssd_writes_total = counters.writes_total;
+            stats.ssd_writes_failed_total = counters.writes_failed_total;
+            stats.ssd_fingerprint_rejects_total = counters.fingerprint_rejects_total;
+        }
+        stats
+    }
+
+    /// Whether donated blocks still await capture/flush to the SSD tier —
+    /// the worker keeps ticking an idle engine while this is true.
+    pub fn has_pending_cache_io(&self) -> bool {
+        self.cache
+            .as_ref()
+            .is_some_and(|state| state.store.is_some() && !state.flush_queue.is_empty())
+    }
+
+    /// Drains the whole flush queue synchronously and waits for the writer
+    /// (worker drain/shutdown and tests; the steady-state path flushes
+    /// write-behind in small batches instead).
+    pub fn flush_prefix_cache(&mut self) {
+        let Self {
+            cache, kv, stream, ..
+        } = self;
+        let Some(state) = cache else { return };
+        while !state.flush_queue.is_empty() {
+            if flush_entries(state, kv, stream, usize::MAX) == 0 {
+                break;
+            }
+        }
+        if let Some(store) = &mut state.store {
+            for ack in store.sync() {
+                apply_ack(&mut state.radix, ack);
+            }
+        }
+    }
+
     pub fn is_idle(&self) -> bool {
         self.num_active() == 0
     }
@@ -473,6 +868,13 @@ impl<M: StepModel> Engine<M> {
     pub fn kv_used_bytes(&self) -> u64 {
         let live = (self.mgr.capacity() - self.mgr.num_free()) as u64;
         live * self.kv.bytes_per_block()
+    }
+
+    /// Pool-block gauges `(in use, free)` — proto `WorkerStats`
+    /// `kv_blocks_allocated` / `kv_blocks_free`.
+    pub fn kv_blocks(&self) -> (u64, u64) {
+        let free = self.mgr.num_free() as u64;
+        (self.mgr.capacity() as u64 - free, free)
     }
 
     /// Queues a request. Invalid or unservable requests get an immediate
@@ -510,6 +912,8 @@ impl<M: StepModel> Engine<M> {
             generated: 0,
             preemptions: 0,
             preempted: false,
+            cache_checked: false,
+            cached_tokens: 0,
             submitted_at: Instant::now(),
             first_token_at: None,
             finished: false,
@@ -536,6 +940,7 @@ impl<M: StepModel> Engine<M> {
             finish(
                 &mut seq,
                 &mut self.mgr,
+                None,
                 FinishKind::Error,
                 None,
                 Some(error),
@@ -554,8 +959,13 @@ impl<M: StepModel> Engine<M> {
     pub fn step(&mut self) -> Result<(), EngineError> {
         if let Some(prev) = self.inflight.take() {
             match self.pipelined_turn(prev) {
-                // A new step is in flight; the turn is complete.
-                Ok(true) => return Ok(()),
+                // A new step is in flight; the turn is complete. Flush
+                // captures would eval the pools and stall the overlap, so
+                // only the (cheap) write acks are applied.
+                Ok(true) => {
+                    self.cache_io_tick(0);
+                    return Ok(());
+                }
                 // Pipeline drained (readback applied); fall through to
                 // the synchronous path on fully-applied state.
                 Ok(false) => {}
@@ -568,14 +978,42 @@ impl<M: StepModel> Engine<M> {
         self.sweep_cancelled();
         self.admit();
         if self.running.is_empty() {
+            // Idle (or everything waiting on capacity): make write-behind
+            // progress so persistence never depends on new traffic.
+            self.cache_io_tick(FLUSH_BATCH);
             return Ok(());
         }
-        match self.run_iteration() {
+        let result = match self.run_iteration() {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.fail_all(&err.to_string());
                 Err(err)
             }
+        };
+        if result.is_ok() && self.inflight.is_none() {
+            // SPEC §6.2 step 5 (cache maintenance): a bounded number of
+            // block captures per synchronous step, plus writer acks.
+            self.cache_io_tick(FLUSH_BATCH);
+        }
+        result
+    }
+
+    /// Applies SSD writer acks and captures up to `captures` queued blocks
+    /// for the write-behind flush. Captures force pool evaluation, so the
+    /// pipelined turn passes 0.
+    fn cache_io_tick(&mut self, captures: usize) {
+        let Self {
+            cache, kv, stream, ..
+        } = self;
+        let Some(state) = cache else { return };
+        let Some(store) = &mut state.store else {
+            return;
+        };
+        for ack in store.drain_acks() {
+            apply_ack(&mut state.radix, ack);
+        }
+        if captures > 0 {
+            flush_entries(state, kv, stream, captures);
         }
     }
 
@@ -601,7 +1039,10 @@ impl<M: StepModel> Engine<M> {
         // build time (safe to release, see the module docs).
         next.rows
             .retain(|(arrival, _)| self.running.iter().any(|seq| seq.arrival == *arrival));
-        self.inflight = (!next.rows.is_empty()).then_some(next);
+        if !next.rows.is_empty() {
+            self.pipelined_total += 1;
+            self.inflight = Some(next);
+        }
         Ok(true)
     }
 
@@ -710,7 +1151,12 @@ impl<M: StepModel> Engine<M> {
                 continue;
             };
             let token = token.item_u32()?;
-            settle_sampled(&mut self.running[i], &mut self.mgr, token);
+            settle_sampled(
+                &mut self.running[i],
+                &mut self.mgr,
+                self.cache.as_mut(),
+                token,
+            );
         }
         self.running.retain(|seq| !seq.finished);
         if self.iterations.is_multiple_of(MAINTENANCE_INTERVAL) {
@@ -723,26 +1169,29 @@ impl<M: StepModel> Engine<M> {
     /// honored within 2 engine steps; this sweep plus the post-sample
     /// check keep it within 1).
     fn sweep_cancelled(&mut self) {
-        let mgr = &mut self.mgr;
-        for seq in &mut self.waiting {
+        let Self {
+            waiting,
+            running,
+            mgr,
+            cache,
+            ..
+        } = self;
+        for seq in waiting.iter_mut().chain(running.iter_mut()) {
             if seq.cancel.load(Ordering::Acquire) {
-                finish(seq, mgr, FinishKind::Cancelled, None, None);
+                finish(seq, mgr, cache.as_mut(), FinishKind::Cancelled, None, None);
             }
         }
-        self.waiting.retain(|seq| !seq.finished);
-        for seq in &mut self.running {
-            if seq.cancel.load(Ordering::Acquire) {
-                finish(seq, mgr, FinishKind::Cancelled, None, None);
-            }
-        }
-        self.running.retain(|seq| !seq.finished);
+        waiting.retain(|seq| !seq.finished);
+        running.retain(|seq| !seq.finished);
     }
 
     /// SPEC §6.2 step 1: admit while the token budget allows. One request
     /// prefills at a time (each step carries at most one prefill chunk),
-    /// so admission pauses while a prefill is in flight; the head of the
-    /// queue additionally waits until its admission projection fits in
-    /// free blocks (SPEC §6.4).
+    /// so admission pauses while a prefill is in flight. The head of the
+    /// queue gets its prefix-cache match here (SPEC §6.3 "on admit"), then
+    /// waits until its remaining admission projection fits in free blocks
+    /// (SPEC §6.4) — evicting cache-only blocks to make room before giving
+    /// up.
     fn admit(&mut self) {
         loop {
             let mid_prefill = self.running.iter().any(|seq| !seq.decoding());
@@ -750,17 +1199,210 @@ impl<M: StepModel> Engine<M> {
             if mid_prefill || !budget_left {
                 return;
             }
+            self.match_head_prefix();
             let Some(head) = self.waiting.front() else {
                 return;
             };
-            if self.mgr.num_free() < head.admission_blocks(self.mgr.block_size()) {
-                return;
+            let needed = head.admission_blocks(self.mgr.block_size());
+            while self.mgr.num_free() < needed {
+                let evicted = self
+                    .cache
+                    .as_mut()
+                    .is_some_and(|state| state.evict_one(&mut self.mgr));
+                if !evicted {
+                    return;
+                }
             }
             match self.waiting.pop_front() {
                 Some(seq) => self.running.push(seq),
                 None => return,
             }
         }
+    }
+
+    /// Longest-prefix match for the head of the waiting queue (SPEC §6.3):
+    /// reuse cached blocks (refcount++), skip those tokens in prefill.
+    /// Non-resident nodes are pulled from the SSD tier when possible; the
+    /// walk also discovers persisted blocks hash-first, which is how a
+    /// restarted worker warms up lazily (SPEC §6.4). Idempotent per
+    /// (re-)admission via `cache_checked`.
+    ///
+    /// Determinism rule (CLAUDE.md: prefix caching must not change greedy
+    /// outputs — KV bits are chunk-shape dependent, so no position may be
+    /// recomputed in a shape the cache-off run would not use):
+    /// - **containment**: when the cache covers every prefill position
+    ///   (`0..prompt.len()-2`, the resubmit/rerun case), serve all of it —
+    ///   including a partial tail block, whose first write resolves via
+    ///   copy-on-write — and recompute nothing;
+    /// - otherwise **trim to canonical `prefill_chunk` boundaries**, so
+    ///   every recomputed chunk has exactly the cold run's shape (causal
+    ///   attention makes per-row bits independent of later tokens within
+    ///   a chunk).
+    fn match_head_prefix(&mut self) {
+        let Self {
+            waiting,
+            mgr,
+            kv,
+            cache,
+            stream,
+            config,
+            ..
+        } = self;
+        let Some(state) = cache else { return };
+        let Some(seq) = waiting.front_mut() else {
+            return;
+        };
+        if seq.cache_checked {
+            return;
+        }
+        seq.cache_checked = true;
+        if seq.processed != 0 || !seq.table.blocks().is_empty() {
+            return;
+        }
+        let block_size = mgr.block_size();
+        // The last prompt token is always computed (its forward yields the
+        // first sampled logits).
+        let limit = seq.prompt.len() - 1;
+        let mut from_ssd = false;
+
+        // -- 1) Full-block walk: resolve (or SSD-load) nodes; no table
+        // mutation yet, since the serveable length is decided below.
+        let mut cur = ROOT;
+        let mut walked: Vec<BlockId> = Vec::new();
+        while (walked.len() + 1) * block_size <= limit {
+            let at = walked.len() * block_size;
+            let chunk = &seq.prompt[at..at + block_size];
+            let Some(node) = resolve_chunk(state, mgr, kv, stream, cur, chunk, &mut from_ssd)
+            else {
+                break;
+            };
+            let Some(block) = state.radix.node_block(node) else {
+                break;
+            };
+            state.radix.touch(node);
+            walked.push(block);
+            cur = node;
+        }
+        let d_full = walked.len() * block_size;
+
+        // -- 2) Containment probe: can a cached block cover the final
+        // `r` sub-block positions? (A full node's first rows, or a donated
+        // partial tail.)
+        let r = limit - d_full;
+        let mut tail: Option<BlockId> = None;
+        if r > 0 && r < block_size {
+            let want = &seq.prompt[d_full..limit];
+            let mut candidate = state
+                .radix
+                .full_children(cur)
+                .find(|&node| state.radix.node_tokens(node).starts_with(want));
+            if candidate.is_none() {
+                candidate = state
+                    .radix
+                    .partial_children(cur)
+                    .iter()
+                    .copied()
+                    .find(|&node| state.radix.node_tokens(node).starts_with(want));
+            }
+            if candidate.is_none()
+                && seq.prompt.len() >= d_full + block_size
+                && let Some(store) = state.store.as_ref()
+            {
+                // Hash-first discovery needs a full chunk's tokens, which
+                // the request has only when exactly one position is left
+                // to compute.
+                let chunk = &seq.prompt[d_full..d_full + block_size];
+                let hash = state.radix.chain_hash_of(cur, chunk);
+                if store.contains(&hash) {
+                    let node = state.radix.insert_child(cur, chunk);
+                    state.radix.set_on_ssd(node);
+                    candidate = Some(node);
+                }
+            }
+            if let Some(node) = candidate {
+                if state.radix.node_block(node).is_none()
+                    && !state.radix.node_is_partial(node)
+                    && state.radix.node_on_ssd(node)
+                {
+                    let tokens = state.radix.node_tokens(node).to_vec();
+                    if load_from_ssd(state, mgr, kv, stream, node, &tokens) {
+                        from_ssd = true;
+                    }
+                }
+                if let Some(block) = state.radix.node_block(node) {
+                    state.radix.touch(node);
+                    tail = Some(block);
+                }
+            }
+        }
+
+        // -- 3) Serve: containment in full, otherwise trimmed to the
+        // nearest *resumable* boundary of the canonical schedule (see
+        // `canonical_prefill_len`): absolute `prefill_chunk` multiples in
+        // the bulk region, absolute `prefill_fine_chunk` multiples inside
+        // the final partial super-chunk. Resuming there recomputes the
+        // remainder in exactly the cold schedule's shapes, which is what
+        // keeps warm outputs bit-identical to cache-off runs.
+        let (serve_full, serve_tail_rows) = if r == 0 || tail.is_some() {
+            (walked.len(), r)
+        } else {
+            let fine = config.prefill_fine_chunk.clamp(1, config.prefill_chunk);
+            let tail_start = limit / config.prefill_chunk * config.prefill_chunk;
+            let m = if d_full >= tail_start {
+                tail_start.max(d_full / fine * fine)
+            } else {
+                d_full / config.prefill_chunk * config.prefill_chunk
+            };
+            tail = (!m.is_multiple_of(block_size)).then(|| walked[m / block_size]);
+            (m / block_size, m % block_size)
+        };
+        let mut served = 0;
+        for &block in &walked[..serve_full] {
+            if mgr.retain(block).is_err() {
+                break;
+            }
+            if seq.table.push_full_block(block, block_size).is_err() {
+                let released = mgr.release(block);
+                debug_assert!(released.is_ok(), "match released a foreign block");
+                break;
+            }
+            served += block_size;
+        }
+        if served == serve_full * block_size
+            && serve_tail_rows > 0
+            && let Some(block) = tail
+            && mgr.retain(block).is_ok()
+        {
+            if seq
+                .table
+                .push_partial_block(block, serve_tail_rows, block_size)
+                .is_ok()
+            {
+                served += serve_tail_rows;
+            } else {
+                let released = mgr.release(block);
+                debug_assert!(released.is_ok(), "match released a foreign block");
+            }
+        }
+        if served == 0 {
+            return;
+        }
+        seq.processed = served;
+        if seq.processed + 1 == seq.prompt.len() && seq.history.is_empty() {
+            // Fully-covered prompt: the sequence decodes immediately,
+            // feeding the last prompt token (mirrors prefill completion).
+            seq.history.push(seq.prompt[seq.processed]);
+        }
+        seq.cached_tokens = seq.cached_tokens.max(served as u32);
+        state.hits_total += 1;
+        state.tokens_reused_total += served as u64;
+        if from_ssd {
+            state.tokens_reused_ssd_total += served as u64;
+        }
+        let _ = (seq.on_event)(SeqEvent::PrefixHit {
+            tokens: served as u32,
+            from_ssd,
+        });
     }
 
     fn run_iteration(&mut self) -> Result<(), EngineError> {
@@ -801,8 +1443,13 @@ impl<M: StepModel> Engine<M> {
             let seq = &self.running[i];
             // Phase-3/mlx-lm chunk rule: prefill covers prompt[..n-1]; the
             // last prompt token is fed by the first sampled (decode) step.
-            let remaining = seq.prompt.len() - 1 - seq.processed;
-            let chunk = remaining.min(self.config.prefill_chunk).min(budget);
+            let chunk = canonical_prefill_len(
+                seq.processed,
+                seq.prompt.len() - 1,
+                self.config.prefill_chunk,
+                self.config.prefill_fine_chunk,
+            )
+            .min(budget);
             if chunk > 0
                 && let Some(step) = self.plan_step(i, chunk, false, &mut decode_plans)?
             {
@@ -877,6 +1524,7 @@ impl<M: StepModel> Engine<M> {
                 let outputs: Vec<&Array> = sampled.iter().map(|(_, token)| token).collect();
                 async_eval(&outputs)?;
             }
+            self.pipelined_total += 1;
             self.inflight = Some(InFlight {
                 rows: sampled
                     .into_iter()
@@ -899,7 +1547,12 @@ impl<M: StepModel> Engine<M> {
         // --- Emit, check stops, release finished (SPEC §6.2 steps 3-4).
         for (i, token) in &sampled {
             let token = token.item_u32()?;
-            settle_sampled(&mut self.running[*i], &mut self.mgr, token);
+            settle_sampled(
+                &mut self.running[*i],
+                &mut self.mgr,
+                self.cache.as_mut(),
+                token,
+            );
         }
         // Replay segments advance silently: their tokens were emitted
         // before the preemption.
@@ -968,9 +1621,19 @@ impl<M: StepModel> Engine<M> {
             )? {
                 return Ok(Some(step));
             }
-            // Out of blocks: preempt the least-deserving block-holder
-            // (the requester competes with its own key, so a newcomer
-            // can never displace a more deserving request).
+            // Out of blocks: reclaim from the prefix cache first — its
+            // sole-owned LRU leaves are free memory (SPEC §6.3 eviction) —
+            // and only then preempt anyone.
+            if self
+                .cache
+                .as_mut()
+                .is_some_and(|state| state.evict_one(&mut self.mgr))
+            {
+                continue;
+            }
+            // Preempt the least-deserving block-holder (the requester
+            // competes with its own key, so a newcomer can never displace
+            // a more deserving request).
             let victim = self
                 .running
                 .iter()
@@ -1001,6 +1664,7 @@ impl<M: StepModel> Engine<M> {
                         finish(
                             &mut self.running[i],
                             &mut self.mgr,
+                            self.cache.as_mut(),
                             FinishKind::Error,
                             None,
                             Some((ErrorCause::Capacity, error)),
@@ -1025,6 +1689,9 @@ impl<M: StepModel> Engine<M> {
         seq.fed = 0;
         seq.preemptions += 1;
         seq.preempted = true;
+        // The resume re-consults the prefix cache (its old blocks are
+        // gone; a sibling's donation may cover the prompt by then).
+        seq.cache_checked = false;
         self.preemptions_total += 1;
     }
 
@@ -1039,6 +1706,7 @@ impl<M: StepModel> Engine<M> {
             finish(
                 seq,
                 mgr,
+                None, // error finishes never donate
                 FinishKind::Error,
                 None,
                 Some((ErrorCause::Internal, format!("engine step failed: {error}"))),
@@ -1046,6 +1714,14 @@ impl<M: StepModel> Engine<M> {
         }
         self.running.clear();
         self.waiting.clear();
+        // The prefix cache dies with the pools: its nodes name blocks of
+        // the manager being rebuilt below and KV whose pending graphs may
+        // be poisoned. SSD copies survive (their bytes were captured from
+        // settled state) and are re-discovered hash-first on later walks.
+        if let Some(state) = &mut self.cache {
+            state.radix.reset();
+            state.flush_queue.clear();
+        }
         // Rebuild ownership state from scratch in case the fault interrupted
         // an append mid-flight; drop pool storage with possibly-poisoned
         // pending graphs.
@@ -1055,6 +1731,184 @@ impl<M: StepModel> Engine<M> {
         self.kv.reset();
         let _ = memory::clear_cache();
     }
+}
+
+/// Resolves the child of `cur` keyed by `chunk` for a match walk:
+/// existing node, or hash-first discovery from the SSD index. Ensures the
+/// node is resident (loading from SSD when needed); `None` means the walk
+/// stops here (silent-skip policy).
+fn resolve_chunk(
+    state: &mut CacheState,
+    mgr: &mut BlockManager,
+    kv: &mut PagedKv,
+    stream: &Stream,
+    cur: usize,
+    chunk: &[u32],
+    from_ssd: &mut bool,
+) -> Option<usize> {
+    let node = match state.radix.child(cur, chunk) {
+        Some(node) => node,
+        None => {
+            let store = state.store.as_ref()?;
+            let hash = state.radix.chain_hash_of(cur, chunk);
+            if !store.contains(&hash) {
+                return None;
+            }
+            let node = state.radix.insert_child(cur, chunk);
+            state.radix.set_on_ssd(node);
+            node
+        }
+    };
+    if state.radix.node_block(node).is_none() {
+        if !state.radix.node_on_ssd(node) || state.store.is_none() {
+            // Unreachable bookkeeping (non-resident, nothing on SSD):
+            // drop the dead subtree and stop.
+            state.radix.prune_subtree(mgr, node);
+            return None;
+        }
+        if !load_from_ssd(state, mgr, kv, stream, node, chunk) {
+            return None;
+        }
+        *from_ssd = true;
+    }
+    Some(node)
+}
+
+/// Pulls one persisted block into the pool for a non-resident radix node
+/// (SPEC §6.4 read path). Returns false — after cleaning up — when the
+/// slot is missing, fails verification, or no pool block can be freed;
+/// failures are silent by policy.
+fn load_from_ssd(
+    state: &mut CacheState,
+    mgr: &mut BlockManager,
+    kv: &mut PagedKv,
+    stream: &Stream,
+    node: usize,
+    chunk: &[u32],
+) -> bool {
+    let hash = state.radix.node_hash(node);
+    let pool_tag = kv.dtype().map(dtype_tag);
+    let Some(store) = &mut state.store else {
+        return false;
+    };
+    let Some((payload, tag)) = store.read(&hash, chunk, pool_tag) else {
+        // Verification failed (torn slot, dtype change, evicted file):
+        // the store dropped its index entry; drop the dead subtree too.
+        state.radix.prune_subtree(mgr, node);
+        return false;
+    };
+    let Some(dtype) = dtype_from_tag(tag) else {
+        state.radix.prune_subtree(mgr, node);
+        return false;
+    };
+    let block = match mgr.allocate() {
+        Ok(block) => Some(block),
+        Err(_) => state.evict_one(mgr).then(|| mgr.allocate().ok()).flatten(),
+    };
+    let Some(block) = block else {
+        return false; // pool genuinely full of live requests; miss
+    };
+    if kv
+        .write_block_bytes(block, &payload, dtype, stream)
+        .is_err()
+    {
+        let released = mgr.release(block);
+        debug_assert!(released.is_ok(), "load released a foreign block");
+        return false;
+    }
+    state.radix.set_resident(node, block);
+    true
+}
+
+/// Captures up to `max` queued blocks and hands them to the SSD writer
+/// (write-behind flush). Skips stale, already-flushed, or non-resident
+/// entries; capture failures drop the entry (silent-skip policy).
+fn flush_entries(state: &mut CacheState, kv: &PagedKv, stream: &Stream, max: usize) -> usize {
+    let Some(store) = &mut state.store else {
+        state.flush_queue.clear();
+        return 0;
+    };
+    let Some(dtype) = kv.dtype() else {
+        // Nothing has been written yet, so nothing donatable exists;
+        // queued entries (there should be none) can only be stale.
+        state.flush_queue.clear();
+        return 0;
+    };
+    let tag = dtype_tag(dtype);
+    let size = dtype.size() as u32;
+    let mut flushed = 0;
+    while flushed < max {
+        let Some((node, generation)) = state.flush_queue.pop_front() else {
+            break;
+        };
+        if !state.radix.is_live(node, generation)
+            || state.radix.node_on_ssd(node)
+            || state.radix.flush_pending(node)
+        {
+            continue;
+        }
+        let Some(block) = state.radix.node_block(node) else {
+            continue;
+        };
+        let Ok(payload) = kv.read_block_bytes(block, stream) else {
+            continue;
+        };
+        store.enqueue_write(
+            crate::ssd::FlushTicket {
+                node,
+                generation,
+                hash: state.radix.node_hash(node),
+            },
+            state.radix.node_tokens(node),
+            payload,
+            tag,
+            size,
+        );
+        state.radix.set_flush_pending(node);
+        flushed += 1;
+    }
+    flushed
+}
+
+/// Applies one SSD writer ack to the radix bookkeeping.
+fn apply_ack(radix: &mut RadixCache, ack: crate::ssd::FlushAck) {
+    if !radix.is_live(ack.node, ack.generation) || radix.node_hash(ack.node) != ack.hash {
+        return;
+    }
+    if ack.ok {
+        radix.set_on_ssd(ack.node);
+    } else {
+        // Allow a later donation to retry the flush.
+        radix.clear_flush_pending(ack.node);
+    }
+}
+
+/// Stable on-disk dtype tags for slab headers (never renumber).
+fn dtype_tag(dtype: Dtype) -> u32 {
+    match dtype {
+        Dtype::Bool => 1,
+        Dtype::Uint8 => 2,
+        Dtype::Uint16 => 3,
+        Dtype::Uint32 => 4,
+        Dtype::Int32 => 5,
+        Dtype::Float16 => 6,
+        Dtype::Bfloat16 => 7,
+        Dtype::Float32 => 8,
+    }
+}
+
+fn dtype_from_tag(tag: u32) -> Option<Dtype> {
+    Some(match tag {
+        1 => Dtype::Bool,
+        2 => Dtype::Uint8,
+        3 => Dtype::Uint16,
+        4 => Dtype::Uint32,
+        5 => Dtype::Int32,
+        6 => Dtype::Float16,
+        7 => Dtype::Bfloat16,
+        8 => Dtype::Float32,
+        _ => return None,
+    })
 }
 
 /// Appends `len` token slots to the sequence's table and derives the write
@@ -1101,4 +1955,61 @@ fn build_seq_step(
         blocks: seq.table.blocks().to_vec(),
         writes,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_prefill_len;
+
+    /// Walks the schedule from `start`, returning (offset, len) segments.
+    fn walk(start: usize, limit: usize, chunk: usize, fine: usize) -> Vec<(usize, usize)> {
+        let mut at = start;
+        let mut segments = Vec::new();
+        while at < limit {
+            let len = canonical_prefill_len(at, limit, chunk, fine);
+            assert!(len >= 1 && at + len <= limit, "bad segment ({at}, {len})");
+            segments.push((at, len));
+            at += len;
+        }
+        segments
+    }
+
+    #[test]
+    fn schedule_shapes_and_boundaries() {
+        // Sub-super-chunk prompt: pure fine grid plus remainder.
+        assert_eq!(
+            walk(0, 248, 2048, 64),
+            vec![(0, 64), (64, 64), (128, 64), (192, 56)]
+        );
+        // Bulk super-chunk, then the fine tail.
+        let schedule = walk(0, 4095, 2048, 64);
+        assert_eq!(schedule[0], (0, 2048));
+        assert_eq!(schedule[1], (2048, 64));
+        assert_eq!(*schedule.last().unwrap(), (4032, 63));
+        // fine >= chunk degenerates to the pre-Phase-5 schedule.
+        assert_eq!(walk(0, 248, 2048, 2048), vec![(0, 248)]);
+        assert_eq!(walk(0, 4095, 2048, 2048), vec![(0, 2048), (2048, 2047)]);
+        // Exact super-chunk multiple: no partial tail exists.
+        assert_eq!(walk(0, 4096, 2048, 64), vec![(0, 2048), (2048, 2048)]);
+    }
+
+    /// The bit-exactness property: resuming at any boundary of the cold
+    /// schedule yields exactly the cold schedule's suffix — no (offset,
+    /// length) shape a cold run would not produce.
+    #[test]
+    fn schedule_is_resume_invariant() {
+        for &(chunk, fine) in &[(16_usize, 4_usize), (2048, 64), (8, 8), (48, 48)] {
+            for limit in 1..=(3 * chunk + 5) {
+                let cold = walk(0, limit, chunk, fine);
+                for i in 0..cold.len() {
+                    let (offset, _) = cold[i];
+                    assert_eq!(
+                        walk(offset, limit, chunk, fine),
+                        cold[i..],
+                        "resume at {offset} diverges (limit {limit}, chunk {chunk}, fine {fine})"
+                    );
+                }
+            }
+        }
+    }
 }

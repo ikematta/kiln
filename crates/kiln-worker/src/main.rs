@@ -23,9 +23,13 @@ fn main() -> std::process::ExitCode {
         .with_target(false)
         .init();
 
+    const USAGE: &str = "usage: kiln-worker --model <dir> --socket <path> [--model-id <id>] \
+                         [--no-prefix-cache] [--ssd-dir <dir>] [--ssd-max-gb <n>]";
+
     let mut model: Option<PathBuf> = None;
     let mut socket: Option<PathBuf> = None;
     let mut model_id: Option<String> = None;
+    let mut cache = engine::CacheOptions::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -33,16 +37,27 @@ fn main() -> std::process::ExitCode {
             "--model" => value("--model").map(|v| model = Some(PathBuf::from(v))),
             "--socket" => value("--socket").map(|v| socket = Some(PathBuf::from(v))),
             "--model-id" => value("--model-id").map(|v| model_id = Some(v)),
+            // SPEC §10 [defaults]: prefix cache + SSD tier config flags.
+            "--no-prefix-cache" => {
+                cache.prefix_cache = false;
+                Ok(())
+            }
+            "--ssd-dir" => value("--ssd-dir").map(|v| cache.ssd_dir = Some(PathBuf::from(v))),
+            "--ssd-max-gb" => value("--ssd-max-gb").and_then(|v| {
+                v.parse::<u64>()
+                    .map(|gb| cache.ssd_max_bytes = gb << 30)
+                    .map_err(|_| format!("--ssd-max-gb needs an integer, got {v:?}"))
+            }),
             other => Err(format!("unknown argument {other:?}")),
         };
         if let Err(err) = result {
             eprintln!("kiln-worker: {err}");
-            eprintln!("usage: kiln-worker --model <dir> --socket <path> [--model-id <id>]");
+            eprintln!("{USAGE}");
             return std::process::ExitCode::FAILURE;
         }
     }
     let (Some(model), Some(socket)) = (model, socket) else {
-        eprintln!("usage: kiln-worker --model <dir> --socket <path> [--model-id <id>]");
+        eprintln!("{USAGE}");
         return std::process::ExitCode::FAILURE;
     };
     let model_id = model_id.unwrap_or_else(|| {
@@ -52,7 +67,7 @@ fn main() -> std::process::ExitCode {
             .unwrap_or_else(|| "unknown".to_owned())
     });
 
-    match run(model, socket, model_id) {
+    match run(model, socket, model_id, cache) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("kiln-worker: {err}");
@@ -66,6 +81,7 @@ fn run(
     model: std::path::PathBuf,
     socket: std::path::PathBuf,
     model_id: String,
+    cache: engine::CacheOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
 
@@ -86,8 +102,8 @@ fn run(
     tracing::info!(model = %model_id, path = %model.display(),
         dtype = %info.dtype, "starting worker");
 
-    let shared = Arc::new(engine::Shared::new(model_id, info));
-    let submissions = engine::spawn(model.clone(), Arc::clone(&shared))?;
+    let shared = Arc::new(engine::Shared::new(model_id, info, &cache));
+    let submissions = engine::spawn(model.clone(), Arc::clone(&shared), cache)?;
     let service = service::WorkerService::new(shared, submissions);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

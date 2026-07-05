@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 
 def _counter(text: str, name: str, **labels) -> float:
@@ -56,3 +57,37 @@ def test_request_counters_increment(stack, client):
     assert (
         'kiln_http_request_duration_seconds_bucket{path="/v1/chat/completions"' in after
     )
+
+
+def test_worker_stats_reexported_with_model_label(stack, client):
+    """Phase 5: the gateway polls the worker's Stats RPC alongside Health
+    and re-exports it with a `model` label (SPEC §5/§2.3). The python
+    worker has no Stats yet — the gateway must simply skip it."""
+    client.chat.completions.create(
+        model=stack.model_id,
+        messages=[{"role": "user", "content": "Say hello."}],
+        temperature=0,
+        max_tokens=8,
+    )
+
+    if stack.worker_kind != "rust":
+        return  # nothing re-exported; the call above must still succeed
+
+    # Stats is polled on the 1s health cadence; allow a few ticks.
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        text = stack.metrics_text()
+        if _counter(text, "kiln_worker_engine_steps_total", model=stack.model_id) > 0:
+            break
+        time.sleep(0.5)
+    else:
+        raise AssertionError("kiln_worker_engine_steps_total never appeared")
+
+    assert _counter(text, "kiln_worker_requests_total", model=stack.model_id) >= 1
+    assert (
+        _counter(text, "kiln_worker_tokens_generated_total", model=stack.model_id) > 0
+    )
+    blocks = _counter(
+        text, "kiln_worker_kv_blocks_allocated", model=stack.model_id
+    ) + _counter(text, "kiln_worker_kv_blocks_free", model=stack.model_id)
+    assert blocks == 512, f"block gauges should cover the pool, got {blocks}"

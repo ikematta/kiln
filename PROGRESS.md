@@ -1268,3 +1268,400 @@
   prefix cache + SSD tier (SPEC §12). Carry-forward for Phase 5: the
   stale-speculative-tail-row invariant above must be part of the radix
   integration review.
+
+## [2026-07-04] Phase 5 — Radix prefix cache + SSD tier — DONE
+- What:
+  - **Step zero (the Phase-4 carry-forward) resolved first**: under radix
+    sharing, "future owners rewrite every row below their length" no
+    longer holds, so the pipeline's discarded speculative row needed a
+    decision. Chosen: **(b), narrowed to the exact hazardous slot** —
+    only settled rows (`processed + fed`, each forced by a token
+    readback or step-boundary eval) are ever keyed by the cache; the
+    discarded in-flight row sits exactly at that boundary and is never
+    served. Its block either returns to the free list (only writers can
+    reacquire it; stale write is stream-ordered before any rewrite) or
+    carries the row beyond the keyed range where request-length trims
+    and COW keep it unreachable. Option (a) (force the readback) was
+    rejected: a pipeline stall at every stop to save at most one
+    cacheable block per pipelined finish, resting on a four-layer
+    laziness argument no reader ever checks. Pinned by
+    `kiln-engine/tests/pipeline_discard.rs`: a mock model whose logits
+    are checksum-tied to gathered KV runs a pipelined stop (in-flight
+    row = last slot of a full block) immediately followed by a prefix
+    match over that region — asserts the exact settled match bound,
+    bit-equality with a cache-cold run, and a cancel variant; the test
+    fails under mutation of the donation bound (verified).
+  - `kiln-engine/src/radix.rs`: block-aligned radix tree (SPEC §6.3) —
+    refcount integration with the Phase-4 block manager, leaf-first LRU
+    eviction of sole-owned blocks ahead of any preemption, sha256 chain
+    hashes, partial leaves for donated settled tails. COW integration:
+    reusing a partial tail leaves the next append to the existing
+    `append_tokens` copy-on-write path (previously unreachable, now the
+    hot containment path). `PrefixCacheHit` events + capability flag +
+    `Finished.cached_prompt_tokens` wired through the worker (existing
+    proto fields only; wire semantics untouched).
+  - `kiln-engine/src/ssd.rs` (SPEC §6.4): fixed-layout slabs, 64 slots
+    per file, header = magic/version/geometry/dtype/model fingerprint;
+    slot = chain hash + token ids (verified on read) + payload sha256
+    (torn slots detectable) + raw K/V bytes. Async flush on a dedicated
+    writer thread with acks (a block is readable only after its write
+    acked); write-behind capture bounded to 2 blocks per synchronous
+    step, never during a pipelined turn; idle worker drains the queue.
+    Startup index scan from headers only; strict fingerprint check =
+    silent skip + counter; LRU byte cap unlinks whole slabs. Restart
+    warm-load is lazy and hash-first during prefix walks.
+  - **Determinism hazard found and fixed mid-phase**: the e2e
+    reproducibility gate caught warm reruns diverging bitwise — a
+    sub-block remainder re-prefilled as one odd-length chunk hits
+    different kernel dispatches than the cold run's chunking, and KV
+    bits are chunk-shape dependent. Rule now enforced: a hit is either
+    **full containment** (every prefill position served, incl. partial
+    tail; nothing recomputed) or **trimmed to canonical prefill_chunk
+    boundaries** (every recomputed chunk has the cold run's exact
+    shape; causality keeps per-row bits independent of later tokens in
+    a chunk). Consequence: sub-2048-token *divergent* overlaps are not
+    served at all — resubmits/reruns (the acceptance case) get 100%
+    containment.
+  - Side task (metrics audit): gateway `/metrics` was gateway-local
+    counters only and the worker's `Stats` RPC was UNIMPLEMENTED.
+    Implemented both ends per SPEC §5/§2.3: worker `Stats` fills every
+    proto field except spec-decode + step-overhead percentiles (zeros;
+    Phase 8 / needs an in-engine reservoir); supervisor polls Stats on
+    the 1s Health cadence and re-exports per-model `kiln_worker_*`
+    gauges; python worker's UNIMPLEMENTED is skipped for that worker
+    lifetime. e2e asserts the labeled gauges appear.
+  - Config flags: engine `EngineConfig{prefix_cache, ssd}`; worker
+    `--no-prefix-cache/--ssd-dir/--ssd-max-gb`; gateway passes
+    `[defaults] ssd_tier/ssd_cache_max_gb` + `server.cache_dir` to rust
+    workers; slabs at `<cache_dir>/<weights_fingerprint>/blocks/`.
+- Decisions:
+  - Preemption suite runs `prefix_cache: false`: it pins exact
+    preemption counts and pool arithmetic that donated-but-evictable
+    blocks would shift; cache-on preemption interplay (resume
+    re-matching) is covered by the cache tests. Not a weakening — the
+    suites' assertions are unchanged.
+  - Partial tails are pool-only (not persisted): a restart therefore
+    serves containment only when the donor's settled stream covers the
+    request's last needed block — the tail chunk is hash-discoverable
+    exactly when `(p-1) % block_size == block_size - 1` or generation
+    crossed the boundary. Persisting partial slots would add slot
+    upgrade churn for a 1-in-32 restart gap; revisit if warm-restart
+    hit rates matter in practice.
+  - Leak gate (batched) now runs cache-on: preemption churn there fell
+    (3 vs 45 events — eviction absorbs pressure), which is the feature
+    working; the preemption suite retains dense preemption coverage.
+- Deviations:
+  - SPEC §6.4 says flushes ride "a dedicated tokio blocking pool";
+    kiln-engine has no tokio (the engine loop is a plain OS thread per
+    SPEC §6.2), so a dedicated writer thread + ack channel implements
+    the same contract.
+  - SPEC §6.4 says reads are "mmap + copy"; used `pread`
+    (`FileExt::read_exact_at`) — mmap requires `unsafe` outside
+    kiln-mlx, forbidden by CLAUDE.md. Same copy semantics, one syscall.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --test prefix_cache -- --nocapture
+  2k resubmit: reused 2047/2048 (100.0% skip), TTFT 1279.2ms -> 20.4ms (62.7x)
+  pipelined stop on real weights: settled 87, containment rerun reused 81,
+    divergent extension unserved, both == cold
+  SSD restart: reused 511 tokens from disk, reads 16, output bit-exact
+  corrupt slab header: ignored (rejects 1), cold run bit-exact
+  test result: ok. 1 passed (live objects back to baseline)
+  $ cargo test -p kiln-engine --test pipeline_discard -- --nocapture
+  pipelined stop: match trimmed to settled blocks; warm == cold
+  pipelined cancel: 3 generated, match 4 <= aligned settled 8
+  test result: ok. 1 passed   (fails under donation-bound mutation: verified)
+  $ cargo test -p kiln-engine   (radix_props + ssd + radix + block units)
+  lib 20 passed; block_props 2 passed; paged/pipeline_discard/radix_props/
+  sampler each ok
+  $ cargo test -p kiln-worker --test rpc -- prefix_cache_stats_and_ssd_restart
+  stats over RPC: requests_total 2, prefix_tokens_reused_total 63,
+  kv_blocks 3+509=512, ssd_writes 2; restart hit: tokens_reused 63, from_ssd
+  test result: ok
+  $ cargo test -p kiln-models --test golden -- --nocapture   (CRITICAL GATE)
+  all 5 fixtures — exact match (batched/paged engine, prefix cache on)
+  all 5 fixtures — exact match at decode width 16
+  $ cargo test -p kiln-models --test batching / preemption / leak_batched
+  all sections ok; preemption exact counts unchanged (cache off there);
+  leak gate: live objects 0 -> 0 (cache on)
+  $ cargo test --workspace -> all test targets ok (exactly as CI runs it)
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+    (incl. test_greedy_is_reproducible[rust] — the gate that caught the
+     chunk-shape divergence — and the new worker-stats re-export test)
+  $ uv run --project python/kiln_worker_py pytest -q -> 28 passed
+  $ cargo test -p kiln-models --release --test throughput -- --ignored
+  single-stream 124.4 (generate) / 124.6 (engine batch 1) tok/s
+  batch-16 aggregate: 416.0 tok/s -> 3.34x   (Phase-4 gate intact)
+  $ cargo bench -p kiln-engine --bench step_overhead
+  engine/step_overhead_batch16 time: [166.70 µs 167.30 µs 167.93 µs]
+  $ cargo run -p kiln-mlx --example smoke -> 3.0 ; proto codegen diff clean
+  $ cargo fmt --all --check -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean
+  $ cargo build --workspace --no-default-features -> clean
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- Next: PM phase gate on Phase 5 (SPEC §13.4: bench + e2e on PM
+  hardware), then Phase 6 — Qwen + Gemma models, quantization matrix,
+  `worker="auto"` routing (SPEC §12). Notes for the gate: (a) the
+  determinism rule trades sub-chunk reuse on *divergent* prefixes for
+  bit-exactness — multi-turn chat reuses nothing until the shared
+  prefix crosses `prefill_chunk` (2048); if that matters before Phase 7,
+  the options are canonical-shape re-prefill of the shared region
+  (costs compute, keeps bits) or an ADR relaxing determinism for
+  partial hits; (b) WorkerStats step-overhead percentiles are zero
+  until an in-engine reservoir exists (criterion covers the gate);
+  (c) partial tails are not persisted (see Decisions) — restart
+  containment holds when generation crossed a block boundary.
+
+## [2026-07-04] Phase 5 / Gate follow-up — multi-turn reuse quantification — DONE
+- What:
+  - PM asked for the real-world impact of the trim-to-canonical-chunk
+    rule before merging. Added
+    `crates/kiln-models/tests/prefix_multiturn.rs`: a realistic 8-turn
+    conversation (600-token opening prompt; each turn appends the
+    64-token reply plus a 90-200-token user increment) run sequentially
+    against the warm cache, with a cache-cold reference per turn. The
+    test asserts only correctness (warm == cold bit-exact every turn —
+    holds — and that any served hit obeys the canonical-boundary rule);
+    the skip percentages are measurements, not gates.
+  - Measured (debug build, M-series, llama-3.2-1b-4bit):
+    ```
+    turn | prompt | reused | skip%  | F=32 would | warm TTFT | cold TTFT
+       0 |    600 |      0 |   0.0% |          0 |   384.7ms |   369.9ms
+       1 |    844 |      0 |   0.0% |        640 |   518.7ms |   520.2ms
+       2 |   1028 |      0 |   0.0% |        896 |   624.7ms |   634.5ms
+       3 |   1252 |      0 |   0.0% |       1088 |   769.8ms |   771.8ms
+       4 |   1406 |      0 |   0.0% |       1312 |   838.3ms |   840.5ms
+       5 |   1670 |      0 |   0.0% |       1440 |  1014.1ms |  1019.6ms
+       6 |   1884 |      0 |   0.0% |       1728 |  1135.7ms |  1152.4ms
+       7 |   2088 |      0 |   0.0% |       1920 |  1362.7ms |  1288.7ms
+    ```
+    Every turn: 0% skip; warm TTFT == cold TTFT, growing linearly with
+    conversation length. Turn 7's donor overlap was 1947 tokens and
+    still trimmed to zero (floor(1947/2048)·2048). A block-granular
+    (F=32) trim would have served 76-93% per turn; F=256 within ~7% of
+    that. The cache currently pays only for exact resubmits/retries
+    (containment: 100% skip, 62x TTFT) and shared prefixes >= 2048.
+- Direct answer: **2048-token granularity is not acceptable if
+  multi-turn conversations are part of the caching value proposition.**
+  For the entire realistic conversation window (< ~2k accumulated
+  tokens) the prefix cache does nothing, and per-turn TTFT grows
+  linearly exactly where prefix caching is supposed to flatten it.
+- DECISION NEEDED: how to narrow reuse granularity without reopening
+  the chunk-shape bit-divergence bug that e2e caught (KV bits depend on
+  prefill chunk shapes; a warm remainder recomputed in a shape the cold
+  run never uses can flip greedy outputs).
+  - **Option A — keep 2048 (status quo).** Zero risk, zero work. The
+    cache remains a resubmit/retry and long-RAG-prefix feature until
+    revisited (e.g., alongside Phase 7 kernel work). Multi-turn gets
+    nothing.
+  - **Option B — hybrid canonical schedule with a fine absolute grid in
+    the tail (recommended, pending approval).** Keep 2048-token bulk
+    chunks; process the *final partial 2048 super-chunk* of every
+    prefill on an absolute F-token grid (chunks split at absolute
+    multiples of F, plus the final sub-F remainder). Warm resumes may
+    then start at any F boundary: every recomputed segment is a
+    (offset, length) pair the cold path uses *for that same prompt* —
+    the fixed-set-of-shapes requirement — so bit-exactness holds by
+    construction rather than by kernel-dispatch luck. Expected
+    multi-turn skip from the measured overlaps: 76-93% per turn at
+    F=32; F=64 within one block of that while halving the added
+    dispatches. Costs/risks, and why this needs a PM decision:
+    (1) it changes the canonical schedule for every prompt whose tail
+    is < 2048 — cold KV bits shift for all sub-2k prompts — so the
+    golden suite must be re-validated against the mlx-lm reference,
+    whose own schedule stays one 2048 chunk; if any fixture's token ids
+    diverge, proceeding requires the SPEC §11.2 relaxed bar + ADR
+    (human approval), else fall back to A. This is the gating risk.
+    (2) Cold prefill gains up to 2048/F extra small forwards for the
+    tail region (~32 at F=64); needs a before/after TTFT bench as part
+    of acceptance. (3) Containment/partial-tail behavior (exact
+    resubmits at 100%) is unaffected.
+  - **Option C — ADR relaxing bit-determinism for divergent-prefix hits
+    only (vLLM-style).** Serve block-granular reuse and accept low-bit
+    KV drift on extended prompts (exact resubmits stay bit-exact via
+    containment). Maximum reuse, no schedule change, but it repeals the
+    CLAUDE.md/SPEC determinism clause for a whole request class and
+    requires carving exceptions into the tests that assert it — not
+    recommended while B is untried.
+  - Recommendation if forced to pick: **B at F=64**, gated on the
+    golden suite staying exact after the schedule change and a
+    cold-TTFT bench delta within noise; escalate to A-vs-C only if a
+    golden fixture diverges. Not implemented — no caching-logic changes
+    in this session per instruction.
+- Deviations: none (investigation + one test only).
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --test prefix_multiturn -- --nocapture
+  (table above) ... warm == cold bit-exact on all 8 turns; served hits
+  obey the canonical-boundary rule; live objects back to baseline
+  test result: ok. 1 passed in 25.58s
+  $ cargo fmt --all --check -> clean
+  $ cargo clippy -p kiln-models --all-targets -- -D warnings -> clean
+  ```
+- Next: PM decision on the granularity options above; Phase 5 merge
+  gate otherwise unchanged (previous entry).
+
+## [2026-07-04] Phase 5 / Option B step 2 — golden gate on the fine-tail schedule — DONE (GATE PASSED)
+- What: ran the full golden-token parity harness against the F=64
+  canonical schedule (previous commit). Under the new schedule every
+  fixture's prefill is re-chunked — e.g. raw-long-prefill's 248 prefill
+  positions run as 64+64+64+56 instead of one 248-token chunk — while
+  the committed fixture ids remain mlx-lm's single-2048-chunk reference.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --test golden -- --nocapture   (THE GATE)
+  golden chat-basic:        48 prompt, 64 gen  — exact match (batched/paged engine)
+  golden chat-code:         47 prompt, 128 gen — exact match
+  golden chat-multibyte:    51 prompt, 64 gen  — exact match
+  golden raw-continuation:   6 prompt, 64 gen  — exact match
+  golden raw-long-prefill: 249 prompt, 64 gen  — exact match
+  (all five again) — exact match at decode width 16   <- mlx#3120 rounds
+  test result: ok. 1 passed in 23.14s
+  $ cargo test -p kiln-models --test batching -- --nocapture
+  solo engine == contiguous path; 4-way == solo x2; late-join;
+  stop-token; pool-pressure — all ok (generate path and engine share
+  the new schedule; batch-1 parity holds)
+  ```
+- Read: token-id parity survives the 64-grid re-chunking of every
+  sub-2k prompt on this model/pin/hardware. This does NOT prove KV
+  bit-equality across schedules (the e2e divergence proved bits can
+  move); it proves the schedule change stays inside golden's token-id
+  bar. The cache-hit path (next commit) does not rely on either fact:
+  warm resumes recompute only in shapes the same prompt's cold schedule
+  produces, per the resume-invariance unit test.
+- Next: step 3 — serve cache hits from F-aligned boundaries.
+
+## [2026-07-04] Phase 5 / Option B (F=64) — fine-grained prefix reuse — DONE
+- What (sequenced per the PM instruction; each step its own commit):
+  1. **Canonical schedule** (`canonical_prefill_len`, shared by the
+     batched engine and the Phase-3 generate path): bulk chunks split at
+     absolute `prefill_chunk` multiples; the final partial super-chunk
+     split at absolute `prefill_fine_chunk` (default 64) multiples plus
+     the sub-fine remainder. A unit test exhaustively proves
+     resume-invariance: walking from any boundary reproduces exactly the
+     cold schedule's suffix, for several (chunk, fine) configs — the
+     property the bit-exactness argument stands on. `fine >=
+     prefill_chunk` restores the old schedule (bench knob); test configs
+     with `prefill_chunk <= 64` degenerate to their old schedules.
+  2. **Golden gate: PASSED** (own commit, before any cache-path change).
+     All 5 fixtures exact, including the width-16 rounds, with every
+     sub-2k prefill re-chunked onto the 64 grid (e.g. raw-long-prefill:
+     one 248-token chunk -> 64+64+64+56). Batch-1 == contiguous parity
+     also re-verified.
+  3. **Cache hits now resume at schedule boundaries** (fine multiples in
+     the final super-chunk, chunk multiples in bulk). Re-measured the
+     8-turn conversation (90-200-token increments, debug build):
+     ```
+     turn | prompt | reused | skip%  | warm TTFT | cold TTFT   (before: all 0%)
+        1 |    844 |    640 |  75.8% |   164.8ms |    573.2ms
+        2 |   1028 |    896 |  87.2% |   114.0ms |    681.4ms
+        3 |   1252 |   1088 |  86.9% |   147.6ms |    842.7ms
+        4 |   1406 |   1280 |  91.0% |   107.6ms |    933.9ms
+        5 |   1670 |   1408 |  84.3% |   216.5ms |   1133.4ms
+        6 |   1884 |   1728 |  91.7% |   142.3ms |   1291.6ms
+        7 |   2088 |      0 |   0.0% |  1285.6ms |   1286.3ms
+     ```
+     The 76-93% estimate is confirmed for steady turns (75.8-91.7%,
+     warm TTFT cut 3.5-9.1x), with one correction: **the single turn
+     whose prompt crosses a 2048 super-chunk boundary serves 0** — its
+     donor overlap (1920 here) lies inside the new prompt's bulk chunk,
+     which is not a resumable boundary; resuming there would compute a
+     shape the cold run never uses, so it is correctly refused. Reuse
+     returns the following turn. Cost: one cold prefill per 2048 tokens
+     of conversation growth (~1 turn in 10-15). Warm == cold bit-exact
+     asserted on every turn; the divergent-extension scenario in
+     prefix_cache.rs now exercises a real fine-aligned resume on real
+     weights (was: expects-no-hit).
+  4. **Miss-path cost** (release medians, fresh engine, cache off,
+     `tests/prefill_schedule_bench.rs`):
+     ```
+     prompt | tail fwds | fine=64 TTFT | old sched | delta
+        257 |         4 |     179.0ms |   168.2ms |  +10.7ms (+6.4%)
+        512 |         8 |     352.3ms |   314.9ms |  +37.4ms (+11.9%)
+       1024 |        16 |     714.6ms |   615.1ms |  +99.5ms (+16.2%)
+       2048 |        32 |    1470.8ms |  1288.4ms | +182.4ms (+14.2%)
+     tuning curve @2048: F=64 +13.9% | F=128 +2.9% | F=256 +0.2%
+     ```
+     ~6.5ms per added forward — dominated by per-step fixed cost (eval
+     sync + per-chunk cache maintenance), not matmul time; hence the
+     sharply non-linear curve.
+  5. Full re-run: workspace 34/34 test targets ok (batching, preemption
+     exact counts, both leak gates 0 -> 0, golden, all prefix suites,
+     worker rpc); batch-16 throughput 398.5 tok/s -> 3.22x (gate >= 3x);
+     e2e 21 passed (both worker kinds); python worker 28 passed; both CI
+     shapes + fmt + ruff clean; smoke 3.0.
+- Decisions:
+  - F=64 shipped as the default per the instruction. **Flagging for the
+    PM**: the measured curve says F=128 (+2.9% miss cost, warm recompute
+    grows by at most 64 extra tokens/turn) or F=256 (+0.2%) may be the
+    better default trade on this hardware; it is a one-line default
+    change (`DEFAULT_PREFILL_FINE_CHUNK`), golden re-gated the same way
+    (a coarser grid is strictly closer to the old schedule). Say the
+    word and it lands with a fresh golden run.
+  - The super-chunk-crossing seam (step 3) is inherent to keeping bulk
+    chunks at 2048: finer bulk boundaries would tax every long cold
+    prompt. Left as-is; the multiturn test documents it.
+  - Per-step overhead, not matmuls, dominates the fine-grid cost —
+    batching several consecutive fine chunks into one engine iteration
+    (same forward shapes, fewer step boundaries) is the obvious lever if
+    the miss cost ever matters; noted, not built.
+- Deviations: none.
+- Acceptance: outputs quoted above per step; gate commands identical to
+  the Phase 5 closeout list.
+- Next: PM phase gate on Phase 5 (SPEC §13.4) including the F-default
+  choice above, then Phase 6 — Qwen + Gemma, quantization matrix,
+  worker="auto" routing (SPEC §12).
+
+## [2026-07-04] Phase 5 / Option B follow-up — default fine grid 64 -> 128 — DONE
+- What: per the step-4 tuning curve and PM approval,
+  `DEFAULT_PREFILL_FINE_CHUNK` changed 64 -> 128 (one-line default; the
+  schedule machinery is untouched). Test adaptations only: the
+  prefix_cache divergent-extension scenario's seed prompt lengthened so
+  its donor overlap still crosses a fine boundary (it keys off the
+  constant), and the schedule bench's first table now measures the
+  shipped default rather than a hardcoded 64.
+- Acceptance (same gates, same order):
+  ```
+  $ cargo test -p kiln-models --test golden -- --nocapture   (THE GATE)
+  all 5 fixtures — exact match (batched/paged engine)
+  all 5 fixtures — exact match at decode width 16            (mlx#3120 rounds)
+  test result: ok. 1 passed in 22.50s
+  $ cargo test -p kiln-models --test prefix_multiturn -- --nocapture
+  turn | prompt | reused | skip%  | warm TTFT | cold TTFT
+     1 |    844 |    640 |  75.8% |   162.5ms |    560.7ms
+     2 |   1028 |    896 |  87.2% |   110.3ms |    668.3ms
+     3 |   1252 |   1024 |  81.8% |   184.0ms |    828.6ms
+     4 |   1406 |   1280 |  91.0% |   105.2ms |    916.8ms
+     5 |   1670 |   1408 |  84.3% |   206.6ms |   1055.7ms
+     6 |   1884 |   1664 |  88.3% |   170.2ms |   1190.4ms
+     7 |   2088 |      0 |   0.0% |  (super-chunk crossing, unchanged seam)
+  vs F=64: turns 3 and 6 reuse exactly 64 fewer tokens; the rest are
+  identical. Short-increment check: turn 4 (90-token increment) reused
+  1280 (91.0%) — every turn advances donor coverage by increment + 64
+  generated >= 154 > 128, so the resumable boundary advances every
+  turn; nothing stalls just short of 128. (Stalling would need
+  increment + generation < 128 in a single turn — possible with very
+  short replies, costs that turn one boundary, self-heals next turn.)
+  $ cargo test -p kiln-models --release --test prefill_schedule_bench -- --ignored
+  prompt | tail fwds | default F=128 TTFT | old sched | delta
+     257 |         2 |        164.2ms |   161.7ms |  +2.5ms (+1.5%)
+     512 |         4 |        320.2ms |   318.5ms |  +1.7ms (+0.5%)
+    1024 |         8 |        672.1ms |   639.9ms | +32.2ms (+5.0%)
+    2048 |        16 |       1401.2ms |  1371.5ms | +29.7ms (+2.2%)
+  curve re-sample @2048: F=64 +16.9% | F=128 +3.9% | F=256 +1.3%
+  -> the exploratory +2.9% figure holds as the real number within the
+  run-to-run noise band (+2.2%/+3.9% across two samplings); single-digit
+  at every prompt size, vs +14-17% at F=64.
+  $ cargo test --workspace -> 34/34 test targets ok, zero failures
+    (batching, preemption exact counts, both leak gates 0 -> 0, all
+     prefix suites, worker rpc)
+  $ cargo fmt --all --check / clippy (both shapes) -> clean
+  $ cargo build --workspace --no-default-features -> clean
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+    (incl. the greedy-reproducibility canary, both worker kinds)
+  ```
+- Deviations: none.
+- Next: PM phase gate on Phase 5 (SPEC §13.4), then Phase 6 — Qwen +
+  Gemma models, quantization matrix, worker="auto" routing (SPEC §12).

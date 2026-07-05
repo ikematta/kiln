@@ -13,8 +13,10 @@ pub mod block;
 pub mod engine;
 #[cfg(feature = "metal")]
 pub mod paged;
+pub mod radix;
 #[cfg(feature = "metal")]
 pub mod sampler;
+pub mod ssd;
 #[cfg(feature = "metal")]
 pub mod step;
 
@@ -22,12 +24,15 @@ pub use block::{AppendPlan, BlockError, BlockId, BlockManager, BlockTable, CowCo
 #[cfg(feature = "metal")]
 pub use engine::{
     DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_TOKENS, DEFAULT_NUM_BLOCKS, DEFAULT_PREFILL_CHUNK,
-    Engine, EngineConfig, EngineError, EngineRequest, ErrorCause, EventSink, FinishKind,
-    FinishSummary, KvDims, Priority, SeqEvent,
+    DEFAULT_PREFILL_FINE_CHUNK, Engine, EngineConfig, EngineError, EngineRequest, ErrorCause,
+    EventSink, FinishKind, FinishSummary, KvDims, PrefixCacheStats, Priority, SeqEvent, SsdParams,
+    canonical_prefill_len,
 };
 #[cfg(feature = "metal")]
 pub use paged::{KvSpec, PagedKv, WriteRun};
+pub use radix::{ChainHash, RadixCache};
 #[cfg(feature = "metal")]
 pub use sampler::{PenaltyOptions, Sampler, SamplingOptions, apply_penalties};
+pub use ssd::{SlabGeometry, SsdStore};
 #[cfg(feature = "metal")]
 pub use step::{SeqStep, StepBatch, StepInput, StepModel};

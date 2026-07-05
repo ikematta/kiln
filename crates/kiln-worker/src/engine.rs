@@ -19,12 +19,12 @@ use std::time::Instant;
 
 use kiln_engine::{
     Engine, EngineConfig, EngineRequest, ErrorCause, FinishKind, PenaltyOptions, SamplingOptions,
-    SeqEvent,
+    SeqEvent, SsdParams,
 };
 use kiln_mlx::Stream;
 use kiln_proto::v1::{
-    FinishReason, Finished, MemoryReport, Priority, SamplingParams, StoppingParams, Timings,
-    TokenChunk, TokenEvent, WorkerErrorCode, WorkerState, token_event,
+    FinishReason, Finished, MemoryReport, PrefixCacheHit, Priority, SamplingParams, StoppingParams,
+    Timings, TokenChunk, TokenEvent, WorkerErrorCode, WorkerState, token_event,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -32,6 +32,29 @@ use crate::modelinfo::StaticInfo;
 
 /// Proto: `repetition_window == 0` means "worker default (64)".
 const DEFAULT_REPETITION_WINDOW: usize = 64;
+
+/// SPEC §10 `[defaults]` ssd_cache_max_gb default.
+const DEFAULT_SSD_MAX_BYTES: u64 = 64 << 30;
+
+/// Prefix-cache/SSD settings from the CLI (SPEC §10 config flags).
+#[derive(Debug, Clone)]
+pub struct CacheOptions {
+    pub prefix_cache: bool,
+    /// Root cache directory (`$KILN_CACHE_DIR`); the worker stores slabs
+    /// under `<root>/<model_fingerprint>/blocks/` (SPEC §6.4).
+    pub ssd_dir: Option<PathBuf>,
+    pub ssd_max_bytes: u64,
+}
+
+impl Default for CacheOptions {
+    fn default() -> Self {
+        Self {
+            prefix_cache: true,
+            ssd_dir: None,
+            ssd_max_bytes: DEFAULT_SSD_MAX_BYTES,
+        }
+    }
+}
 
 /// One queued generation request.
 pub struct Submission {
@@ -83,11 +106,32 @@ pub struct Shared {
     pub tokens_generated_total: AtomicU64,
     pub kv_pool_allocated_bytes: AtomicU64,
     pub kv_pool_used_bytes: AtomicU64,
+    pub kv_blocks_allocated: AtomicU64,
+    pub kv_blocks_free: AtomicU64,
+    pub engine_steps_total: AtomicU64,
+    pub prefix_tokens_reused_total: AtomicU64,
+    pub ssd_blocks_stored: AtomicU64,
+    pub ssd_cache_bytes: AtomicU64,
+    pub ssd_reads_total: AtomicU64,
+    pub ssd_writes_total: AtomicU64,
+    pub ssd_fingerprint_rejects_total: AtomicU64,
+    /// Capability enum values advertised in `GetInfo` (set at startup
+    /// from the cache flags; the engine thread may clear SSD_TIER if the
+    /// store fails to open).
+    pub capabilities: std::sync::Mutex<Vec<i32>>,
     started_at: Instant,
 }
 
 impl Shared {
-    pub fn new(model_id: String, info: StaticInfo) -> Self {
+    pub fn new(model_id: String, info: StaticInfo, cache: &CacheOptions) -> Self {
+        use kiln_proto::v1::Capability;
+        let mut capabilities = Vec::new();
+        if cache.prefix_cache {
+            capabilities.push(Capability::PrefixCache as i32);
+            if cache.ssd_dir.is_some() {
+                capabilities.push(Capability::SsdTier as i32);
+            }
+        }
         Self {
             model_id,
             info,
@@ -105,8 +149,37 @@ impl Shared {
             tokens_generated_total: AtomicU64::new(0),
             kv_pool_allocated_bytes: AtomicU64::new(0),
             kv_pool_used_bytes: AtomicU64::new(0),
+            kv_blocks_allocated: AtomicU64::new(0),
+            kv_blocks_free: AtomicU64::new(0),
+            engine_steps_total: AtomicU64::new(0),
+            prefix_tokens_reused_total: AtomicU64::new(0),
+            ssd_blocks_stored: AtomicU64::new(0),
+            ssd_cache_bytes: AtomicU64::new(0),
+            ssd_reads_total: AtomicU64::new(0),
+            ssd_writes_total: AtomicU64::new(0),
+            ssd_fingerprint_rejects_total: AtomicU64::new(0),
+            capabilities: std::sync::Mutex::new(capabilities),
             started_at: Instant::now(),
         }
+    }
+
+    /// Advertised capability values (proto enum ints).
+    pub fn capabilities(&self) -> Vec<i32> {
+        match self.capabilities.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Drops SSD_TIER from the advertised capabilities (store failed to
+    /// open; the engine degraded per the SPEC §6.4 silent-skip policy).
+    fn clear_ssd_capability(&self) {
+        use kiln_proto::v1::Capability;
+        let mut guard = match self.capabilities.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.retain(|&capability| capability != Capability::SsdTier as i32);
     }
 
     pub fn state(&self) -> (WorkerState, String) {
@@ -138,7 +211,7 @@ impl Shared {
             mlx_cache_bytes: kiln_mlx::memory::cache_memory().unwrap_or(0) as u64,
             mlx_peak_bytes: kiln_mlx::memory::peak_memory().unwrap_or(0) as u64,
             process_rss_bytes: kiln_mlx::os::process_rss_bytes(),
-            ssd_cache_bytes: 0,
+            ssd_cache_bytes: self.ssd_cache_bytes.load(Ordering::Acquire),
         }
     }
 
@@ -179,7 +252,12 @@ impl Shared {
 
 /// Runs on the dedicated engine thread. Owns the model + MLX stream +
 /// batching loop.
-pub fn engine_main(model_dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Submission>) {
+pub fn engine_main(
+    model_dir: PathBuf,
+    shared: Arc<Shared>,
+    rx: Receiver<Submission>,
+    cache: CacheOptions,
+) {
     kiln_mlx::init(); // swap out mlx-c's exit()-ing error handler first
     let stream = Stream::gpu();
 
@@ -201,7 +279,22 @@ pub fn engine_main(model_dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Submiss
     let dims = model.kv_dims();
     // Pool sizing: EngineConfig defaults (512 blocks x 32 tokens) until
     // memory-budget admission lands (SPEC §6.4 / §2.3, Phase 4 part 3+).
-    let mut engine = match Engine::new(model, dims, EngineConfig::default(), stream) {
+    // Prefix cache/SSD per the CLI flags (SPEC §6.3/§6.4): slabs live
+    // under `<ssd_dir>/<model_fingerprint>/blocks/`.
+    let config = EngineConfig {
+        prefix_cache: cache.prefix_cache,
+        ssd: cache
+            .ssd_dir
+            .as_ref()
+            .filter(|_| cache.prefix_cache)
+            .map(|root| SsdParams {
+                dir: root.join(&shared.info.weights_fingerprint).join("blocks"),
+                max_bytes: cache.ssd_max_bytes,
+                fingerprint: shared.info.weights_fingerprint.clone(),
+            }),
+        ..EngineConfig::default()
+    };
+    let mut engine = match Engine::new(model, dims, config, stream) {
         Ok(engine) => engine,
         Err(err) => {
             tracing::error!(error = %err, "engine construction failed");
@@ -209,6 +302,11 @@ pub fn engine_main(model_dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Submiss
             return;
         }
     };
+    if let Some(reason) = engine.ssd_error() {
+        // SPEC §6.4: the tier degrades silently for requests; say it once.
+        tracing::warn!(model = %shared.model_id, reason, "ssd tier disabled");
+        shared.clear_ssd_capability();
+    }
     tracing::info!(
         model = %shared.model_id,
         load_ms = load_started.elapsed().as_millis() as u64,
@@ -218,11 +316,24 @@ pub fn engine_main(model_dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Submiss
 
     'serve: loop {
         // Block for work when idle; otherwise drain whatever queued while
-        // the last step ran, so new requests join the next iteration.
+        // the last step ran, so new requests join the next iteration. An
+        // idle engine with pending SSD flushes keeps ticking (bounded
+        // waits) so persistence never depends on new traffic.
         if engine.is_idle() {
-            match rx.recv() {
-                Ok(submission) => submit(&mut engine, &shared, &eos_ids, submission),
-                Err(_) => break 'serve, // gRPC side is gone
+            if engine.has_pending_cache_io() {
+                match rx.recv_timeout(std::time::Duration::from_millis(2)) {
+                    Ok(submission) => submit(&mut engine, &shared, &eos_ids, submission),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        engine.flush_prefix_cache();
+                        break 'serve;
+                    }
+                }
+            } else {
+                match rx.recv() {
+                    Ok(submission) => submit(&mut engine, &shared, &eos_ids, submission),
+                    Err(_) => break 'serve, // gRPC side is gone
+                }
             }
         }
         loop {
@@ -230,7 +341,7 @@ pub fn engine_main(model_dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Submiss
                 Ok(submission) => submit(&mut engine, &shared, &eos_ids, submission),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    if engine.is_idle() {
+                    if engine.is_idle() && !engine.has_pending_cache_io() {
                         break 'serve;
                     }
                     break;
@@ -242,22 +353,55 @@ pub fn engine_main(model_dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Submiss
             // the engine reset itself; keep serving.
             tracing::error!(error = %err, "engine step failed");
         }
-        shared
-            .running
-            .store(engine.num_running() as u32, Ordering::Release);
-        shared
-            .engine_waiting
-            .store(engine.num_waiting() as u32, Ordering::Release);
-        shared
-            .requests_preempted
-            .store(engine.preemptions(), Ordering::Release);
-        shared
-            .kv_pool_allocated_bytes
-            .store(engine.kv_allocated_bytes(), Ordering::Release);
-        shared
-            .kv_pool_used_bytes
-            .store(engine.kv_used_bytes(), Ordering::Release);
+        publish_stats(&engine, &shared);
     }
+}
+
+/// Copies the engine's gauges/counters into `Shared` for Health and Stats
+/// (the gRPC side never touches the engine directly).
+fn publish_stats(engine: &Engine<kiln_models::LlamaModel>, shared: &Shared) {
+    shared
+        .running
+        .store(engine.num_running() as u32, Ordering::Release);
+    shared
+        .engine_waiting
+        .store(engine.num_waiting() as u32, Ordering::Release);
+    shared
+        .requests_preempted
+        .store(engine.preemptions(), Ordering::Release);
+    shared
+        .kv_pool_allocated_bytes
+        .store(engine.kv_allocated_bytes(), Ordering::Release);
+    shared
+        .kv_pool_used_bytes
+        .store(engine.kv_used_bytes(), Ordering::Release);
+    let (blocks_used, blocks_free) = engine.kv_blocks();
+    shared
+        .kv_blocks_allocated
+        .store(blocks_used, Ordering::Release);
+    shared.kv_blocks_free.store(blocks_free, Ordering::Release);
+    shared
+        .engine_steps_total
+        .store(engine.steps(), Ordering::Release);
+    let cache = engine.cache_stats();
+    shared
+        .prefix_tokens_reused_total
+        .store(cache.tokens_reused_total, Ordering::Release);
+    shared
+        .ssd_blocks_stored
+        .store(cache.ssd_blocks_stored, Ordering::Release);
+    shared
+        .ssd_cache_bytes
+        .store(cache.ssd_bytes_stored, Ordering::Release);
+    shared
+        .ssd_reads_total
+        .store(cache.ssd_reads_total, Ordering::Release);
+    shared
+        .ssd_writes_total
+        .store(cache.ssd_writes_total, Ordering::Release);
+    shared
+        .ssd_fingerprint_rejects_total
+        .store(cache.ssd_fingerprint_rejects_total, Ordering::Release);
 }
 
 /// Maps a proto submission onto an engine request whose event sink speaks
@@ -330,10 +474,19 @@ fn submit(
                     })),
                 })
                 .is_ok(),
+            SeqEvent::PrefixHit { tokens, from_ssd } => events
+                .send(TokenEvent {
+                    event: Some(token_event::Event::Cache(PrefixCacheHit {
+                        tokens_reused: tokens,
+                        from_ssd,
+                    })),
+                })
+                .is_ok(),
             SeqEvent::Finished(summary) => {
                 let mut finished = Finished {
                     prompt_tokens,
                     completion_tokens: summary.completion_tokens,
+                    cached_prompt_tokens: summary.cached_prompt_tokens,
                     seed_used,
                     ..Finished::default()
                 };
@@ -427,10 +580,14 @@ fn random_seed() -> u64 {
 }
 
 /// Creates the engine thread; returns the submission sender.
-pub fn spawn(model_dir: PathBuf, shared: Arc<Shared>) -> std::io::Result<Sender<Submission>> {
+pub fn spawn(
+    model_dir: PathBuf,
+    shared: Arc<Shared>,
+    cache: CacheOptions,
+) -> std::io::Result<Sender<Submission>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("kiln-engine".to_owned())
-        .spawn(move || engine_main(model_dir, shared, rx))?;
+        .spawn(move || engine_main(model_dir, shared, rx, cache))?;
     Ok(tx)
 }

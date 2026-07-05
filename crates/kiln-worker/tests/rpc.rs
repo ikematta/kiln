@@ -50,6 +50,10 @@ struct Worker {
 
 impl Worker {
     fn spawn(model: &PathBuf, tag: &str) -> Worker {
+        Self::spawn_with(model, tag, &[])
+    }
+
+    fn spawn_with(model: &PathBuf, tag: &str, extra: &[&str]) -> Worker {
         let socket =
             std::env::temp_dir().join(format!("kiln-rpc-{tag}-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket);
@@ -60,6 +64,7 @@ impl Worker {
             .arg(&socket)
             .arg("--model-id")
             .arg(format!("rpc-test-{tag}"))
+            .args(extra)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -322,4 +327,162 @@ async fn cancel_and_drain_rpc_semantics() {
         assert_eq!(finished.error_code(), WorkerErrorCode::WorkerErrorDraining);
         eprintln!("worker 2: immediate drain ok");
     }
+}
+
+/// Phase 5 RPC surface: `PrefixCacheHit` events, `Finished.cached_prompt_tokens`,
+/// the `Stats` RPC (SPEC §5), and the SSD tier surviving a worker restart
+/// (SPEC §6.4 persistence) — all over the frozen proto, exactly as the
+/// gateway consumes them.
+#[tokio::test(flavor = "multi_thread")]
+async fn prefix_cache_stats_and_ssd_restart() {
+    use kiln_proto::v1::{Capability, InfoRequest, StatsRequest};
+
+    if !kiln_mlx::memory::metal_is_available() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let Some(model) = model_dir() else {
+        eprintln!("skipping: KILN_TEST_MODELS not set or {MODEL_NAME} missing");
+        return;
+    };
+
+    let ssd_dir = std::env::temp_dir().join(format!("kiln-rpc-ssd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ssd_dir);
+    std::fs::create_dir_all(&ssd_dir).expect("ssd dir");
+    let ssd_arg = ssd_dir.display().to_string();
+
+    // 64-token prompt: two full 32-token blocks become cache-eligible,
+    // and (p-1) % 32 == 31 keeps the tail chunk hash-discoverable after a
+    // restart (the containment probe needs a full chunk's tokens).
+    let submission_64 = |id: &str| SubmitRequest {
+        request_id: id.to_owned(),
+        input: Some(submit_request::Input::TokenIds(TokenIds {
+            ids: (1..=64).collect(),
+        })),
+        sampling: Some(SamplingParams::default()),
+        stopping: Some(StoppingParams {
+            max_tokens: 8,
+            ignore_eos: true,
+            ..StoppingParams::default()
+        }),
+        grammar: None,
+        priority: Priority::Interactive as i32,
+        prefix_hint: 0,
+        echo_prompt: false,
+    };
+
+    /// Reads to Finished, returning it plus any PrefixCacheHit event.
+    async fn read_with_cache(
+        stream: &mut EventStream,
+    ) -> (Finished, Option<kiln_proto::v1::PrefixCacheHit>) {
+        let mut cache = None;
+        loop {
+            match next_event(stream).await {
+                Some(token_event::Event::Finished(finished)) => return (finished, cache),
+                Some(token_event::Event::Cache(hit)) => cache = Some(hit),
+                Some(_) => {}
+                None => panic!("stream ended without a Finished event"),
+            }
+        }
+    }
+
+    {
+        let worker = Worker::spawn_with(&model, "cache", &["--ssd-dir", &ssd_arg]);
+        let mut client = worker.client_when_ready().await;
+
+        let info = client
+            .get_info(InfoRequest {})
+            .await
+            .expect("info ok")
+            .into_inner();
+        assert!(
+            info.capabilities
+                .contains(&(Capability::PrefixCache as i32)),
+            "PREFIX_CACHE must be advertised: {:?}",
+            info.capabilities
+        );
+        assert!(
+            info.capabilities.contains(&(Capability::SsdTier as i32)),
+            "SSD_TIER must be advertised with --ssd-dir: {:?}",
+            info.capabilities
+        );
+
+        // Cold, then warm: the second stream must carry PrefixCacheHit
+        // and account the reuse in Finished.
+        let mut stream = client
+            .submit(submission_64("cache-cold"))
+            .await
+            .expect("submit ok")
+            .into_inner();
+        let (finished, cache) = read_with_cache(&mut stream).await;
+        assert_eq!(finished.finish_reason(), FinishReason::Length);
+        assert!(cache.is_none(), "first run cannot hit: {cache:?}");
+        assert_eq!(finished.cached_prompt_tokens, 0);
+
+        let mut stream = client
+            .submit(submission_64("cache-warm"))
+            .await
+            .expect("submit ok")
+            .into_inner();
+        let (finished, cache) = read_with_cache(&mut stream).await;
+        assert_eq!(finished.finish_reason(), FinishReason::Length);
+        let hit = cache.expect("resubmit must emit PrefixCacheHit");
+        // Containment: every prefill position (p - 1 = 63) is served —
+        // one full block plus 31 rows of the next (copy-on-write tail).
+        assert_eq!(hit.tokens_reused, 63, "resubmit must reuse all prefill");
+        assert!(!hit.from_ssd, "pool-resident hit");
+        assert_eq!(finished.cached_prompt_tokens, 63);
+
+        // Stats (SPEC §5): totals + gauges, and the idle write-behind
+        // flush persisting the donated block.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let stats = loop {
+            let stats = client
+                .stats(StatsRequest {})
+                .await
+                .expect("stats ok")
+                .into_inner();
+            if stats.ssd_writes_total >= 2 || Instant::now() > deadline {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(stats.requests_total, 2);
+        assert!(stats.engine_steps_total > 0);
+        assert_eq!(stats.prefix_tokens_reused_total, 63);
+        assert_eq!(
+            stats.kv_blocks_allocated + stats.kv_blocks_free,
+            512,
+            "block gauges must cover the pool: {stats:?}"
+        );
+        assert_eq!(stats.ssd_writes_total, 2, "two unique full blocks flushed");
+        assert_eq!(stats.ssd_blocks_stored, 2);
+        assert_eq!(stats.ssd_fingerprint_rejects_total, 0);
+        eprintln!("stats + prefix cache over RPC ok: {stats:?}");
+    }
+
+    // Restart (SPEC §6.4 persistence): a fresh worker over the same cache
+    // directory serves the prefix from SSD.
+    {
+        let worker = Worker::spawn_with(&model, "cache2", &["--ssd-dir", &ssd_arg]);
+        let mut client = worker.client_when_ready().await;
+        let mut stream = client
+            .submit(submission_64("cache-restart"))
+            .await
+            .expect("submit ok")
+            .into_inner();
+        let (finished, cache) = read_with_cache(&mut stream).await;
+        assert_eq!(finished.finish_reason(), FinishReason::Length);
+        let hit = cache.expect("restart must hit from SSD");
+        assert_eq!(hit.tokens_reused, 63, "containment across the restart");
+        assert!(hit.from_ssd, "hit must come from the cold tier");
+        let stats = client
+            .stats(StatsRequest {})
+            .await
+            .expect("stats ok")
+            .into_inner();
+        assert!(stats.ssd_reads_total >= 1, "{stats:?}");
+        eprintln!("worker restart served the prefix from SSD: {hit:?}");
+    }
+    let _ = std::fs::remove_dir_all(&ssd_dir);
 }

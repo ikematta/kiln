@@ -324,6 +324,34 @@ impl Array {
         Ok(unsafe { std::slice::from_raw_parts(ptr, self.size()) }.to_vec())
     }
 
+    /// Copies the evaluated contents out as raw little-endian bytes,
+    /// whatever the dtype — the KV-block serialization path (f16/bf16 have
+    /// no native Rust type). Same eval + contiguity contract as
+    /// [`Self::data_u32`]; the byte count is `size() * dtype.size()`.
+    #[allow(unsafe_code)]
+    pub fn data_raw_bytes(&self) -> Result<Vec<u8>, MlxError> {
+        let elem = self.dtype().map_or(0, Dtype::size);
+        if elem == 0 {
+            return Err(MlxError {
+                message: "data_raw_bytes called on an array with an unsupported dtype".to_owned(),
+            });
+        }
+        self.eval()?;
+        self.expect_contiguous("data_raw_bytes")?;
+        // SAFETY: live, evaluated, row-contiguous handle — the buffer holds
+        // `size()` consecutive elements of `elem` bytes each; mlx-c's typed
+        // data accessors all return the same base pointer (no dtype check in
+        // C++), so the uint8 view is the raw byte image.
+        let ptr = unsafe { sys::mlx_array_data_uint8(self.raw) };
+        if ptr.is_null() {
+            return Err(MlxError {
+                message: "mlx_array_data_uint8 returned null".to_owned(),
+            });
+        }
+        #[allow(unsafe_code)]
+        Ok(unsafe { std::slice::from_raw_parts(ptr, self.size() * elem) }.to_vec())
+    }
+
     pub(crate) fn raw(&self) -> sys::mlx_array {
         self.raw
     }

@@ -26,6 +26,12 @@ use crate::llama::{LlamaModel, ModelError};
 /// too).
 pub const PREFILL_CHUNK: usize = 2048;
 
+/// This path and the batched engine must share one canonical prefill
+/// schedule (Phase 5 Option B, PROGRESS 2026-07-04): the batching suite
+/// pins them bit-identical, and the prefix cache resumes on the
+/// schedule's fine boundaries. See `kiln_engine::canonical_prefill_len`.
+pub const PREFILL_FINE_CHUNK: usize = kiln_engine::DEFAULT_PREFILL_FINE_CHUNK;
+
 /// Result of a [`generate`] run.
 #[derive(Debug)]
 pub struct GenerateOutput {
@@ -109,7 +115,12 @@ where
     let total = prompt.len();
     let mut processed = 0;
     while total - processed > 1 {
-        let n = (total - processed - 1).min(PREFILL_CHUNK);
+        let n = kiln_engine::canonical_prefill_len(
+            processed,
+            total - 1,
+            PREFILL_CHUNK,
+            PREFILL_FINE_CHUNK,
+        );
         let chunk = Array::from_u32_slice(&prompt[processed..processed + n], &[1, n as i32])?;
         drop(model.forward(&chunk, &mut caches, s)?);
         let state: Vec<&Array> = caches.iter().flat_map(KvCache::state).collect();

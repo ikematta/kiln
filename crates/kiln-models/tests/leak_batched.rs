@@ -66,6 +66,7 @@ fn submit(engine: &mut Engine<&LlamaModel>, prompt: &[u32], max_tokens: usize) -
         on_event: Box::new(move |event| {
             match event {
                 SeqEvent::Token(token) => t.borrow_mut().push(token),
+                SeqEvent::PrefixHit { .. } => {}
                 SeqEvent::Finished(summary) => *f.borrow_mut() = Some(summary),
             }
             true

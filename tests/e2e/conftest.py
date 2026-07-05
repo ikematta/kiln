@@ -55,6 +55,7 @@ class Stack:
     base_url: str
     api_key: str
     model_id: str
+    worker_kind: str
     runtime_dir: pathlib.Path
     gateway: subprocess.Popen
     log_path: pathlib.Path
@@ -162,6 +163,7 @@ worker = "{worker}"
 host = "127.0.0.1"
 port = {port}
 runtime_dir = "{runtime_dir}"
+cache_dir = "{runtime_dir}/cache"
 {blocks}
 [[auth.api_keys]]
 name = "e2e"
@@ -181,6 +183,7 @@ key_hash = "{key_hash}"
         base_url=f"http://127.0.0.1:{port}",
         api_key=API_KEY,
         model_id=models[0][0],
+        worker_kind=models[0][1],
         runtime_dir=runtime_dir,
         gateway=gateway,
         log_path=log_path,
