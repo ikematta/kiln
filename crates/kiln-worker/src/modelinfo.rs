@@ -28,6 +28,10 @@ pub struct StaticInfo {
     pub architecture: String,
     pub dtype: String,
     pub max_context_len: u32,
+    /// Largest admissible PROMPT (0 = bounded only by `max_context_len`).
+    /// Tighter than the context bound only where an architecture's prefill
+    /// op stream is reference-shaped up to a prompt length (gemma2).
+    pub max_prompt_len: u32,
     pub vocab_size: u32,
     pub weights_bytes: u64,
     pub weights_fingerprint: String,
@@ -89,11 +93,36 @@ pub fn read_static_info(model_dir: &Path) -> Result<StaticInfo, ModelInfoError> 
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0)
     };
+    // Parity envelopes (Phase 6 Task 2, mirrored from the kiln-models
+    // per-arch accessors so WorkerInfo and admission agree before the
+    // model finishes loading): gemma3's op stream is reference-shaped only
+    // within the sliding window (`gemma3.rs` module docs — lifting it is
+    // the recorded ring-gather follow-up); gemma2's manual softcapped
+    // attention only for single-`prefill_step_size`-chunk prompts
+    // (`gemma2.rs` module docs).
+    let mut max_context_len = as_u32("max_position_embeddings");
+    let mut max_prompt_len = 0;
+    match architecture.as_str() {
+        "gemma3_text" => {
+            let window = match as_u32("sliding_window") {
+                0 => 512, // mlx-lm ModelArgs default
+                w => w,
+            };
+            max_context_len = if max_context_len == 0 {
+                window
+            } else {
+                max_context_len.min(window)
+            };
+        }
+        "gemma2" => max_prompt_len = 2048,
+        _ => {}
+    }
     Ok(StaticInfo {
         model_path: model_dir.display().to_string(),
         architecture,
         dtype,
-        max_context_len: as_u32("max_position_embeddings"),
+        max_context_len,
+        max_prompt_len,
         vocab_size: as_u32("vocab_size"),
         weights_bytes,
         weights_fingerprint: format!("{:x}", fp.finalize()),

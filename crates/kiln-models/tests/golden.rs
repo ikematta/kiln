@@ -229,17 +229,19 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
     // Production config except pool size: 256 blocks x 32 = 8192 token
     // slots, ample for every fixture. The engine is reused across
     // fixtures, exercising block recycling between requests.
-    let mut engine = Engine::new(
-        &model,
-        model.kv_dims(),
-        EngineConfig {
-            num_blocks: 256,
-            deterministic_decode_width: det_width,
-            ..EngineConfig::default()
-        },
-        Stream::gpu(),
-    )
-    .expect("engine builds");
+    let mut config = EngineConfig {
+        num_blocks: 256,
+        deterministic_decode_width: det_width,
+        ..EngineConfig::default()
+    };
+    if model.monolithic_prefill_required() {
+        // gemma2 manual softcapped attention: reference-shaped
+        // (single-tail) prefill only — the same override the worker
+        // applies at load (see kiln-worker engine_main).
+        config.prefill_fine_chunk = config.prefill_chunk;
+    }
+    let mut engine =
+        Engine::new(&model, model.kv_dims(), config, Stream::gpu()).expect("engine builds");
 
     let fixtures: Vec<(String, Fixture, Vec<u32>)> = fixture_paths
         .iter()

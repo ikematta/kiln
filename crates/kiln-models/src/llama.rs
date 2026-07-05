@@ -16,7 +16,7 @@ use kiln_mlx::{Array, MlxError, Stream};
 
 use crate::config::LlamaConfig;
 use crate::kv_cache::KvCache;
-use crate::nn::{AttentionShape, CausalLm, Rope};
+use crate::nn::{AttentionShape, CausalLm, Rope, TrunkOptions};
 use crate::weights::WeightStore;
 
 pub use crate::nn::ModelError;
@@ -40,6 +40,8 @@ impl LlamaModel {
             head_dim: config.head_dim() as i32,
             traditional_rope: config.rope_traditional,
             qk_norm_eps: None,
+            scale_override: None,
+            attn_logit_softcapping: None,
         };
         let scaling = config.rope_scaling()?;
         let lm = CausalLm::load(
@@ -49,7 +51,9 @@ impl LlamaModel {
             &shape,
             config.rms_norm_eps,
             config.tie_word_embeddings,
-            || Rope::new(&scaling, config.head_dim(), config.rope_theta, s),
+            TrunkOptions::default(),
+            |_| Rope::new(&scaling, config.head_dim(), config.rope_theta, s),
+            s,
         )?;
         Ok(Self { config, lm })
     }

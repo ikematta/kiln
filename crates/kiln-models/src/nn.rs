@@ -192,13 +192,77 @@ impl Embedding {
     }
 }
 
-/// The SwiGLU MLP shared verbatim by llama/qwen2/qwen3
-/// (`down(silu(gate(x)) * up(x))`).
+/// A Python-float scalar as MLX's weak-promotion rules see it: the value is
+/// held in float32 and cast to the tensor operand's dtype at the op, so the
+/// op itself runs in the tensor dtype (mirroring `0.5 * x` on an f16 `x` in
+/// the reference — a plain f32 Kiln scalar would promote the op to f32
+/// instead and change bits).
+fn weak_scalar(v: f64, like: &Array, s: &Stream) -> Result<Array, MlxError> {
+    let dtype = like.dtype().ok_or_else(|| MlxError {
+        message: "weak scalar against an array with an unsupported dtype".to_owned(),
+    })?;
+    ops::astype(&Array::from_f32(v as f32), dtype, s)
+}
+
+/// Gated-MLP activation — which `mlx.nn` function the reference architecture
+/// applies to the gate projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Activation {
+    /// llama/qwen: `silu(gate) * up`.
+    Silu,
+    /// gemma2/gemma3: `gelu_approx(gate) * up`.
+    GeluApprox,
+}
+
+/// `mlx.nn.gelu_approx` (tanh approximation), op-for-op in the reference's
+/// evaluation order: `(0.5 * x) * (1 + tanh(sqrt(2/pi) * (x + 0.044715 *
+/// x**3)))`, all scalars weak (op dtype = x dtype).
+fn gelu_approx(x: &Array, s: &Stream) -> Result<Array, MlxError> {
+    let cube = ops::power(x, &weak_scalar(3.0, x, s)?, s)?;
+    let inner = ops::add(
+        x,
+        &ops::multiply(&weak_scalar(0.044715, x, s)?, &cube, s)?,
+        s,
+    )?;
+    let scaled = ops::multiply(
+        &weak_scalar((2.0 / std::f64::consts::PI).sqrt(), x, s)?,
+        &inner,
+        s,
+    )?;
+    let gate = ops::add(&weak_scalar(1.0, x, s)?, &ops::tanh(&scaled, s)?, s)?;
+    ops::multiply(&ops::multiply(&weak_scalar(0.5, x, s)?, x, s)?, &gate, s)
+}
+
+/// How an architecture parameterizes RMSNorm weights. Gemma stores `w` and
+/// applies `rms_norm(x, 1 + w)`; the `1 + w` is folded in once at load (the
+/// same add the reference issues per call — identical bits, fewer ops).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NormStyle {
+    Plain,
+    OnePlus,
+}
+
+impl NormStyle {
+    fn apply(self, w: Array, s: &Stream) -> Result<Array, ModelError> {
+        match self {
+            NormStyle::Plain => Ok(w),
+            NormStyle::OnePlus => {
+                let effective = ops::add(&weak_scalar(1.0, &w, s)?, &w, s)?;
+                effective.eval()?;
+                Ok(effective)
+            }
+        }
+    }
+}
+
+/// The gated MLP shared by llama/qwen2/qwen3 (`down(silu(gate(x)) * up(x))`)
+/// and gemma2/gemma3 (`down(gelu_approx(gate(x)) * up(x))`).
 #[derive(Debug)]
 pub(crate) struct Mlp {
     pub(crate) gate_proj: Linear,
     pub(crate) up_proj: Linear,
     pub(crate) down_proj: Linear,
+    activation: Activation,
 }
 
 impl Mlp {
@@ -206,20 +270,26 @@ impl Mlp {
         store: &mut WeightStore,
         prefix: &str,
         quantization: Option<Quantization>,
+        activation: Activation,
     ) -> Result<Self, ModelError> {
         Ok(Self {
             gate_proj: Linear::load(store, &format!("{prefix}.gate_proj"), quantization)?,
             up_proj: Linear::load(store, &format!("{prefix}.up_proj"), quantization)?,
             down_proj: Linear::load(store, &format!("{prefix}.down_proj"), quantization)?,
+            activation,
         })
     }
 
     pub(crate) fn forward(&self, x: &Array, s: &Stream) -> Result<Array, MlxError> {
-        // swiglu(gate, up) = silu(gate) * up ; silu(x) = x * sigmoid(x)
         let gate = self.gate_proj.forward(x, s)?;
         let up = self.up_proj.forward(x, s)?;
-        let silu = ops::multiply(&gate, &ops::sigmoid(&gate, s)?, s)?;
-        self.down_proj.forward(&ops::multiply(&silu, &up, s)?, s)
+        let activated = match self.activation {
+            // swiglu(gate, up) = silu(gate) * up ; silu(x) = x * sigmoid(x)
+            Activation::Silu => ops::multiply(&gate, &ops::sigmoid(&gate, s)?, s)?,
+            Activation::GeluApprox => gelu_approx(&gate, s)?,
+        };
+        self.down_proj
+            .forward(&ops::multiply(&activated, &up, s)?, s)
     }
 }
 
@@ -301,8 +371,15 @@ pub(crate) struct AttentionShape {
     pub(crate) n_kv_heads: i32,
     pub(crate) head_dim: i32,
     pub(crate) traditional_rope: bool,
-    /// `Some(eps)` loads `q_norm`/`k_norm` weights (Qwen3-style qk-norm).
+    /// `Some(eps)` loads `q_norm`/`k_norm` weights (qwen3/gemma3 qk-norm;
+    /// the weight parameterization follows the trunk's [`NormStyle`]).
     pub(crate) qk_norm_eps: Option<f32>,
+    /// SDPA scale, already computed with the architecture's own f64
+    /// formula (gemma `query_pre_attn_scalar`); `None` = `head_dim**-0.5`.
+    pub(crate) scale_override: Option<f64>,
+    /// gemma2 attention logit softcapping — selects the reference's manual
+    /// attention (`tanh(scores/cap)*cap`, no `mx.fast` SDPA).
+    pub(crate) attn_logit_softcapping: Option<f32>,
 }
 
 /// GQA attention shared by llama/qwen2/qwen3 — identical module math in
@@ -315,6 +392,7 @@ pub(crate) struct Attention {
     head_dim: i32,
     scale: f32,
     traditional_rope: bool,
+    attn_softcap: Option<f32>,
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
@@ -330,11 +408,13 @@ impl Attention {
         quantization: Option<Quantization>,
         shape: &AttentionShape,
         rope: Rope,
+        norm_style: NormStyle,
+        s: &Stream,
     ) -> Result<Self, ModelError> {
         let qk_norm = match shape.qk_norm_eps {
             Some(eps) => Some(QkNorm {
-                q_weight: store.take(&format!("{prefix}.q_norm.weight"))?,
-                k_weight: store.take(&format!("{prefix}.k_norm.weight"))?,
+                q_weight: norm_style.apply(store.take(&format!("{prefix}.q_norm.weight"))?, s)?,
+                k_weight: norm_style.apply(store.take(&format!("{prefix}.k_norm.weight"))?, s)?,
                 eps,
             }),
             None => None,
@@ -343,10 +423,14 @@ impl Attention {
             n_heads: shape.n_heads,
             n_kv_heads: shape.n_kv_heads,
             head_dim: shape.head_dim,
-            // Python computes `head_dim ** -0.5` in double precision and the
-            // FFI narrows it; same here.
-            scale: (f64::from(shape.head_dim)).powf(-0.5) as f32,
+            // Python computes the scale in double precision and the FFI
+            // narrows it; same here. Gemma passes its own
+            // `query_pre_attn_scalar` formula through `scale_override`.
+            scale: shape
+                .scale_override
+                .unwrap_or_else(|| f64::from(shape.head_dim).powf(-0.5)) as f32,
             traditional_rope: shape.traditional_rope,
+            attn_softcap: shape.attn_logit_softcapping,
             q_proj: Linear::load(store, &format!("{prefix}.q_proj"), quantization)?,
             k_proj: Linear::load(store, &format!("{prefix}.k_proj"), quantization)?,
             v_proj: Linear::load(store, &format!("{prefix}.v_proj"), quantization)?,
@@ -354,6 +438,99 @@ impl Attention {
             qk_norm,
             rope,
         })
+    }
+
+    /// The reference's manual attention for softcapped architectures
+    /// (`mlx_lm.models.gemma2.Attention.__call__` after the cache update):
+    /// scale into Q, GQA group reshape, `Q @ K^T`, `tanh(scores/cap)*cap`,
+    /// boolean causal mask via `where`, precise softmax, `probs @ V`.
+    /// `q` is `[B, H, L, D]`, `k`/`v` are `[B, KV, S, D]`; `q_offset` is the
+    /// absolute position of `q`'s first row (0 in every reference-shaped
+    /// prefill; the offset-aware mask generalizes the same predicate).
+    #[allow(clippy::too_many_arguments)]
+    fn manual_softcap_attention(
+        &self,
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        cap: f32,
+        mask: SdpaMask,
+        q_offset: i32,
+        s: &Stream,
+    ) -> Result<Array, MlxError> {
+        let (b, l, d) = (q.dim(0), q.dim(2), q.dim(3));
+        let (kv_heads, s_len) = (k.dim(1), k.dim(2));
+        let repeats = self.n_heads / self.n_kv_heads;
+
+        let qs = ops::multiply(q, &weak_scalar(f64::from(self.scale), q, s)?, s)?;
+        let (qs, kx, vx) = if repeats > 1 {
+            (
+                ops::reshape(&qs, &[b, kv_heads, repeats, l, d], s)?,
+                ops::reshape(k, &[b, kv_heads, 1, s_len, d], s)?,
+                ops::reshape(v, &[b, kv_heads, 1, s_len, d], s)?,
+            )
+        } else {
+            (qs, k.clone(), v.clone())
+        };
+        let ndim_axes: &[i32] = if repeats > 1 {
+            &[0, 1, 2, 4, 3]
+        } else {
+            &[0, 1, 3, 2]
+        };
+        let scores = ops::matmul(&qs, &ops::transpose(&kx, ndim_axes, s)?, s)?;
+        let scores = ops::multiply(
+            &ops::tanh(
+                &ops::divide(&scores, &weak_scalar(f64::from(cap), &scores, s)?, s)?,
+                s,
+            )?,
+            &weak_scalar(f64::from(cap), &scores, s)?,
+            s,
+        )?;
+        let scores = match mask {
+            SdpaMask::None => scores,
+            SdpaMask::Causal => {
+                // Boolean `linds >= rinds` causal mask (reference
+                // `create_causal_mask`), realized as `linds + 1 > rinds`
+                // over integer indices; masked lanes get
+                // `finfo(dtype).min` via `where`, exactly as the
+                // reference's bool-mask branch does.
+                let linds1 = ops::reshape(
+                    &ops::arange(
+                        f64::from(q_offset) + 1.0,
+                        f64::from(q_offset + l) + 1.0,
+                        1.0,
+                        Dtype::Int32,
+                        s,
+                    )?,
+                    &[l, 1],
+                    s,
+                )?;
+                let rinds = ops::reshape(
+                    &ops::arange(0.0, f64::from(s_len), 1.0, Dtype::Int32, s)?,
+                    &[1, s_len],
+                    s,
+                )?;
+                let keep = ops::greater(&linds1, &rinds, s)?;
+                let dtype = scores.dtype().ok_or_else(|| MlxError {
+                    message: "softcap scores with an unsupported dtype".to_owned(),
+                })?;
+                // mx.finfo(dtype).min per dtype: bf16's is NOT f32::MIN
+                // (that would round to -inf in bf16).
+                let neg_min = match dtype {
+                    Dtype::Float16 => -65504.0,
+                    Dtype::Bfloat16 => -(2.0 - f64::powi(2.0, -7)) * f64::powi(2.0, 127),
+                    _ => f64::from(f32::MIN),
+                };
+                ops::where_cond(&keep, &scores, &weak_scalar(neg_min, &scores, s)?, s)?
+            }
+        };
+        let probs = ops::softmax(&scores, -1, true, s)?;
+        let out = ops::matmul(&probs, &vx, s)?;
+        if repeats > 1 {
+            ops::reshape(&out, &[b, self.n_heads, l, d], s)
+        } else {
+            Ok(out)
+        }
     }
 
     /// Contiguous-cache forward. `pad` rows (ADR 0002 kernel-class padding,
@@ -420,22 +597,33 @@ impl Attention {
 
         let (keys, values) = cache.update_and_fetch(&keys, &values, s)?;
 
-        // Pad queries sit in FRONT of the real rows: SDPA's causal mask is
-        // bottom-right aligned, so the real rows keep their exact
-        // attention spans and the pad rows (garbage in, discarded out)
-        // attend shorter prefixes.
-        let queries = pad_front(&queries, pad, 2, s)?;
-        let out =
-            fast::scaled_dot_product_attention(&queries, &keys, &values, self.scale, mask, s)?;
-        let out = if pad > 0 {
-            ops::slice(
-                &out,
-                &[0, 0, pad, 0],
-                &[b, self.n_heads, pad + l, self.head_dim],
-                s,
-            )?
+        let out = if let Some(cap) = self.attn_softcap {
+            // Softcapped architectures run reference-shaped (monolithic)
+            // prefill pieces only, so kernel-class pads never arise here.
+            if pad > 0 {
+                return Err(MlxError {
+                    message: "kernel-class pad rows on a softcapped-attention forward".to_owned(),
+                });
+            }
+            self.manual_softcap_attention(&queries, &keys, &values, cap, mask, offset, s)?
         } else {
-            out
+            // Pad queries sit in FRONT of the real rows: SDPA's causal mask
+            // is bottom-right aligned, so the real rows keep their exact
+            // attention spans and the pad rows (garbage in, discarded out)
+            // attend shorter prefixes.
+            let queries = pad_front(&queries, pad, 2, s)?;
+            let out =
+                fast::scaled_dot_product_attention(&queries, &keys, &values, self.scale, mask, s)?;
+            if pad > 0 {
+                ops::slice(
+                    &out,
+                    &[0, 0, pad, 0],
+                    &[b, self.n_heads, pad + l, self.head_dim],
+                    s,
+                )?
+            } else {
+                out
+            }
         };
         let out = ops::transpose(&out, &[0, 2, 1, 3], s)?;
         let out = ops::reshape(&out, &[b, l, self.n_heads * self.head_dim], s)?;
@@ -548,17 +736,28 @@ impl Attention {
             } else {
                 SdpaMask::None
             };
-            let q = pad_front(q, pad, 2, s)?;
-            let o = fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, s)?;
-            let o = if pad > 0 {
-                ops::slice(
-                    &o,
-                    &[0, 0, pad, 0],
-                    &[1, self.n_heads, pad + seq.len, self.head_dim],
-                    s,
-                )?
+            let o = if let Some(cap) = self.attn_softcap {
+                // Softcapped architectures run reference-shaped
+                // (monolithic) prefill pieces only — pads never arise.
+                if pad > 0 {
+                    return Err(MlxError {
+                        message: "kernel-class pad rows on a softcapped-attention step".to_owned(),
+                    });
+                }
+                self.manual_softcap_attention(q, &k, &v, cap, mask, seq.offset, s)?
             } else {
-                o
+                let q = pad_front(q, pad, 2, s)?;
+                let o = fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, s)?;
+                if pad > 0 {
+                    ops::slice(
+                        &o,
+                        &[0, 0, pad, 0],
+                        &[1, self.n_heads, pad + seq.len, self.head_dim],
+                        s,
+                    )?
+                } else {
+                    o
+                }
             };
             let o = ops::transpose(&o, &[0, 2, 1, 3], s)?;
             outs.push(ops::reshape(
@@ -579,12 +778,39 @@ impl Attention {
     }
 }
 
-/// Pre-norm transformer block (attention + SwiGLU MLP with RMSNorm skips) —
-/// the block shape shared by llama/qwen2/qwen3.
+/// Residual connection. With `clip_f16` (gemma3 `clip_residual`) an f16
+/// residual is computed in f32 and clipped to the f16 range before
+/// narrowing; any other dtype (and the non-clipping architectures) is a
+/// plain add — exactly the reference's branch.
+fn residual_add(x: &Array, y: &Array, clip_f16: bool, s: &Stream) -> Result<Array, MlxError> {
+    if !clip_f16 || x.dtype() != Some(Dtype::Float16) {
+        return ops::add(x, y, s);
+    }
+    let sum = ops::add(
+        &ops::astype(x, Dtype::Float32, s)?,
+        &ops::astype(y, Dtype::Float32, s)?,
+        s,
+    )?;
+    // mx.finfo(mx.float16).max
+    let bound = 65504.0f32;
+    let clipped = ops::clip(&sum, &Array::from_f32(-bound), &Array::from_f32(bound), s)?;
+    ops::astype(&clipped, Dtype::Float16, s)
+}
+
+/// Transformer block. Two reference shapes share it:
+/// - llama/qwen pre-norm: `h = x + attn(norm(x)); out = h + mlp(norm(h))`;
+/// - gemma "sandwich" (pre/post-feedforward norms present, post-attention
+///   norm applied to the attention OUTPUT):
+///   `h = x (+) norm(attn(norm(x))); out = h (+) norm(mlp(norm(h)))`
+///   where `(+)` is [`residual_add`] (clipped for gemma3 f16).
 #[derive(Debug)]
 pub(crate) struct Block {
     input_layernorm: Array,
     post_attention_layernorm: Array,
+    /// `Some` selects the gemma sandwich shape.
+    pre_feedforward_layernorm: Option<Array>,
+    post_feedforward_layernorm: Option<Array>,
+    clip_residual_f16: bool,
     self_attn: Attention,
     mlp: Mlp,
     rms_eps: f32,
@@ -592,6 +818,7 @@ pub(crate) struct Block {
 
 impl Block {
     /// Loads one decoder layer at `prefix` (`model.layers.N`).
+    #[allow(clippy::too_many_arguments)] // load-time plumbing, one call site
     pub(crate) fn load(
         store: &mut WeightStore,
         prefix: &str,
@@ -599,21 +826,72 @@ impl Block {
         shape: &AttentionShape,
         rope: Rope,
         rms_eps: f32,
+        opts: &TrunkOptions,
+        s: &Stream,
     ) -> Result<Self, ModelError> {
+        let norm = |w: Array| opts.norm_style.apply(w, s);
+        let (pre_ffw, post_ffw) = if opts.sandwich_norms {
+            (
+                Some(norm(store.take(&format!(
+                    "{prefix}.pre_feedforward_layernorm.weight"
+                ))?)?),
+                Some(norm(store.take(&format!(
+                    "{prefix}.post_feedforward_layernorm.weight"
+                ))?)?),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
-            input_layernorm: store.take(&format!("{prefix}.input_layernorm.weight"))?,
-            post_attention_layernorm: store
-                .take(&format!("{prefix}.post_attention_layernorm.weight"))?,
+            input_layernorm: norm(store.take(&format!("{prefix}.input_layernorm.weight"))?)?,
+            post_attention_layernorm: norm(
+                store.take(&format!("{prefix}.post_attention_layernorm.weight"))?,
+            )?,
+            pre_feedforward_layernorm: pre_ffw,
+            post_feedforward_layernorm: post_ffw,
+            clip_residual_f16: opts.clip_residual_f16,
             self_attn: Attention::load(
                 store,
                 &format!("{prefix}.self_attn"),
                 quantization,
                 shape,
                 rope,
+                opts.norm_style,
+                s,
             )?,
-            mlp: Mlp::load(store, &format!("{prefix}.mlp"), quantization)?,
+            mlp: Mlp::load(
+                store,
+                &format!("{prefix}.mlp"),
+                quantization,
+                opts.activation,
+            )?,
             rms_eps,
         })
+    }
+
+    /// Everything after the attention sublayer — shared by both decode
+    /// paths so the two block shapes exist exactly once.
+    fn finish(&self, x: &Array, attn: &Array, s: &Stream) -> Result<Array, MlxError> {
+        match (
+            &self.pre_feedforward_layernorm,
+            &self.post_feedforward_layernorm,
+        ) {
+            (Some(pre_ffw), Some(post_ffw)) => {
+                let attn = fast::rms_norm(attn, &self.post_attention_layernorm, self.rms_eps, s)?;
+                let h = residual_add(x, &attn, self.clip_residual_f16, s)?;
+                let mlp = self
+                    .mlp
+                    .forward(&fast::rms_norm(&h, pre_ffw, self.rms_eps, s)?, s)?;
+                let mlp = fast::rms_norm(&mlp, post_ffw, self.rms_eps, s)?;
+                residual_add(&h, &mlp, self.clip_residual_f16, s)
+            }
+            _ => {
+                let h = ops::add(x, attn, s)?;
+                let normed = fast::rms_norm(&h, &self.post_attention_layernorm, self.rms_eps, s)?;
+                let mlp = self.mlp.forward(&normed, s)?;
+                ops::add(&h, &mlp, s)
+            }
+        }
     }
 
     fn forward(
@@ -626,10 +904,7 @@ impl Block {
     ) -> Result<Array, MlxError> {
         let normed = fast::rms_norm(x, &self.input_layernorm, self.rms_eps, s)?;
         let attn = self.self_attn.forward(&normed, cache, mask, pad, s)?;
-        let h = ops::add(x, &attn, s)?;
-        let normed = fast::rms_norm(&h, &self.post_attention_layernorm, self.rms_eps, s)?;
-        let mlp = self.mlp.forward(&normed, s)?;
-        ops::add(&h, &mlp, s)
+        self.finish(x, &attn, s)
     }
 
     fn forward_step(
@@ -645,23 +920,55 @@ impl Block {
         let attn = self
             .self_attn
             .forward_step(&normed, seqs, kv, layer, pad, s)?;
-        let h = ops::add(x, &attn, s)?;
-        let normed = fast::rms_norm(&h, &self.post_attention_layernorm, self.rms_eps, s)?;
-        let mlp = self.mlp.forward(&normed, s)?;
-        ops::add(&h, &mlp, s)
+        self.finish(x, &attn, s)
     }
 }
 
-/// The llama-shaped causal-LM trunk: token embedding, `Block` stack, final
+/// Architecture switches for the shared trunk beyond [`AttentionShape`] —
+/// one parity-proven `CausalLm` serves llama/qwen (defaults) and gemma
+/// (sandwich blocks, `1+w` norms, gelu, embed scaling, softcapping).
+#[derive(Debug)]
+pub(crate) struct TrunkOptions {
+    pub(crate) norm_style: NormStyle,
+    pub(crate) activation: Activation,
+    /// Load pre/post-feedforward norms and use the gemma sandwich block.
+    pub(crate) sandwich_norms: bool,
+    /// gemma3 `clip_residual` (f32 residual adds clipped to f16 range).
+    pub(crate) clip_residual_f16: bool,
+    /// Multiply embeddings by this constant after lookup (gemma's
+    /// `sqrt(hidden_size)`, pre-built with the architecture's own rounding:
+    /// a bf16 constant for gemma3, an f32 weak scalar for gemma2); it is
+    /// `astype`d to the hidden dtype in-graph, as the reference does.
+    pub(crate) embed_scale: Option<Array>,
+    /// gemma2 final logit softcapping (`tanh(logits/cap)*cap`).
+    pub(crate) final_logit_softcapping: Option<f32>,
+}
+
+impl Default for TrunkOptions {
+    fn default() -> Self {
+        Self {
+            norm_style: NormStyle::Plain,
+            activation: Activation::Silu,
+            sandwich_norms: false,
+            clip_residual_f16: false,
+            embed_scale: None,
+            final_logit_softcapping: None,
+        }
+    }
+}
+
+/// The shared causal-LM trunk: token embedding, `Block` stack, final
 /// RMSNorm, (possibly tied) lm_head. Owns both decode paths so every
 /// architecture built from it shares one parity-proven implementation.
 #[derive(Debug)]
 pub(crate) struct CausalLm {
     embed_tokens: Embedding,
+    embed_scale: Option<Array>,
     blocks: Vec<Block>,
     norm: Array,
     /// `None` when `tie_word_embeddings` (logits via `embed_tokens.as_linear`).
     lm_head: Option<Linear>,
+    final_logit_softcapping: Option<f32>,
     rms_eps: f32,
 }
 
@@ -669,7 +976,9 @@ impl CausalLm {
     /// Consumes `store`, loading embedding + `num_layers` blocks + head. The
     /// checkpoint must be fully consumed: unexpected leftovers (beyond
     /// mlx-lm's sanitize-dropped `rotary_emb.inv_freq` tables and the stray
-    /// `lm_head` on tied models) fail the load.
+    /// `lm_head` on tied models) fail the load. `mk_rope` receives the layer
+    /// index (gemma3 alternates local/global rope; other archs ignore it).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load(
         mut store: WeightStore,
         quantization: Option<Quantization>,
@@ -677,7 +986,9 @@ impl CausalLm {
         shape: &AttentionShape,
         rms_eps: f32,
         tie_word_embeddings: bool,
-        mk_rope: impl Fn() -> Result<Rope, ModelError>,
+        opts: TrunkOptions,
+        mk_rope: impl Fn(usize) -> Result<Rope, ModelError>,
+        s: &Stream,
     ) -> Result<Self, ModelError> {
         let embed_tokens = Embedding::load(&mut store, "model.embed_tokens", quantization)?;
         let mut blocks = Vec::with_capacity(num_layers);
@@ -687,11 +998,13 @@ impl CausalLm {
                 &format!("model.layers.{i}"),
                 quantization,
                 shape,
-                mk_rope()?,
+                mk_rope(i)?,
                 rms_eps,
+                &opts,
+                s,
             )?);
         }
-        let norm = store.take("model.norm.weight")?;
+        let norm = opts.norm_style.apply(store.take("model.norm.weight")?, s)?;
         let lm_head = if tie_word_embeddings {
             // mlx-lm sanitize drops a stray lm_head.weight on tied models.
             let _ = store.take_optional("lm_head.weight");
@@ -717,11 +1030,43 @@ impl CausalLm {
 
         Ok(Self {
             embed_tokens,
+            embed_scale: opts.embed_scale,
             blocks,
             norm,
             lm_head,
+            final_logit_softcapping: opts.final_logit_softcapping,
             rms_eps,
         })
+    }
+
+    /// Embedding lookup + the gemma `sqrt(hidden)` scaling (reference:
+    /// `h *= scale.astype(h.dtype)`); a plain lookup elsewhere.
+    fn embed(&self, tokens: &Array, s: &Stream) -> Result<Array, MlxError> {
+        let h = self.embed_tokens.lookup(tokens, s)?;
+        match &self.embed_scale {
+            None => Ok(h),
+            Some(scale) => {
+                let dtype = h.dtype().ok_or_else(|| MlxError {
+                    message: "embedding output with an unsupported dtype".to_owned(),
+                })?;
+                ops::multiply(&h, &ops::astype(scale, dtype, s)?, s)
+            }
+        }
+    }
+
+    /// gemma2 final logit softcapping (`out = tanh(out/cap) * cap`); the
+    /// identity elsewhere.
+    fn softcap_logits(&self, logits: Array, s: &Stream) -> Result<Array, MlxError> {
+        match self.final_logit_softcapping {
+            None => Ok(logits),
+            Some(cap) => {
+                let capped = ops::tanh(
+                    &ops::divide(&logits, &weak_scalar(f64::from(cap), &logits, s)?, s)?,
+                    s,
+                )?;
+                ops::multiply(&capped, &weak_scalar(f64::from(cap), &logits, s)?, s)
+            }
+        }
     }
 
     pub(crate) fn num_layers(&self) -> usize {
@@ -818,7 +1163,7 @@ impl CausalLm {
         } else {
             SdpaMask::None
         };
-        let mut h = self.embed_tokens.lookup(tokens, s)?;
+        let mut h = self.embed(tokens, s)?;
         for (block, cache) in self.blocks.iter().zip(caches.iter_mut()) {
             h = block.forward(&h, cache, mask, pad, s)?;
         }
@@ -827,7 +1172,7 @@ impl CausalLm {
             Some(head) => head.forward(&h, s)?,
             None => self.embed_tokens.as_linear(&h, s)?,
         };
-        Ok(logits)
+        Ok(self.softcap_logits(logits, s)?)
     }
 
     /// The batched/paged forward pass (SPEC §6.2 step 2 / §7.2). The lm_head
@@ -882,7 +1227,7 @@ impl CausalLm {
                 });
             }
         };
-        let mut h = self.embed_tokens.lookup(&tokens, s)?;
+        let mut h = self.embed(&tokens, s)?;
         for (layer, block) in self.blocks.iter().enumerate() {
             h = block.forward_step(&h, &batch.seqs, kv, layer, pad, s)?;
         }
@@ -912,7 +1257,7 @@ impl CausalLm {
             Some(head) => head.forward(&h, s)?,
             None => self.embed_tokens.as_linear(&h, s)?,
         };
-        Ok(Some(logits))
+        Ok(Some(self.softcap_logits(logits, s)?))
     }
 }
 

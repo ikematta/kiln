@@ -202,6 +202,18 @@ impl Worker for WorkerService {
                 ),
             )));
         }
+        // Architecture parity envelope (Phase 6 Task 2, see modelinfo.rs):
+        // prompts past this bound have no reference-shaped prefill.
+        let max_prompt = self.shared.info.max_prompt_len;
+        if max_prompt > 0 && prompt_ids.len() as u64 > u64::from(max_prompt) {
+            return Ok(Response::new(error_stream(
+                WorkerErrorCode::WorkerErrorCtxOverflow,
+                format!(
+                    "prompt ({}) exceeds this architecture's prefill bound ({max_prompt})",
+                    prompt_ids.len(),
+                ),
+            )));
+        }
 
         // Register (duplicate ids rejected) and enqueue.
         let handle = Arc::new(RequestHandle::default());

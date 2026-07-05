@@ -13,7 +13,7 @@ use kiln_engine::{KvDims, PagedKv, StepBatch, StepModel};
 use kiln_mlx::{Array, MlxError, Stream};
 
 use crate::config::Qwen2Config;
-use crate::nn::{AttentionShape, CausalLm, ModelError, Rope};
+use crate::nn::{AttentionShape, CausalLm, ModelError, Rope, TrunkOptions};
 use crate::weights::WeightStore;
 
 /// A loaded Qwen2/2.5-family model.
@@ -35,6 +35,8 @@ impl Qwen2Model {
             head_dim: config.head_dim() as i32,
             traditional_rope: config.rope_traditional,
             qk_norm_eps: None,
+            scale_override: None,
+            attn_logit_softcapping: None,
         };
         let scaling = config.rope_scaling()?;
         let lm = CausalLm::load(
@@ -44,7 +46,9 @@ impl Qwen2Model {
             &shape,
             config.rms_norm_eps,
             config.tie_word_embeddings,
-            || Rope::new(&scaling, config.head_dim(), config.rope_theta, s),
+            TrunkOptions::default(),
+            |_| Rope::new(&scaling, config.head_dim(), config.rope_theta, s),
+            s,
         )?;
         Ok(Self { config, lm })
     }

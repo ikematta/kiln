@@ -9,6 +9,8 @@ use kiln_engine::{KvDims, PagedKv, StepBatch, StepModel};
 use kiln_mlx::{Array, MlxError, Stream};
 
 use crate::config::ArchConfig;
+use crate::gemma2::Gemma2Model;
+use crate::gemma3::Gemma3Model;
 use crate::llama::LlamaModel;
 use crate::nn::ModelError;
 use crate::qwen2::Qwen2Model;
@@ -21,6 +23,8 @@ pub enum AnyModel {
     Llama(LlamaModel),
     Qwen2(Qwen2Model),
     Qwen3(Qwen3Model),
+    Gemma2(Gemma2Model),
+    Gemma3(Gemma3Model),
 }
 
 impl AnyModel {
@@ -33,6 +37,8 @@ impl AnyModel {
             ArchConfig::Llama(_) => Ok(Self::Llama(LlamaModel::load(dir, s)?)),
             ArchConfig::Qwen2(_) => Ok(Self::Qwen2(Qwen2Model::load(dir, s)?)),
             ArchConfig::Qwen3(_) => Ok(Self::Qwen3(Qwen3Model::load(dir, s)?)),
+            ArchConfig::Gemma2(_) => Ok(Self::Gemma2(Gemma2Model::load(dir, s)?)),
+            ArchConfig::Gemma3(_) => Ok(Self::Gemma3(Gemma3Model::load(dir, s)?)),
         }
     }
 
@@ -41,6 +47,8 @@ impl AnyModel {
             Self::Llama(m) => &m.config().model_type,
             Self::Qwen2(m) => &m.config().model_type,
             Self::Qwen3(m) => &m.config().model_type,
+            Self::Gemma2(m) => &m.config().model_type,
+            Self::Gemma3(m) => &m.config().model_type,
         }
     }
 
@@ -50,6 +58,8 @@ impl AnyModel {
             Self::Llama(m) => m.config().eos_token_ids(),
             Self::Qwen2(m) => m.config().eos_token_ids(),
             Self::Qwen3(m) => m.config().eos_token_ids(),
+            Self::Gemma2(m) => m.config().eos_token_ids(),
+            Self::Gemma3(m) => m.config().eos_token_ids(),
         }
     }
 
@@ -59,6 +69,39 @@ impl AnyModel {
             Self::Llama(m) => m.kv_dims(),
             Self::Qwen2(m) => m.kv_dims(),
             Self::Qwen3(m) => m.kv_dims(),
+            Self::Gemma2(m) => m.kv_dims(),
+            Self::Gemma3(m) => m.kv_dims(),
+        }
+    }
+
+    /// `true` when the architecture's attention math is only
+    /// reference-defined for monolithic (offset-0, per-`prefill_chunk`)
+    /// prefill pieces — gemma2's manual softcapped attention. Engine
+    /// builders honor it as `prefill_fine_chunk = prefill_chunk` (the
+    /// single-tail schedule; Phase 5's fine grid stays on elsewhere).
+    pub fn monolithic_prefill_required(&self) -> bool {
+        match self {
+            Self::Gemma2(m) => m.monolithic_prefill_required(),
+            _ => false,
+        }
+    }
+
+    /// Largest PROMPT length whose prefill op stream is reference-shaped
+    /// (`None` = no architectural bound beyond pool/config limits).
+    pub fn max_prompt_for_parity(&self) -> Option<usize> {
+        match self {
+            Self::Gemma2(m) => Some(m.max_prompt_for_parity()),
+            _ => None,
+        }
+    }
+
+    /// Largest TOTAL context (prompt + generated) whose op stream is
+    /// reference-shaped (`None` = no architectural bound). gemma3's
+    /// sliding window — see `gemma3.rs` module docs.
+    pub fn max_context_for_parity(&self) -> Option<usize> {
+        match self {
+            Self::Gemma3(m) => Some(m.max_context_for_parity()),
+            _ => None,
         }
     }
 
@@ -72,6 +115,8 @@ impl AnyModel {
             Self::Llama(m) => m.calibrate_deterministic_width(s),
             Self::Qwen2(m) => m.calibrate_deterministic_width(s),
             Self::Qwen3(m) => m.calibrate_deterministic_width(s),
+            Self::Gemma2(m) => m.calibrate_deterministic_width(s),
+            Self::Gemma3(m) => m.calibrate_deterministic_width(s),
         }
     }
 }
@@ -87,6 +132,8 @@ impl StepModel for AnyModel {
             Self::Llama(m) => m.forward_step(batch, kv, s),
             Self::Qwen2(m) => m.forward_step(batch, kv, s),
             Self::Qwen3(m) => m.forward_step(batch, kv, s),
+            Self::Gemma2(m) => m.forward_step(batch, kv, s),
+            Self::Gemma3(m) => m.forward_step(batch, kv, s),
         }
     }
 }

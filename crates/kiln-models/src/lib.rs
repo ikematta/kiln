@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
-//! `kiln-models`: model implementations (llama, qwen2/3) and `config.json`
-//! parsing per mlx-lm conventions (SPEC §7.2).
+//! `kiln-models`: model implementations (llama, qwen2/3, gemma2/3) and
+//! `config.json` parsing per mlx-lm conventions (SPEC §7.2).
 //!
 //! Architecture dispatch is [`AnyModel`]/[`config::ArchConfig`]; the shared
 //! decode paths live in the crate-private `nn` module and each architecture
@@ -10,6 +10,10 @@
 //! compile-check).
 
 pub mod config;
+#[cfg(feature = "metal")]
+pub mod gemma2;
+#[cfg(feature = "metal")]
+pub mod gemma3;
 #[cfg(feature = "metal")]
 pub mod generate;
 #[cfg(feature = "metal")]
@@ -28,9 +32,13 @@ pub mod qwen3;
 pub mod weights;
 
 pub use config::{
-    ArchConfig, ConfigError, LlamaConfig, Quantization, Qwen2Config, Qwen3Config, RopeScaling,
-    SUPPORTED_ARCHITECTURES,
+    ArchConfig, ConfigError, Gemma2Config, Gemma3Config, LlamaConfig, Quantization, Qwen2Config,
+    Qwen3Config, RopeScaling, SUPPORTED_ARCHITECTURES,
 };
+#[cfg(feature = "metal")]
+pub use gemma2::Gemma2Model;
+#[cfg(feature = "metal")]
+pub use gemma3::Gemma3Model;
 #[cfg(feature = "metal")]
 pub use generate::{GenerateOutput, generate, generate_with};
 #[cfg(feature = "metal")]

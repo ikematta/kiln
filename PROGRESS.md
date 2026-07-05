@@ -2356,3 +2356,108 @@
 - **Phase 6 / Task 1 (Qwen2.5/Qwen3 + parity/throughput bars) is CLOSED.**
 - Next: Task 2 — Gemma2/Gemma3 impls, fixtures first (SPEC §12 Phase 6),
   width-16 parity verified against the ADR 0002/0003 bars.
+
+## [2026-07-05] Phase 6 / Task 2 — Gemma2 + Gemma3 — DONE
+- What (fixtures first, then implementation, per CLAUDE.md):
+  1. **Golden fixtures** (sanctioned generator, pinned stack mlx.core
+     0.31.1 / mlx-lm 0.31.2): tests/golden/gemma-3-1b-it-4bit/ (6 cases)
+     and tests/golden/gemma-2-2b-it-4bit/ (6 cases), standard CASES list.
+     New pinned test model `gemma-2-2b-it-4bit`
+     (mlx-community @ 2c715097) — the smallest gemma-2 checkpoint that
+     exists; gemma3 uses the already-pinned gemma-3-1b-it-4bit.
+  2. **Shared-trunk extension** (nn.rs `TrunkOptions` — one parity-proven
+     CausalLm for all five archs): `NormStyle::OnePlus` (gemma `1+w`
+     RMSNorm, folded into the weights at load — same add, same bits,
+     fewer ops), `Activation::GeluApprox` (`mlx.nn.gelu_approx`
+     op-for-op in the reference's evaluation order), gemma sandwich
+     `Block` (post-attention/pre-/post-feedforward norms on sublayer
+     OUTPUTS), `clip_residual` (gemma3: f32 residual adds clipped to the
+     f16 range), embedding scaling (gemma3: bf16(sqrt(hidden)) cast
+     in-graph = f16 34.0 verified against the reference; gemma2: weak
+     f32 scalar), final logit softcapping (gemma2), per-layer
+     `mk_rope(layer)` (gemma3 local 10k / global 1M+scaling), qk-norm
+     with the trunk's norm style (gemma3), `scale_override` computed
+     with each arch's own f64 formula, and **manual softcapped
+     attention** for gemma2 (`tanh(scores/cap)*cap`, boolean causal mask
+     via `where`, `softmax(precise)` — `mx.fast` SDPA is unusable under
+     softcapping, so the reference matmuls scores/probs explicitly) on
+     BOTH decode paths. kiln-mlx gains `ops::tanh` (bindgen surface
+     already had it). `weak_scalar` helper mirrors MLX's Python-float
+     promotion (f32 value cast to the tensor dtype at the op) so scalar
+     ops run in the reference's dtype.
+  3. **Arch modules + dispatch**: gemma3.rs / gemma2.rs, Gemma2Config /
+     Gemma3Config (defaults mirror the reference ModelArgs; gemma3 tie
+     decided from the checkpoint like the reference's `sanitize` — the
+     1B ships an lm_head, so it runs untied), ArchConfig/AnyModel
+     variants, SUPPORTED_ARCHITECTURES += gemma2, gemma3_text
+     (multimodal "gemma3" stays python-routed).
+  4. **Parity envelopes, worker-enforced** (existing CTX_OVERFLOW path):
+     - gemma3: total context (prompt+generated) <= sliding_window (512).
+       The reference's RotatingKVCache(keep=0) is bit-for-bit a plain
+       temporal cache BELOW the window and its masks are plain causal;
+       ABOVE it the buffer rotates (ring order) and serving without
+       ring-order gather would silently diverge from the reference and
+       from the model's own window semantics. modelinfo.rs min's the
+       advertised max_context_len with the window.
+     - gemma2: prompt <= 2048 (one mlx-lm `prefill_step_size` chunk) +
+       the single-tail prefill schedule (worker engine_main and the
+       golden harness set `prefill_fine_chunk = prefill_chunk` when the
+       model declares `monolithic_prefill_required`). Manual-attention
+       score/prob matmul row bits depend on the key-axis length and the
+       reference's bool mask exists only at offset 0 (KVCache has no
+       `make_mask` at the pin), so only reference-shaped monolithic
+       pieces are parity-defined. New `StaticInfo.max_prompt_len` backs
+       the admission check.
+- **Result: 28/28 fixtures bit-exact** — llama 6, qwen2.5 5, qwen3 5,
+  gemma2 6, gemma3 6 — single-stream AND at decode width 16 under B'
+  (both gemmas calibrate deterministic width 9 on this machine, probing
+  through the untied 262k-vocab gemma3 head and gemma2's tied embedding
+  alike). Both models were bit-exact on the FIRST harness run.
+- Decisions (within latitude):
+  - gemma3 window-crossing support deferred behind a hard cap rather
+    than shipped semantically wrong (unwindowed attention past 512).
+    Lifting it = ring-order decode gather (slot = closed-form rotation
+    of the reference buffer) + reference-shaped >window prefill masks +
+    a dedicated >512-token fixture; recorded as the follow-up item.
+  - gemma2 fine grid off is the Phase-5-B2 tradeoff scoped to one arch
+    (forfeits sub-2048 multi-turn prefill reuse for gemma2 only) —
+    required for mask semantics, not a perf preference.
+  - qk-norm slot: the reference norms after the head transpose, Kiln
+    norms before it (identical row content either way, both reduce over
+    head_dim) — kept Kiln's existing slot; verified empirically by the
+    bit-exact fixtures.
+- Deviations: fetch-test-model.sh gained the gemma-2-2b-it-4bit pin (new
+  entry; existing pins untouched) — same shape as the Phase 6 qwen2.5
+  addition, unavoidable for gemma2 coverage. Flagging per protocol.
+- Known issue (pre-existing, NOT addressed here):
+  `cargo test -p kiln-engine --test sampler --release` dies with
+  SIGBUS/SIGSEGV — reproduced on clean HEAD cce71d7 (pre-gemma), debug
+  mode passes, and the CI gates run debug, which is why it was never
+  seen. Discovered via an exploratory --release suite run. Needs its own
+  session; test not weakened, nothing skipped.
+- Acceptance (real outputs, trimmed):
+  ```
+  $ uv run ... python scripts/gen-golden.py --model gemma-3-1b-it-4bit ...
+  wrote 6 fixtures  (chat-basic 21 tok ... raw-long-prefill 242 tok)
+  $ uv run ... python scripts/gen-golden.py --model gemma-2-2b-it-4bit ...
+  wrote 6 fixtures  (prompts 6..241 tok; all within both parity caps)
+  $ cargo test -p kiln-models --test golden --release -- --nocapture
+  == gemma-3-1b-it-4bit: model_type=gemma3_text, 6 fixture(s), det width 9
+  6x "exact match (batched/paged engine)" + 6x "exact match at decode
+  width 16 (B' deterministic sub-batching)"
+  == gemma-2-2b-it-4bit: model_type=gemma2, 6 fixture(s), det width 9
+  6x exact + 6x exact at width 16
+  (llama 6, qwen2.5 5, qwen3 5 all still exact both rounds)
+  test result: ok
+  $ cargo test --workspace --no-fail-fast   (debug = CI shape)
+  38/38 test targets ok (golden, calibration, deterministic_partition,
+  batching, prefill_pad, prefix suites, both leak gates, worker rpc)
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+  clean (also clean with --no-default-features; linux compile-check builds)
+  $ uv run --project tests/e2e pytest tests/e2e -q -> 21 passed
+  $ KILN_TEST_MODELS=... pytest python/kiln_worker_py/tests -> 28 passed
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order);
+  standing items: gemma3 window-crossing (ring-order gather + fixture),
+  release-mode sampler crash (separate session).

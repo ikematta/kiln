@@ -23,6 +23,10 @@ PINS=(
   # Phase 6 additions (new pins, existing pins untouched): qwen2 arch
   # coverage and the 8-bit quantization path (SPEC §12 Phase 6 matrix).
   "qwen2.5-0.5b-4bit   mlx-community/Qwen2.5-0.5B-Instruct-4bit  a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3"
+  # Phase 6 Task 2: gemma2 arch coverage (smallest gemma-2 is 2B; no
+  # tinier checkpoint exists). gemma3 is covered by the pinned
+  # gemma-3-1b-it-4bit above.
+  "gemma-2-2b-it-4bit  mlx-community/gemma-2-2b-it-4bit          2c715097ff9c081a6ac1e5cd239e2ac756b5bd99"
 )
 
 DEST="${KILN_TEST_MODELS:-$HOME/.kiln/test-models}"

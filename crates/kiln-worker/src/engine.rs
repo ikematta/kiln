@@ -302,7 +302,7 @@ pub fn engine_main(
     // memory-budget admission lands (SPEC §6.4 / §2.3, Phase 4 part 3+).
     // Prefix cache/SSD per the CLI flags (SPEC §6.3/§6.4): slabs live
     // under `<ssd_dir>/<model_fingerprint>/blocks/`.
-    let config = EngineConfig {
+    let mut config = EngineConfig {
         prefix_cache: cache.prefix_cache,
         ssd: cache
             .ssd_dir
@@ -316,6 +316,12 @@ pub fn engine_main(
         deterministic_decode_width: det_width,
         ..EngineConfig::default()
     };
+    if model.monolithic_prefill_required() {
+        // gemma2 manual softcapped attention: prefill must run in the
+        // reference's own single-tail shape (no Phase 5 fine grid); values
+        // >= prefill_chunk select exactly that schedule.
+        config.prefill_fine_chunk = config.prefill_chunk;
+    }
     let mut engine = match Engine::new(model, dims, config, stream) {
         Ok(engine) => engine,
         Err(err) => {

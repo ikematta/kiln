@@ -57,6 +57,11 @@ unary_op!(
     exp, mlx_exp
 );
 unary_op!(
+    /// Elementwise hyperbolic tangent (gemma logit softcapping,
+    /// `gelu_approx`).
+    tanh, mlx_tanh
+);
+unary_op!(
     /// Elementwise -x.
     negative, mlx_negative
 );

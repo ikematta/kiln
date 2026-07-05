@@ -33,8 +33,10 @@ pub struct Quantization {
 }
 
 /// `model_type` values the Rust worker implements (SPEC §7.2). Keyed to the
-/// [`ArchConfig`] dispatch below — extend both together.
-pub const SUPPORTED_ARCHITECTURES: &[&str] = &["llama", "qwen2", "qwen3"];
+/// [`ArchConfig`] dispatch below — extend both together. (`gemma3_text` is
+/// the text-only Gemma3 checkpoint type; multimodal `"gemma3"` is not
+/// supported and routes to the Python worker.)
+pub const SUPPORTED_ARCHITECTURES: &[&str] = &["llama", "qwen2", "qwen3", "gemma2", "gemma3_text"];
 
 /// Resolved `rope_scaling` (the variants mlx-lm's `initialize_rope` supports
 /// for the SPEC §7.2 architectures: default, linear, llama3, yarn).
@@ -372,6 +374,200 @@ impl Qwen3Config {
     }
 }
 
+/// Parsed Gemma2-family `config.json` — fields and defaults mirror
+/// `mlx_lm.models.gemma2.ModelArgs` exactly. Note what the reference does
+/// NOT implement at the pin and Kiln therefore must not either: no sliding
+/// window (the config's `sliding_window` is ignored), no `rope_scaling`,
+/// always-tied embeddings, attention + final logit softcapping always on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Gemma2Config {
+    pub model_type: String,
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub intermediate_size: usize,
+    pub num_attention_heads: usize,
+    pub head_dim: usize,
+    pub rms_norm_eps: f32,
+    pub vocab_size: usize,
+    pub num_key_value_heads: usize,
+    #[serde(default = "default_gemma2_rope_theta")]
+    pub rope_theta: f32,
+    #[serde(default)]
+    pub rope_traditional: bool,
+    #[serde(default = "default_gemma2_attn_softcap")]
+    pub attn_logit_softcapping: f32,
+    #[serde(default = "default_gemma2_final_softcap")]
+    pub final_logit_softcapping: f32,
+    #[serde(default = "default_gemma2_query_pre_attn_scalar")]
+    pub query_pre_attn_scalar: f64,
+    #[serde(default)]
+    pub quantization: Option<Quantization>,
+    #[serde(default)]
+    pub eos_token_id: Option<serde_json::Value>,
+}
+
+fn default_gemma2_rope_theta() -> f32 {
+    10_000.0
+}
+
+fn default_gemma2_attn_softcap() -> f32 {
+    50.0
+}
+
+fn default_gemma2_final_softcap() -> f32 {
+    30.0
+}
+
+fn default_gemma2_query_pre_attn_scalar() -> f64 {
+    144.0
+}
+
+impl Gemma2Config {
+    /// Loads and validates `<dir>/config.json`.
+    pub fn from_model_dir(dir: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        Self::from_json_str(&read_config_json(dir.as_ref())?)
+    }
+
+    /// Parses and validates a `config.json` document (load-time fail-loud;
+    /// see [`LlamaConfig::from_json_str`]).
+    pub fn from_json_str(text: &str) -> Result<Self, ConfigError> {
+        let raw: serde_json::Value = serde_json::from_str(text)?;
+        let config: Self = serde_json::from_value(raw.clone())?;
+        if config.model_type != "gemma2" {
+            return Err(ConfigError::UnsupportedArchitecture(
+                config.model_type.clone(),
+            ));
+        }
+        validate_quantization(&raw)?;
+        validate_quant_params(config.quantization)?;
+        Ok(config)
+    }
+
+    pub fn eos_token_ids(&self) -> Vec<u32> {
+        eos_ids_from(self.eos_token_id.as_ref())
+    }
+}
+
+/// Parsed Gemma3 text-only `config.json` — fields and defaults mirror
+/// `mlx_lm.models.gemma3_text.ModelArgs` exactly (that dataclass defaults
+/// every field to the 1B checkpoint's values). Tying is NOT a config field:
+/// the reference's `sanitize` ties iff the checkpoint has no
+/// `lm_head.weight`, so Kiln decides at weight-load time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Gemma3Config {
+    pub model_type: String,
+    #[serde(default = "default_gemma3_hidden_size")]
+    pub hidden_size: usize,
+    #[serde(default = "default_gemma3_num_hidden_layers")]
+    pub num_hidden_layers: usize,
+    #[serde(default = "default_gemma3_intermediate_size")]
+    pub intermediate_size: usize,
+    #[serde(default = "default_gemma3_num_attention_heads")]
+    pub num_attention_heads: usize,
+    #[serde(default = "default_gemma3_head_dim")]
+    pub head_dim: usize,
+    #[serde(default = "default_gemma3_rms_norm_eps")]
+    pub rms_norm_eps: f32,
+    #[serde(default = "default_gemma3_vocab_size")]
+    pub vocab_size: usize,
+    #[serde(default = "default_gemma3_num_key_value_heads")]
+    pub num_key_value_heads: usize,
+    #[serde(default = "default_gemma3_rope_theta")]
+    pub rope_theta: f32,
+    #[serde(default = "default_gemma3_rope_local_base_freq")]
+    pub rope_local_base_freq: f32,
+    #[serde(default = "default_gemma3_query_pre_attn_scalar")]
+    pub query_pre_attn_scalar: f64,
+    #[serde(default = "default_gemma3_sliding_window")]
+    pub sliding_window: usize,
+    #[serde(default = "default_gemma3_sliding_window_pattern")]
+    pub sliding_window_pattern: usize,
+    #[serde(default = "default_gemma3_max_position_embeddings")]
+    pub max_position_embeddings: usize,
+    #[serde(default)]
+    pub rope_scaling: Option<serde_json::Value>,
+    #[serde(default)]
+    pub quantization: Option<Quantization>,
+    #[serde(default)]
+    pub eos_token_id: Option<serde_json::Value>,
+}
+
+fn default_gemma3_hidden_size() -> usize {
+    1152
+}
+fn default_gemma3_num_hidden_layers() -> usize {
+    26
+}
+fn default_gemma3_intermediate_size() -> usize {
+    6912
+}
+fn default_gemma3_num_attention_heads() -> usize {
+    4
+}
+fn default_gemma3_head_dim() -> usize {
+    256
+}
+fn default_gemma3_rms_norm_eps() -> f32 {
+    1.0e-6
+}
+fn default_gemma3_vocab_size() -> usize {
+    262_144
+}
+fn default_gemma3_num_key_value_heads() -> usize {
+    1
+}
+fn default_gemma3_rope_theta() -> f32 {
+    1_000_000.0
+}
+fn default_gemma3_rope_local_base_freq() -> f32 {
+    10_000.0
+}
+fn default_gemma3_query_pre_attn_scalar() -> f64 {
+    256.0
+}
+fn default_gemma3_sliding_window() -> usize {
+    512
+}
+fn default_gemma3_sliding_window_pattern() -> usize {
+    6
+}
+fn default_gemma3_max_position_embeddings() -> usize {
+    32_768
+}
+
+impl Gemma3Config {
+    /// Loads and validates `<dir>/config.json`.
+    pub fn from_model_dir(dir: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        Self::from_json_str(&read_config_json(dir.as_ref())?)
+    }
+
+    /// Parses and validates a `config.json` document (load-time fail-loud;
+    /// see [`LlamaConfig::from_json_str`]).
+    pub fn from_json_str(text: &str) -> Result<Self, ConfigError> {
+        let raw: serde_json::Value = serde_json::from_str(text)?;
+        let config: Self = serde_json::from_value(raw.clone())?;
+        if config.model_type != "gemma3_text" {
+            return Err(ConfigError::UnsupportedArchitecture(
+                config.model_type.clone(),
+            ));
+        }
+        config.rope_scaling()?;
+        validate_quantization(&raw)?;
+        validate_quant_params(config.quantization)?;
+        Ok(config)
+    }
+
+    pub fn eos_token_ids(&self) -> Vec<u32> {
+        eos_ids_from(self.eos_token_id.as_ref())
+    }
+
+    /// Scaling for the GLOBAL layers' rope (`rope_theta`); local layers are
+    /// always plain `rope_local_base_freq` (mlx-lm `gemma3_text.Attention`).
+    pub fn rope_scaling(&self) -> Result<RopeScaling, ConfigError> {
+        resolve_rope_scaling(self.rope_scaling.as_ref())
+    }
+}
+
 /// A validated `config.json` for any architecture the Rust worker implements,
 /// dispatched on `model_type` ([`SUPPORTED_ARCHITECTURES`]).
 ///
@@ -384,6 +580,8 @@ pub enum ArchConfig {
     Llama(LlamaConfig),
     Qwen2(Qwen2Config),
     Qwen3(Qwen3Config),
+    Gemma2(Gemma2Config),
+    Gemma3(Gemma3Config),
 }
 
 impl ArchConfig {
@@ -406,6 +604,8 @@ impl ArchConfig {
             "llama" => Ok(Self::Llama(LlamaConfig::from_json_str(text)?)),
             "qwen2" => Ok(Self::Qwen2(Qwen2Config::from_json_str(text)?)),
             "qwen3" => Ok(Self::Qwen3(Qwen3Config::from_json_str(text)?)),
+            "gemma2" => Ok(Self::Gemma2(Gemma2Config::from_json_str(text)?)),
+            "gemma3_text" => Ok(Self::Gemma3(Gemma3Config::from_json_str(text)?)),
             _ => Err(ConfigError::UnsupportedArchitecture(model_type)),
         }
     }
@@ -415,6 +615,8 @@ impl ArchConfig {
             Self::Llama(c) => &c.model_type,
             Self::Qwen2(c) => &c.model_type,
             Self::Qwen3(c) => &c.model_type,
+            Self::Gemma2(c) => &c.model_type,
+            Self::Gemma3(c) => &c.model_type,
         }
     }
 
@@ -423,6 +625,8 @@ impl ArchConfig {
             Self::Llama(c) => c.eos_token_ids(),
             Self::Qwen2(c) => c.eos_token_ids(),
             Self::Qwen3(c) => c.eos_token_ids(),
+            Self::Gemma2(c) => c.eos_token_ids(),
+            Self::Gemma3(c) => c.eos_token_ids(),
         }
     }
 }
