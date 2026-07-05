@@ -245,8 +245,10 @@ fn prefix_cache_and_ssd_tier() {
             assert!(hits[0].0 as usize <= settled, "match exceeded settled rows");
 
             // (b) Divergent extension: everything the stopped run computed
-            // (including the stop token) plus fresh text. Shorter than a
-            // prefill chunk, so the determinism rule serves no reuse.
+            // (including the stop token) plus fresh text. Served up to the
+            // fine-grid boundary of the canonical schedule (Option B); the
+            // remainder is recomputed in the cold schedule's exact shapes,
+            // so bit-equality with a cold run must hold.
             let mut extended = seed_prompt.clone();
             extended.extend(&generated[..6]); // ..5 emitted + stop token
             extended.extend(
@@ -264,14 +266,18 @@ fn prefix_cache_and_ssd_tier() {
                 cold.tokens.borrow().as_slice(),
                 "stale data after a pipelined stop (settled-rows invariant)"
             );
+            let ext_hits = warm.hits.borrow().clone();
+            assert_eq!(ext_hits.len(), 1, "F-aligned overlap must be served");
+            let fine = kiln_engine::DEFAULT_PREFILL_FINE_CHUNK;
+            let served = ext_hits[0].0 as usize;
             assert!(
-                warm.hits.borrow().is_empty(),
-                "sub-chunk divergent overlap must not be served: {:?}",
-                warm.hits.borrow()
+                served > 0 && served.is_multiple_of(fine),
+                "divergent overlap must resume on the fine grid: {served}"
             );
+            assert!(served <= settled, "match exceeded settled rows");
             eprintln!(
                 "pipelined stop on real weights: settled {settled}, containment rerun \
-                 reused {}, divergent extension unserved, both == cold",
+                 reused {}, divergent extension resumed at {served}, both == cold",
                 hits[0].0
             );
         }

@@ -1335,11 +1335,22 @@ impl<M: StepModel> Engine<M> {
         }
 
         // -- 3) Serve: containment in full, otherwise trimmed to the
-        // canonical chunk grid (m == 0 drops sub-chunk partial overlaps).
+        // nearest *resumable* boundary of the canonical schedule (see
+        // `canonical_prefill_len`): absolute `prefill_chunk` multiples in
+        // the bulk region, absolute `prefill_fine_chunk` multiples inside
+        // the final partial super-chunk. Resuming there recomputes the
+        // remainder in exactly the cold schedule's shapes, which is what
+        // keeps warm outputs bit-identical to cache-off runs.
         let (serve_full, serve_tail_rows) = if r == 0 || tail.is_some() {
             (walked.len(), r)
         } else {
-            let m = d_full / config.prefill_chunk * config.prefill_chunk;
+            let fine = config.prefill_fine_chunk.clamp(1, config.prefill_chunk);
+            let tail_start = limit / config.prefill_chunk * config.prefill_chunk;
+            let m = if d_full >= tail_start {
+                tail_start.max(d_full / fine * fine)
+            } else {
+                d_full / config.prefill_chunk * config.prefill_chunk
+            };
             tail = (!m.is_multiple_of(block_size)).then(|| walked[m / block_size]);
             (m / block_size, m % block_size)
         };

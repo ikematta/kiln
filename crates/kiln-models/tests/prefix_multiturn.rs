@@ -34,7 +34,7 @@ use kiln_tokenize::Tokenizer;
 
 const MODEL_NAME: &str = "llama-3.2-1b-4bit";
 const BLOCK: usize = 32;
-const CHUNK: usize = 2048;
+const FINE: usize = kiln_engine::DEFAULT_PREFILL_FINE_CHUNK;
 const TURN_GENERATION: usize = 64;
 
 fn model_dir() -> Option<PathBuf> {
@@ -169,12 +169,14 @@ fn multiturn_incremental_growth_prefill_skip() {
                 "turn {turn}: warm output diverged from cold (determinism contract)"
             );
 
-            // The current rule: a served hit is chunk-aligned or full
-            // containment; incremental growth is never contained.
+            // The rule (Option B): a served hit resumes on a boundary of
+            // the canonical schedule — fine-grid multiples in the final
+            // super-chunk (2048 multiples are also fine multiples) — or is
+            // full containment.
             let reused = summary.cached_prompt_tokens as usize;
             assert!(
-                reused.is_multiple_of(CHUNK) || reused == prompt.len() - 1,
-                "turn {turn}: reuse {reused} violates the canonical-boundary rule"
+                reused.is_multiple_of(FINE) || reused == prompt.len() - 1,
+                "turn {turn}: reuse {reused} violates the resumable-boundary rule"
             );
 
             // What finer canonical grids would have served this turn:
