@@ -119,6 +119,18 @@ pub fn canonical_prefill_len(at: usize, limit: usize, prefill_chunk: usize, fine
     }
 }
 
+/// Minimum trunk row count for ragged prefill tail pieces (ADR 0002): a
+/// piece shorter than this that does not start on a `prefill_chunk`
+/// boundary is computed with pad rows so every matmul/SDPA stays in the
+/// same kernel class the mlx-lm reference used for those positions
+/// (MLX's `get_qmv_batch_limit` tops out at 32 across GPU classes; the
+/// SDPA vector-kernel bound is lower). Pieces starting ON a
+/// `prefill_chunk` boundary are exactly the piece the reference also
+/// computes at that size and are never padded. Pad rows are compute
+/// filler only — never written to KV, sampled, or emitted (see
+/// `StepBatch::pad_rows` and the `prefill_pad` tests).
+pub const PREFILL_PAD_MIN_ROWS: usize = 32;
+
 /// Cache maintenance cadence in decode iterations (mirrors the Phase-3
 /// loop's `clear_cache` every 256 steps).
 const MAINTENANCE_INTERVAL: u64 = 256;
@@ -1115,6 +1127,7 @@ impl<M: StepModel> Engine<M> {
         let batch = StepBatch {
             input: StepInput::Lazy(input),
             seqs,
+            pad_rows: 0,
         };
         let logits = self
             .model
@@ -1443,8 +1456,9 @@ impl<M: StepModel> Engine<M> {
             let seq = &self.running[i];
             // Phase-3/mlx-lm chunk rule: prefill covers prompt[..n-1]; the
             // last prompt token is fed by the first sampled (decode) step.
+            let at = seq.processed;
             let chunk = canonical_prefill_len(
-                seq.processed,
+                at,
                 seq.prompt.len() - 1,
                 self.config.prefill_chunk,
                 self.config.prefill_fine_chunk,
@@ -1454,12 +1468,24 @@ impl<M: StepModel> Engine<M> {
                 && let Some(step) = self.plan_step(i, chunk, false, &mut decode_plans)?
             {
                 let seq = &self.running[i];
-                let tokens = seq.prompt[seq.processed..seq.processed + chunk].to_vec();
+                let tokens = seq.prompt[at..at + chunk].to_vec();
+                // ADR 0002 kernel-class padding: sub-32-row ragged pieces
+                // off the super-chunk grid run with pad rows. Capped at
+                // `at` so the padded SDPA query never exceeds the KV
+                // coverage (`at` is the piece's RoPE offset).
+                let pad_rows = if chunk < PREFILL_PAD_MIN_ROWS
+                    && !at.is_multiple_of(self.config.prefill_chunk)
+                {
+                    (PREFILL_PAD_MIN_ROWS - chunk).min(at) as i32
+                } else {
+                    0
+                };
                 prefill = Some((
                     i,
                     StepBatch {
                         input: StepInput::Ids(tokens),
                         seqs: vec![step],
+                        pad_rows,
                     },
                 ));
             }
@@ -1482,6 +1508,7 @@ impl<M: StepModel> Engine<M> {
         let decode_batch = StepBatch {
             input: StepInput::Ids(decode_tokens),
             seqs: decode_seqs,
+            pad_rows: 0,
         };
 
         // --- Forward (SPEC §6.2 step 3). Prefill first so its KV writes

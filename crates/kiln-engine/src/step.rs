@@ -55,10 +55,17 @@ impl StepInput {
 pub struct StepBatch {
     pub input: StepInput,
     pub seqs: Vec<SeqStep>,
+    /// Kernel-class pad rows the model must append to the trunk (and
+    /// prepend as SDPA query rows) for this step — ADR 0002 / the
+    /// [`crate::PREFILL_PAD_MIN_ROWS`] rule. Set only on single-sequence
+    /// ragged prefill pieces; `input` and `num_tokens()` cover REAL tokens
+    /// only. Pad rows are pure compute filler: implementations must never
+    /// write their K/V, sample them, or emit them.
+    pub pad_rows: i32,
 }
 
 impl StepBatch {
-    /// Total positions in the step.
+    /// Total REAL positions in the step (pad rows excluded).
     pub fn num_tokens(&self) -> usize {
         self.input.num_tokens()
     }
