@@ -2595,12 +2595,22 @@
     bit-exact bar on raw f32 intermediates was never achievable
     (ADR 0002's per-device/kernel-class observation at unit-test scale).
   - Fix: test renamed `yarn_freqs_match_reference_within_ulp_tol`;
-    freq assertion is now <= 2 ulp per element (observed need: 1;
-    2 = the full measured pow spread above; any real defect lands
-    orders of magnitude outside). Failure path reports every offending
-    index + worst ulp so one CI run yields the whole spectrum. `mscale`
-    assertion stays bit-exact (host f64; f64->f32 rounding absorbs libm
-    ulp noise; CI agrees). Test doc states explicitly why bit-exact was
+    per-element ulp bound with a failure path that reports EVERY
+    offending index + worst ulp, so one CI run yields the whole
+    spectrum. That reporting immediately earned its keep: a first PR
+    run at tolerance 2 (the pow spread at index 3) was red on CI with
+    the full spectrum revealed — all 64 elements within 2 ulp EXCEPT
+    freq[39] = 15407.383 vs 15407.387: 4 ulp (2.6e-7 relative).
+    Index 39 is the deepest interpolation-blend element (ramp = 16/17,
+    mask = 1/17), where the (I*E)/(I*m + E*(1-m)) divide chain
+    AMPLIFIES the pow spread instead of passing it through
+    bit-transparently as at mask-saturated indices — consistent with
+    ~2x amplification of a ±1.5-ulp pow difference, and hundreds of
+    thousands of ulp away from any real defect. Final bound:
+    YARN_FREQ_ULP_TOL = 8 (2x the observed worst, ~1e-6 relative —
+    the rel-epsilon band anticipated for f32). `mscale` assertion
+    stays bit-exact (host f64; f64->f32 rounding absorbs libm ulp
+    noise; CI agrees). Test doc states explicitly why bit-exact was
     wrong HERE and why the golden bar (bit-exact token ids, same-device
     reference) is different and must never be relaxed citing this.
     `Rope::new` doc amended: freq tables match the Python reference
@@ -2632,7 +2642,10 @@
   $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
   clean (also clippy --no-default-features: clean; ruff check + format: clean)
   $ cargo test -p kiln-models -> 11 passed lib + integration green
-  CI: <run link recorded post-push in commit/PR>
+  CI (PR #7): run 28736761483 at tol=2 -> test-macos red, full-spectrum
+  report "worst 4: freq[39] ... 4 ulp" (the measurement above);
+  final run at tol=8 -> all four jobs green (run id + confirmation in
+  the PR thread; merged to main only after green).
   ```
 - Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
   unchanged. Standing items unchanged (gemma3 window-crossing fixture,

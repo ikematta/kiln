@@ -1477,9 +1477,12 @@ mod tests {
     ///   deterministic per device. Fixture bits captured on one machine can
     ///   therefore never be a cross-machine bit-exact bar; this is ADR
     ///   0002's observation (bit-identity holds per device and kernel
-    ///   class) at unit-test scale. The multiply/divide chain around the
-    ///   `power` is bit-transparent (verified in strict f32 emulation), so
-    ///   the tolerance covers exactly the transcendental's spread.
+    ///   class) at unit-test scale. Outside the interpolation blend the
+    ///   multiply/divide chain around the `power` is bit-transparent
+    ///   (verified in strict f32 emulation); inside the blend it AMPLIFIES
+    ///   the pow spread — measured full spectrum on the macos-14 CI GPU:
+    ///   every element within 2 ulp of the fixture bits except freq[39]
+    ///   (deepest into the blend, mask = 1/17) at 4 ulp (2.6e-7 relative).
     /// - This does NOT loosen the golden-parity bar (SPEC §11.2 /
     ///   ADR 0002), which stays strictly bit-exact and is a different kind
     ///   of bar: it compares integer token ids from a reference generated
@@ -1556,12 +1559,13 @@ mod tests {
     }
 
     /// Per-element bound for the yarn freq table vs the committed reference
-    /// bits. Observed need: 1 ulp (macos-14 CI GPU vs the dev machine the
-    /// fixture bits were captured on); 2 is the full measured spread of the
-    /// three `pow` implementations listed in the test doc. Any real defect
-    /// (wrong exponent, mask, or factor) lands orders of magnitude outside
-    /// this.
-    const YARN_FREQ_ULP_TOL: u32 = 2;
+    /// bits. Measured cross-device spectrum (macos-14 CI GPU vs the dev
+    /// machine that generated the fixture bits): all elements within 2 ulp
+    /// except freq[39] — deepest into the interpolation blend, where the
+    /// divide chain amplifies the pow spread — at 4 ulp. 8 is 2x the
+    /// observed worst (~1e-6 relative); any real defect (wrong exponent,
+    /// mask, or factor) lands thousands of ulp out.
+    const YARN_FREQ_ULP_TOL: u32 = 8;
 
     /// Ulp distance via bit-pattern difference — valid because all yarn
     /// freqs are positive finite f32 (monotone bit ordering); a NaN/inf/
