@@ -1928,3 +1928,120 @@
      recommended as a default.
 - Next: residual ruling (A/B/C) -> land held fixtures + per-arch gating,
   close Task 1, then Task 2 (Gemma2/3, fixtures first).
+
+## [2026-07-04] Phase 6 / Task 1 — batched-bar investigation (PM-directed) — REPORT
+- Scope: investigation only, per instruction. No fixture, harness, or
+  source changes; all probes were scratch tests, removed after
+  measurement. Working tree still holds only the previously-HELD items
+  (qwen fixture dirs + fetch pin).
+- 1) Precision mitigation — no narrow high-precision path can close this
+  at the pin, for two independent reasons:
+  a. The root cause is not accumulation precision but ARGMAX TIES.
+     Reference-side top-2 logprob gaps at every observed flip position
+     (measured on the pinned mlx-lm stack, f32-read):
+     ```
+     qwen2.5/chat-basic  @33  gap = 0.015625  (one f16 ulp)
+     qwen2.5/raw-long    @10  gap = 0.000000  (EXACT f16 tie)
+     qwen3/chat-basic    @28  gap = 0.000000  (EXACT f16 tie)
+     qwen3/chat-code     @42  gap = 0.125
+     ```
+     At an exact tie the reference argmax picks by index order. ANY
+     perturbation — including a MORE accurate fp32 head — resolves the
+     tie by magnitude instead, which need not match that index-order
+     choice. Higher precision therefore cannot reproduce the reference
+     token except by being bit-identical; "compute-in-fp32-then-cast"
+     narrows nothing here. Llama is not structurally safer: its
+     chat-basic stream carries an exact 0.0 tie at position 24 and
+     simply has not flipped (verified through width 24) — fixture luck,
+     as ADR 0002 already frames it.
+  b. MLX v0.31.1 exposes NO dispatch control: the qmv/qmm split
+     (quantized.cpp, `M >= get_qmv_batch_limit(K, N, device)`) and the
+     SDPA vector/full split (`q_len <= 8`) are hard-coded; no env var or
+     API parameter reaches either. The only adjacent knob is
+     MLX_METAL_GPU_ARCH, which spoofs the GPU arch string — it can only
+     shift thresholds within the table's 6..32 range while perturbing
+     unrelated kernel selections; unusable. `mx.quantized_matmul` has no
+     kernel/mode argument at this pin; `env::enable_tf32` affects only
+     fp32 GEMMs. This is a real "no such control" answer.
+- 2) Empirical characterization (flip onset per decode width, fillers
+  pinning the batch; widths 1,2,4,6,8,10,12,14,16,20,24):
+  ```
+  qwen2.5/chat-basic        w<=8 ok | @33 from w10 (stable through w24)
+  qwen2.5/raw-long-prefill  w<=8 ok | @10 from w10
+  qwen3/chat-basic          w<=8 ok | @52 at w10, @28 from w12
+  qwen3/chat-code           w<=8 ok | @103 at w10, @42 from w12
+  llama/chat-basic          ok at every width tested
+  ```
+  - The cliff is exactly the dispatch ladder measured earlier on this
+    GPU: lm_head (limit 10) crosses first at w10; the MLP shapes
+    (limit 12) cross at w12 and MOVE the flip position (two independent
+    noise sources, visible in the qwen3 rows); attention projections
+    (limit 18) cross later and add nothing new on these fixtures. Below
+    the lowest threshold the trunk rows are BIT-identical to M=1 (qmv
+    row-stability, probe-verified) — token equality at w<=8 is
+    guaranteed by construction, not marginal.
+  - Weights vs structure: the flips are near-tie statistics, not qwen op
+    structure. Class-crossing exists identically for llama; whether a
+    fixture flips depends only on whether its greedy stream visits a
+    knife-edge position. A different qwen checkpoint/quantization would
+    flip elsewhere or not at all. Per-arch conformance inferred from
+    fixture passes is therefore statistically weak; the honest system
+    property is a per-DEVICE deterministic width bound.
+  - The bound is hardware-dependent: flips start at w10 here (safe
+    verified <= 8; <= 9 implied by the limit table's 10 minimum);
+    M1/M2-class large-shape limit is 6 (safe <= 5); 'd'-class is 12
+    (safe <= 11). A ~100ms startup calibration (row-stability probe per
+    weight shape) derives it robustly on unknown GPUs, vs replicating
+    MLX's device table.
+- 3) Cost of a load-bearing max-safe-batch-width:
+  - Proto: one additive WorkerInfo field (e.g.
+    `max_deterministic_decode_width`, 0 = "greedy determinism under
+    batching not guaranteed at this build") — additive fields are
+    explicitly allowed post-Phase-2; gateway plumbs it through for
+    observability/routing. Cheap (~50 lines both workers + gateway).
+  - Enforcement, two shapes:
+    (a) cap concurrent DECODING sequences at W: ~20 scheduler lines, but
+        aggregate throughput is then W-way batching, remainder queues.
+    (b) sub-batched decode: admit any width, split each decode forward
+        into <=W-row chunks (prefill already runs as its own forward;
+        the pipelined path folds in). This makes batched greedy ==
+        single-stream BIT-exact at any admitted width for every arch —
+        the whole fixture-luck problem disappears and llama's margin
+        stops being load-bearing. Est. 150-250 lines (run_iteration,
+        pipelined path, tests).
+  - Measured cost of (b) at width 16, qwen2.5-0.5B, release micro-bench
+    (per-op medians; absolutes inflated by per-op sync — ratios are the
+    signal): lm_head 2x(M=8) = 2.85x its qmm(M=16) time (~+5ms/step —
+    dominant: the 78MB packed head streams twice), gate/up +62%,
+    down +20%, attention projections neutral-to-faster (already qmv at
+    M=16 on this GPU). Net trunk-matmul delta ~+8% in the micro-bench;
+    on 14B-class production models the MLP share grows, trending the
+    penalty toward +20-60% at width 16 with W=8, and roughly doubling on
+    M1-class (W=5 -> 4 chunks). The Phase-4 3x batch-16 gate still
+    clears on the pinned test models (~8x single-stream equivalent at 2
+    chunks); the 14B target needs an engine-level bench before (b)
+    becomes the default.
+- Revised DECISION NEEDED:
+  A') Sub-batched deterministic decode (3b) as the default for all
+      archs: width-16 golden rounds become a hard BIT bar for every
+      model, qwen fixtures land green, and ADR 0002's batched token-id
+      bar is guaranteed by construction rather than empirical. First
+      implementation step is the engine-level width-16 throughput bench
+      on a large model, with (a)-style capping as the fallback if the
+      penalty misses the perf gate. Calibrated W per device (5
+      conservative constant; 9 measured here; 11 on 'd'-class).
+  B') A' scoped to deterministic traffic only: greedy and seeded
+      requests decode in <=W sub-batches, unseeded temperature>0 traffic
+      keeps full-width steps (its draws are not reproducible
+      run-to-run anyway). Keeps peak throughput for sampling workloads;
+      costs step-builder complexity (partitioning by determinism class).
+  C') The prior entry's options (per-arch xfail status / EOS-scoped bar /
+      blanket width cap) — all now strictly weaker: the first encodes
+      fixture luck, the second rescues 1 of 4 flips, the third is A'
+      with worse throughput at equal bandwidth.
+  My read: A' (with B' as a follow-on refinement if sampling throughput
+  matters before Phase 9): it is the only option that makes the SPEC
+  §6.6 invariant true by construction, on every arch and every GPU, and
+  the measured cost on the pinned test models is acceptable.
+- Next: PM ruling (A'/B'/fallback) -> implement + engine bench, land the
+  held qwen fixtures, close Task 1, then Task 2 (Gemma, fixtures first).
