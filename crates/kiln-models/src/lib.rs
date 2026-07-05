@@ -1,11 +1,13 @@
 #![deny(unsafe_code)]
-//! `kiln-models`: model implementations (llama, qwen2/3, gemma2/3) and
-//! `config.json` parsing per mlx-lm conventions (SPEC §7.2).
+//! `kiln-models`: model implementations (llama, qwen2/3) and `config.json`
+//! parsing per mlx-lm conventions (SPEC §7.2).
 //!
-//! Phase 3 ships the Llama family (single-request, contiguous KV cache);
-//! further architectures and the paged/batched integration arrive with
-//! Phases 4–6. Config parsing compiles everywhere; model code needs the
-//! `metal` feature (on by default, off for the Linux compile-check).
+//! Architecture dispatch is [`AnyModel`]/[`config::ArchConfig`]; the shared
+//! decode paths live in the crate-private `nn` module and each architecture
+//! module contributes config mapping + loading rules. Config parsing
+//! compiles everywhere (the gateway's `worker = "auto"` routing predicate);
+//! model code needs the `metal` feature (on by default, off for the Linux
+//! compile-check).
 
 pub mod config;
 #[cfg(feature = "metal")]
@@ -15,14 +17,33 @@ pub mod kv_cache;
 #[cfg(feature = "metal")]
 pub mod llama;
 #[cfg(feature = "metal")]
+mod model;
+#[cfg(feature = "metal")]
+mod nn;
+#[cfg(feature = "metal")]
+pub mod qwen2;
+#[cfg(feature = "metal")]
+pub mod qwen3;
+#[cfg(feature = "metal")]
 pub mod weights;
 
-pub use config::{ConfigError, LlamaConfig, Quantization, RopeScaling};
+pub use config::{
+    ArchConfig, ConfigError, LlamaConfig, Quantization, Qwen2Config, Qwen3Config, RopeScaling,
+    SUPPORTED_ARCHITECTURES,
+};
 #[cfg(feature = "metal")]
 pub use generate::{GenerateOutput, generate, generate_with};
 #[cfg(feature = "metal")]
 pub use kv_cache::KvCache;
 #[cfg(feature = "metal")]
-pub use llama::{LlamaModel, ModelError};
+pub use llama::LlamaModel;
+#[cfg(feature = "metal")]
+pub use model::AnyModel;
+#[cfg(feature = "metal")]
+pub use nn::ModelError;
+#[cfg(feature = "metal")]
+pub use qwen2::Qwen2Model;
+#[cfg(feature = "metal")]
+pub use qwen3::Qwen3Model;
 #[cfg(feature = "metal")]
 pub use weights::{WeightStore, WeightsError};
