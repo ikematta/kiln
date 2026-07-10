@@ -27,6 +27,12 @@ PINS=(
   # tinier checkpoint exists). gemma3 is covered by the pinned
   # gemma-3-1b-it-4bit above.
   "gemma-2-2b-it-4bit  mlx-community/gemma-2-2b-it-4bit          2c715097ff9c081a6ac1e5cd239e2ac756b5bd99"
+  # Phase 6 Task 3: the 8-bit quantization path (SPEC §7.3 matrix). Same
+  # base model as the qwen3-0.6b-4bit pin, so the 4-bit/8-bit cells of
+  # the dtype matrix differ only in quantization. Uniform affine
+  # {group_size: 64, bits: 8} — no per-module overrides (config.rs
+  # fail-loud check). BF16 is covered by smollm2-135m-bf16 above.
+  "qwen3-0.6b-8bit     mlx-community/Qwen3-0.6B-8bit             11de96878523501bcaa86104e3c186de07ff9068"
 )
 
 DEST="${KILN_TEST_MODELS:-$HOME/.kiln/test-models}"

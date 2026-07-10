@@ -116,7 +116,11 @@ where
     // sub-32-row ragged pieces off the super-chunk grid run with pad rows
     // (copies of the piece's last token; excluded from the caches by
     // `forward_padded`) so both paths stay bit-identical to each other and
-    // to the mlx-lm reference at every prompt length.
+    // to the mlx-lm reference at every prompt length — for QUANTIZED
+    // checkpoints. Dense (unquantized) trunks are not bit-reproducible
+    // under this fine-grid schedule (the engine runs them monolithic; see
+    // AnyModel::monolithic_prefill_required); this path always uses the
+    // fine grid and is only parity-meaningful for quantized models.
     let total = prompt.len();
     let mut processed = 0;
     while total - processed > 1 {

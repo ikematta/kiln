@@ -235,9 +235,10 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
         ..EngineConfig::default()
     };
     if model.monolithic_prefill_required() {
-        // gemma2 manual softcapped attention: reference-shaped
-        // (single-tail) prefill only — the same override the worker
-        // applies at load (see kiln-worker engine_main).
+        // gemma2 softcapped attention / dense (unquantized) checkpoints:
+        // reference-shaped (single-tail) prefill only — the same override
+        // the worker applies at load (see kiln-worker engine_main and
+        // AnyModel::monolithic_prefill_required).
         config.prefill_fine_chunk = config.prefill_chunk;
     }
     let mut engine =
