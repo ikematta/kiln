@@ -27,6 +27,7 @@ from mlx_lm.generate import generate_step
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
 from ._gen import worker_pb2 as pb
+from .detok import StreamingDecoder
 from .modelinfo import ModelInfo, read_model_info
 from .stops import StopStringMatcher
 
@@ -223,8 +224,10 @@ class Engine:
         stop_ids = set(stopping.stop_token_ids)
         eos_ids = set() if stopping.ignore_eos else set(self.tokenizer.eos_token_ids)
         matcher = StopStringMatcher(list(stopping.stop_strings))
-        detok = self.tokenizer.detokenizer
-        detok.reset()
+        # Kiln's own decoder, NOT self.tokenizer.detokenizer: mlx-lm's
+        # detokenizers trim the first segment's leading space, breaking the
+        # TokenChunk.text contract and cross-worker text parity (see detok.py).
+        detok = StreamingDecoder(self.tokenizer)
 
         completion = 0
         finish_reason = pb.FINISH_REASON_LENGTH
