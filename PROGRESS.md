@@ -3485,3 +3485,143 @@
     exact on the foreign device this run.
 - Next: Phase 6 Task 4 — gateway worker="auto" routing (SPEC §12
   Phase 6 order).
+
+## [2026-07-10] Phase 6 / Task 4 — worker="auto" routing + /v1/completions — DONE
+- What:
+  1. **worker="auto" routing (SPEC §10/§12).** registry.rs `resolve_worker`
+     replaces the Phase-3 placeholder (auto→python unconditionally): auto
+     resolves to RUST iff `kiln_models::ArchConfig::from_model_dir` accepts
+     the checkpoint — implemented arch (llama/qwen2/qwen3/gemma2/
+     gemma3_text), known rope_scaling, uniform affine 4/8-bit @ group
+     32/64/128 or unquantized bf16/f16 (SPEC §7.3) — else PYTHON with the
+     reason logged. The routing predicate IS the loader's own fail-loud
+     validation, so the decision is exactly "would the rust worker load
+     this". An unloadable tokenizer.json downgrades auto to python (the
+     rust route requires gateway-side tokenization); explicit
+     worker="rust" keeps hard-failing at startup.
+  2. **Stale explicit-rust validation fixed in passing:** worker="rust"
+     was still validated with `LlamaConfig::from_model_dir` (Phase 3
+     vintage) — a qwen/gemma model explicitly pinned to rust failed
+     gateway startup with UnsupportedArchitecture despite full support.
+     Now ArchConfig; regression-guarded by a unit test.
+  3. **/v1/completions (SPEC §8.1).** New completions.rs: OpenAI legacy
+     text-completions endpoint, stream + non-stream, both worker kinds.
+     Raw prompt (no chat template) encoded WITH special tokens (raw-prompt
+     BOS contract = mlx-lm raw generate). max_tokens defaults to 16
+     (OpenAI legacy semantics; chat keeps fill-remaining-context).
+     Rejected by name: multi-prompts, token-id prompts, echo, suffix,
+     best_of>1, n>1, logprobs. Downstream of validation it reuses the chat
+     machinery — ready_entry/encode_prompt extracted; TextPipeline/
+     CompletionCtx/classify_finished shared pub(crate); CompletionCtx
+     parameterized over the endpoint's counter — so the chat.rs
+     stop-string-precedence and usage semantics apply verbatim. New metric
+     kiln_completions_total{model,outcome}; sampling-range validation
+     deduped into openai.rs validate_sampling so the endpoints cannot
+     drift.
+  4. **Python worker detok contract bug — found by the new e2e, fixed.**
+     First e2e run: the python-routed twin's /v1/completions text lacked
+     the leading space (" a device..." vs "a device...", token ids
+     IDENTICAL). Root cause: mlx-lm's streaming detokenizers trim the
+     first segment's leading space (`_maybe_trim_space`: `elif not
+     self.text: return current_text[1:]`) — CLI display behavior that
+     violates the proto contract (TokenChunk.text = exact detokenization
+     of token_ids) and cross-worker text parity; chat never noticed
+     because templated responses rarely open with a space-prefixed token.
+     Fix: kiln_worker_py/detok.py — a Kiln-owned port of kiln-tokenize's
+     two-offset StreamingDecoder (same algorithm the gateway uses for rust
+     workers; decode with specials included, no cleanup), presented behind
+     mlx-lm's reset/add_token/finalize/last_segment interface; engine.py
+     now uses it instead of tokenizer.detokenizer. No monkey-patching —
+     mlx-lm is untouched. 7 tokenizer-only unit tests (leading space,
+     UTF-8 holdback incl. ZWJ/flag sequences, specials not skipped,
+     concat == full decode).
+  5. **E2E (the task's required test).** test_auto_routing.py: doctored
+     copy of the pinned llama-3.2-1b-4bit — weights symlinked, config.json
+     quantization gains a per-module override entry whose params EQUAL the
+     uniform block: a rejected quantization form for the rust matrix
+     (mixed-precision shape), loaded bit-identically by mlx-lm via its
+     class_predicate. One gateway, both models under worker="auto":
+     asserts the supported twin got a rust worker process and the doctored
+     twin a python worker process (matched per-model via the socket-path
+     hash), the routing decisions are logged, and the python-routed model
+     serves BOTH endpoints with output byte-identical to the rust twin
+     (transparent fallback; the greedy cross-worker parity invariant is
+     the "serves correctly" oracle). test_completions.py: /v1/completions
+     against both worker kinds — non-stream, stream==non-stream (greedy),
+     stop strings, default max_tokens=16, rejections by name, 404,
+     kiln_completions_total. conftest running_stack now accepts per-model
+     paths (3-tuples).
+  6. Registry unit tests for the matrix (unsupported arch / per-module
+     override / mxfp4 mode / bits=3 / group=16 / longrope → python; all
+     five archs + dense-bf16 accepted; explicit-rust hard error;
+     explicit-python skips validation). kiln.toml.example comment updated
+     to name the quant-format condition.
+- Decisions:
+  - Auto downgrades to python when tokenizer.json is unloadable even if
+    config.json is servable: the rust route REQUIRES gateway
+    tokenization; python owns its tokenizer. Explicit rust stays loud.
+  - /v1/completions default max_tokens=16 per OpenAI legacy docs, not
+    chat's fill-remaining-context — a deliberate, documented divergence
+    between the two endpoints.
+  - Unsupported-config e2e uses an equal-params per-module override
+    rather than a genuinely mixed checkpoint: same weights ⇒ greedy
+    parity doubles as the serving-correctness oracle, and no new pin.
+  - The python worker's first-chunk space trim was treated as a worker
+    bug, not a test to relax: the proto comment and the gateway's
+    fuzzed-against-full-decode rust path both define text as the exact
+    detokenization. (mlx-lm's own server inherits the trim; Kiln now
+    matches OpenAI/HF-decode semantics instead.)
+- Deviations: none.
+- Task 5 / folded-items audit (PM-instructed): the SPEC §12 Phase 6 list
+  maps to the ledger as 1=Qwen2.5/3, 2=Gemma2/3, 3=8-bit+BF16,
+  4=routing+/v1/completions (this entry). The remaining item,
+  "rope_scaling variants", never needed its own session — folding
+  confirmed accurate: default/linear/llama3 landed with Phase 3 (llama
+  config parsing + nn.rs Rope; llama3 exercised end-to-end by the
+  llama-3.2 fixtures), yarn landed in Task 1
+  (yarn_freqs_match_reference_within_ulp_tol + the qwen pins), gemma3's
+  local/global dual rope in Task 2. All four variants dispatch in nn.rs
+  (config.rs resolve_rope_scaling → Rope). Nothing outstanding; with this
+  task every Phase 6 item is done.
+- Acceptance (dev machine; KILN_TEST_MODELS set):
+  ```
+  $ cargo test -p kiln-gateway --lib
+  registry::tests::auto_routes_unsupported_configs_to_python ... ok
+  registry::tests::auto_prefers_rust_but_downgrades_without_tokenizer ... ok
+  registry::tests::explicit_rust_on_unservable_model_is_a_startup_error ... ok
+  registry::tests::explicit_rust_accepts_every_supported_architecture ... ok
+  registry::tests::explicit_python_skips_validation_entirely ... ok
+  (+ completions validation/serialization tests in openai::tests)
+  test result: ok. 33 passed; 0 failed
+  $ cargo test --workspace                    -> exit 0
+  $ cargo test -p kiln-models --test golden -- --nocapture   (explicit re-run)
+  all 7 pinned models × all fixtures: exact match, BOTH rounds
+  (batched/paged engine + decode width 16 B'), incl. qwen3-0.6b-8bit and
+  smollm2-135m-bf16
+  test result: ok. 1 passed; finished in 295.20s
+  $ uv run --project python/kiln_worker_py pytest python/kiln_worker_py/tests -q
+  35 passed   (28 prior + 7 new detok)
+  $ uv run --project tests/e2e pytest tests/e2e -v
+  test_auto_routing.py::test_auto_resolves_by_the_support_matrix PASSED
+  test_auto_routing.py::test_unsupported_model_serves_transparently_from_python PASSED
+  test_auto_routing.py::test_unsupported_model_serves_completions_too PASSED
+  test_completions.py (6 tests) [python] PASSED  [rust] PASSED
+  (chat/crash/metrics/cross-worker-parity suites unchanged, all PASSED)
+  36 passed in 33.68s
+  NOTE: the FIRST e2e run failed test_unsupported_model_serves_completions_too
+  — rust " a device..." vs python "a device...", identical token ids; that
+  failure IS the detok bug in item 4. Fixed, full suite re-run green.
+  $ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+  clean
+  $ cargo build --workspace --no-default-features
+    cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+  clean (linux CI shape)
+  $ ruff check python/ tests/e2e scripts/ && ruff format --check python/ tests/e2e scripts/
+  All checks passed! / 21 files already formatted
+  ```
+  CI matrix verification (real CI shapes) to be recorded on this branch's
+  PR thread per the PR #10 precedent, incl. the advisory golden lane
+  reading (ADR 0004).
+- Next: PM phase gate on Phase 6 (SPEC §13.4) — all Phase 6 items are
+  done — then Phase 7: llguidance structured output, tool-call parsers,
+  /v1/messages, paged-attention kernel (SPEC §12).
