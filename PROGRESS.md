@@ -3017,3 +3017,56 @@
   No open DECISION NEEDED remains. Standing items: gemma3
   window-crossing fixture, rustc miscompile upstream report, and (per
   ADR 0004) read the advisory lane for pattern changes at each mlx bump.
+
+## [2026-07-10] Phase 6 — PR #8 red runs: e2e metrics flake deflaked; Actions billing block (owner action needed) — DONE
+- What: two unrelated failures behind the PR #8 red checks, diagnosed
+  separately:
+  1. **Run 28754975315 (docs-only commit 4d60fa6): a genuine e2e flake,
+     not a regression.** `test_metrics.py::
+     test_worker_stats_reexported_with_model_label[rust]` failed with
+     `assert 0.0 > 0` on `kiln_worker_tokens_generated_total`, having
+     passed on the two prior runs of identical code the same day. Root
+     cause: the test polled /metrics (10s deadline) until
+     `engine_steps_total > 0` only, then asserted `requests_total` and
+     `tokens_generated_total` on that SAME snapshot. The gateway
+     re-exports worker Stats on a 1s cadence, so a poll landing
+     mid-request captures steps>0/tokens=0, and /metrics serves that
+     snapshot until the next tick — the CI dump shows exactly that state
+     (plus earlier crash-recovery tests had reset the worker-lifetime
+     gauges, narrowing the window). Fix: the poll predicate now covers
+     ALL THREE asserted counters, same 10s deadline, deadline failure
+     reports all three values. Not a weakening: the same assertions must
+     hold within the same deadline — the poll condition was simply
+     incomplete for an eventually-consistent export (the test's own
+     comment already said "allow a few ticks").
+     Also in that run's log: the advisory golden step reproduced the
+     gemma-3-1b/chat-basic divergence identically (same fixture, same
+     position) — per-device deterministic, as ADR 0002/0004 predict.
+  2. **Runs 28755209357 and later (incl. all 4 jobs "failed" in 2-3s):
+     GitHub Actions account-level billing block** — every job annotated
+     "The job was not started because recent account payments have
+     failed or your spending limit needs to be increased", zero steps
+     executed, Linux jobs included. The repo is PUBLIC (standard runners
+     are free), so this is a failed-payment/account issue, not minutes
+     from the new CI tier. NOT fixable in-repo: needs the account owner
+     in GitHub Settings -> Billing & plans. Until then every push
+     fail-fasts (including this entry's); after it clears, rerun via
+     `gh run rerun 28755209357` (its tree is this branch minus this fix)
+     or just let the next push run.
+- Decisions: deflake shape (poll-all-asserted-counters) chosen over
+  raising the deadline or re-reading once — it encodes the actual
+  contract (eventual consistency of every re-exported counter) and fails
+  with the full counter state.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ uv run --project tests/e2e pytest tests/e2e/test_metrics.py -v
+  4 passed in 13.34s   (both worker kinds, real stack)
+  $ uv run --project tests/e2e pytest tests/e2e -q
+  21 passed in 28.82s
+  $ ruff check tests/e2e + ruff format --check tests/e2e -> clean
+  CI verification deferred: Actions is billing-blocked account-wide
+  (see above); local full-stack run is the acceptance until it clears.
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order).
+  Blocked externally only on CI: Actions billing needs owner action.
