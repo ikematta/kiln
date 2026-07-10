@@ -136,38 +136,7 @@ impl Registry {
                 });
             }
 
-            // `auto` still resolves to python until the Phase 6 routing
-            // matrix (arch + quant-format detection) lands; explicit
-            // worker="rust" is validated eagerly so a wrong arch fails at
-            // startup, not at first request.
-            let worker_kind = match model.worker {
-                WorkerKind::Rust => {
-                    kiln_models::LlamaConfig::from_model_dir(&model_path).map_err(|err| {
-                        RegistryError::RustUnsupported {
-                            id: model.id.clone(),
-                            reason: err.to_string(),
-                        }
-                    })?;
-                    WorkerKind::Rust
-                }
-                WorkerKind::Auto => {
-                    tracing::info!(model = %model.id,
-                        "worker=auto resolves to python (routing matrix lands in Phase 6)");
-                    WorkerKind::Python
-                }
-                WorkerKind::Python => WorkerKind::Python,
-            };
-            let tokenizer = match worker_kind {
-                WorkerKind::Rust => {
-                    Some(Arc::new(Tokenizer::from_model_dir(&model_path).map_err(
-                        |source| RegistryError::Tokenizer {
-                            id: model.id.clone(),
-                            source,
-                        },
-                    )?))
-                }
-                _ => None,
-            };
+            let (worker_kind, tokenizer) = resolve_worker(model, &model_path)?;
 
             let template = match ChatTemplate::from_model_dir(&model_path) {
                 Ok(t) => Some(t),
@@ -227,6 +196,67 @@ impl Registry {
     }
 }
 
+/// SPEC §10 `worker` resolution, plus the gateway-side tokenizer that a Rust
+/// route requires (the gateway owns tokenization for Rust workers).
+///
+/// `auto` applies the Phase 6 routing matrix: Rust if `kiln_models` can serve
+/// the checkpoint — implemented architecture (`SUPPORTED_ARCHITECTURES`),
+/// known `rope_scaling`, and a quantization format the Rust worker honors
+/// (uniform affine 4/8-bit at group size 32/64/128, or an unquantized
+/// bf16/f16 checkpoint; SPEC §7.3) — else Python, with the reason logged.
+/// The same parse rejects unsupported variants by name at load time, so the
+/// decision is exactly "would the Rust worker load this".
+///
+/// Explicit `worker = "rust"` on an unservable model stays a startup error
+/// (the operator asked for something impossible); explicit `"python"` skips
+/// the check entirely. A tokenizer.json the gateway cannot load downgrades
+/// `auto` to Python (the Python worker owns its tokenizer) but fails an
+/// explicit `"rust"`.
+fn resolve_worker(
+    model: &ModelConfig,
+    model_path: &Path,
+) -> Result<(WorkerKind, Option<Arc<Tokenizer>>), RegistryError> {
+    let load_tokenizer = || {
+        Tokenizer::from_model_dir(model_path)
+            .map(Arc::new)
+            .map_err(|source| RegistryError::Tokenizer {
+                id: model.id.clone(),
+                source,
+            })
+    };
+    match model.worker {
+        WorkerKind::Python => Ok((WorkerKind::Python, None)),
+        WorkerKind::Rust => {
+            kiln_models::ArchConfig::from_model_dir(model_path).map_err(|err| {
+                RegistryError::RustUnsupported {
+                    id: model.id.clone(),
+                    reason: err.to_string(),
+                }
+            })?;
+            Ok((WorkerKind::Rust, Some(load_tokenizer()?)))
+        }
+        WorkerKind::Auto => match kiln_models::ArchConfig::from_model_dir(model_path) {
+            Ok(config) => match load_tokenizer() {
+                Ok(tokenizer) => {
+                    tracing::info!(model = %model.id, model_type = %config.model_type(),
+                        "worker=auto resolved to rust");
+                    Ok((WorkerKind::Rust, Some(tokenizer)))
+                }
+                Err(err) => {
+                    tracing::info!(model = %model.id, reason = %err,
+                        "worker=auto resolved to python (gateway tokenizer unavailable)");
+                    Ok((WorkerKind::Python, None))
+                }
+            },
+            Err(err) => {
+                tracing::info!(model = %model.id, reason = %err,
+                    "worker=auto resolved to python (rust worker cannot serve this model)");
+                Ok((WorkerKind::Python, None))
+            }
+        },
+    }
+}
+
 /// `$KILN_RUNTIME_DIR/worker-<model_hash>.sock` (SPEC §3). The hash keeps the
 /// name filesystem-safe regardless of what characters the model id uses.
 fn socket_path_for(runtime_dir: &Path, model_id: &str) -> PathBuf {
@@ -271,6 +301,181 @@ mod tests {
             expand_tilde(Path::new("rel/path")),
             PathBuf::from("rel/path")
         );
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kiln-registry-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        dir
+    }
+
+    /// A `[[model]]` entry pointing at a directory holding `config` as its
+    /// config.json. No tokenizer.json is written, so a Rust resolution here
+    /// exercises the tokenizer-unavailable path.
+    fn model_in_dir(dir: &Path, worker: WorkerKind, config: serde_json::Value) -> ModelConfig {
+        std::fs::write(dir.join("config.json"), config.to_string()).expect("write config");
+        ModelConfig {
+            id: "test-model".into(),
+            path: dir.to_string_lossy().into_owned(),
+            worker,
+            pinned: false,
+            ttl_seconds: 0,
+            speculative: None,
+        }
+    }
+
+    /// Minimal servable llama config (matrix: supported arch, 4-bit uniform).
+    fn supported_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 64, "num_hidden_layers": 2, "intermediate_size": 128,
+            "num_attention_heads": 4, "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5, "vocab_size": 128,
+            "quantization": {"group_size": 64, "bits": 4}
+        })
+    }
+
+    fn resolve(worker: WorkerKind, config: serde_json::Value) -> (WorkerKind, bool) {
+        let dir = temp_dir("resolve");
+        let model = model_in_dir(&dir, worker, config);
+        let result = resolve_worker(&model, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (kind, tokenizer) = result.expect("resolution must not error");
+        (kind, tokenizer.is_some())
+    }
+
+    #[test]
+    fn auto_routes_unsupported_configs_to_python() {
+        // SPEC §12 Phase 6 matrix: every rejection reason lands on python.
+        let unsupported = [
+            // Architecture not implemented by the rust worker.
+            serde_json::json!({"model_type": "phi3"}),
+            // Per-module quantization override (mixed-precision checkpoint).
+            {
+                let mut c = supported_config();
+                c["quantization"]["model.embed_tokens"] =
+                    serde_json::json!({"group_size": 64, "bits": 4});
+                c
+            },
+            // Non-affine quantization mode.
+            {
+                let mut c = supported_config();
+                c["quantization"]["mode"] = serde_json::json!("mxfp4");
+                c
+            },
+            // Out-of-matrix bits / group size (SPEC §7.3: 4/8 @ 32/64/128).
+            {
+                let mut c = supported_config();
+                c["quantization"] = serde_json::json!({"group_size": 64, "bits": 3});
+                c
+            },
+            {
+                let mut c = supported_config();
+                c["quantization"] = serde_json::json!({"group_size": 16, "bits": 4});
+                c
+            },
+            // rope_scaling variant the rust worker does not implement.
+            {
+                let mut c = supported_config();
+                c["rope_scaling"] = serde_json::json!({"rope_type": "longrope", "factor": 4.0});
+                c
+            },
+        ];
+        for config in unsupported {
+            let (kind, has_tokenizer) = resolve(WorkerKind::Auto, config.clone());
+            assert_eq!(kind, WorkerKind::Python, "config: {config}");
+            assert!(!has_tokenizer, "python route must not load a tokenizer");
+        }
+    }
+
+    #[test]
+    fn auto_prefers_rust_but_downgrades_without_tokenizer() {
+        // Every supported architecture, servable quant — but the test dir has
+        // no tokenizer.json, so auto downgrades to python instead of failing.
+        // The from_json_str assertion pins WHY python was chosen: the matrix
+        // said yes and only the tokenizer was missing.
+        for (model_type, extra) in [
+            ("llama", serde_json::json!({})),
+            ("qwen2", serde_json::json!({})),
+            (
+                "qwen3",
+                serde_json::json!({
+                    "max_position_embeddings": 4096, "rope_theta": 1e6,
+                    "head_dim": 16, "tie_word_embeddings": true
+                }),
+            ),
+            ("gemma2", serde_json::json!({"head_dim": 16})),
+            ("gemma3_text", serde_json::json!({})),
+        ] {
+            let mut config = supported_config();
+            config["model_type"] = serde_json::json!(model_type);
+            if let Some(obj) = extra.as_object() {
+                for (k, v) in obj {
+                    config[k] = v.clone();
+                }
+            }
+            kiln_models::ArchConfig::from_json_str(&config.to_string())
+                .unwrap_or_else(|err| panic!("matrix must accept {config}: {err}"));
+            let (kind, _) = resolve(WorkerKind::Auto, config.clone());
+            assert_eq!(kind, WorkerKind::Python, "config: {config}");
+        }
+        // BF16/F16 (no quantization block) is servable too — same downgrade.
+        let mut dense = supported_config();
+        dense
+            .as_object_mut()
+            .expect("object")
+            .remove("quantization");
+        kiln_models::ArchConfig::from_json_str(&dense.to_string()).expect("dense is servable");
+        let (kind, _) = resolve(WorkerKind::Auto, dense);
+        assert_eq!(kind, WorkerKind::Python);
+    }
+
+    #[test]
+    fn explicit_rust_on_unservable_model_is_a_startup_error() {
+        let dir = temp_dir("rust-unservable");
+        let mut config = supported_config();
+        config["quantization"]["lm_head"] = serde_json::json!(false);
+        let model = model_in_dir(&dir, WorkerKind::Rust, config);
+        let result = resolve_worker(&model, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = result.expect_err("must fail loudly");
+        assert!(
+            matches!(err, RegistryError::RustUnsupported { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn explicit_rust_accepts_every_supported_architecture() {
+        // Regression guard: explicit rust validation must use the full
+        // ArchConfig matrix, not the Phase 3 llama-only parse. The servable
+        // config passes arch/quant validation and fails only at the missing
+        // tokenizer.json — proving the matrix said yes.
+        let mut config = supported_config();
+        config["model_type"] = serde_json::json!("qwen2");
+        let dir = temp_dir("rust-qwen2");
+        let model = model_in_dir(&dir, WorkerKind::Rust, config);
+        let result = resolve_worker(&model, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = result.expect_err("no tokenizer.json in the test dir");
+        assert!(matches!(err, RegistryError::Tokenizer { .. }), "{err}");
+    }
+
+    #[test]
+    fn explicit_python_skips_validation_entirely() {
+        let (kind, has_tokenizer) = resolve(
+            WorkerKind::Python,
+            serde_json::json!({"model_type": "phi3"}),
+        );
+        assert_eq!(kind, WorkerKind::Python);
+        assert!(!has_tokenizer);
     }
 
     #[test]

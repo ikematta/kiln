@@ -38,7 +38,7 @@ ssd_tier = true
 [[model]]
 id = "qwen3-14b-4bit"
 path = "mlx-community/Qwen3-14B-4bit" # HF repo id or local path
-worker = "auto"                       # rust | python | auto (rust if arch supported)
+worker = "auto"                       # rust | python | auto (rust if arch + quant format supported, else python)
 pinned = true                         # never evicted under memory pressure
 ttl_seconds = 0                       # idle auto-unload; 0 = never
 

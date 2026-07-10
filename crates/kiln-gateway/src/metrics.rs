@@ -22,6 +22,9 @@ pub struct Metrics {
     /// Chat completion requests by model and outcome
     /// (`ok | client_error | worker_error | worker_crashed | unavailable`).
     pub chat_completions_total: IntCounterVec,
+    /// Legacy text completion requests (`/v1/completions`) by model and
+    /// outcome; same outcome values as `chat_completions_total`.
+    pub completions_total: IntCounterVec,
     /// Prompt tokens processed, per model (from worker `Finished` events).
     pub prompt_tokens_total: IntCounterVec,
     /// Completion tokens generated, per model.
@@ -116,6 +119,11 @@ impl Metrics {
             "Chat completion requests by model and outcome",
             &["model", "outcome"],
         )?;
+        let completions_total = counter(
+            "kiln_completions_total",
+            "Legacy text completion requests by model and outcome",
+            &["model", "outcome"],
+        )?;
         let prompt_tokens_total = counter(
             "kiln_prompt_tokens_total",
             "Prompt tokens processed per model",
@@ -203,6 +211,7 @@ impl Metrics {
             http_requests_total,
             http_request_duration_seconds,
             chat_completions_total,
+            completions_total,
             prompt_tokens_total,
             completion_tokens_total,
             worker_restarts_total,

@@ -32,6 +32,7 @@ pub struct RequestId(pub String);
 pub fn router(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/v1/chat/completions", post(crate::chat::chat_completions))
+        .route("/v1/completions", post(crate::completions::completions))
         .route("/v1/models", get(list_models))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
