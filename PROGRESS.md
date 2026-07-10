@@ -3625,3 +3625,30 @@
 - Next: PM phase gate on Phase 6 (SPEC §13.4) — all Phase 6 items are
   done — then Phase 7: llguidance structured output, tool-call parsers,
   /v1/messages, paged-attention kernel (SPEC §12).
+
+## [2026-07-10] Phase 6 / Task 4 — CI verification on PR #12 — DONE
+- Real CI shapes (PR #12, run 29122429155, head d139ab3): all four
+  blocking jobs green — lint, compile-linux, test-macos,
+  test-macos-release.
+  - The task's required test verified on the foreign GPU: e2e 36 passed
+    incl. test_auto_routing (unsupported-quant config transparently
+    routed to + served from the python worker, byte-identical to the
+    rust twin on both endpoints) and the full /v1/completions suite over
+    both worker kinds. Python worker 35 passed (incl. the 7 new detok
+    tests).
+  - test-macos-release green → the rustc 1.96.1 MIR-GVN standing check
+    (rust-lang/rust#158830) holds on this change.
+- Advisory golden lane (ADR 0004, permanently non-blocking) reading,
+  recorded per the ADR's consequence clause:
+  - gemma-2-2b: all rounds token-exact on the foreign GPU (visible in
+    the log before the fail-fast).
+  - gemma-3-1b/chat-basic: diverges at generated token 50 of 64, runner
+    188797 vs fixture 195597 — byte-identical to the pattern ADR 0004
+    records (the 4-fp16-ULP kernel-class coin toss). NO pattern change
+    accompanies this change.
+  - Advisory preemption + prefill_pad committed-fixture comparisons:
+    exact on the foreign device this run (1 passed each).
+- **Phase 6 / Task 4 is CLOSED; every Phase 6 item is done.**
+- Next: PM phase gate on Phase 6 (SPEC §13.4), then Phase 7 —
+  llguidance structured output, tool-call parsers, /v1/messages,
+  paged-attention kernel (SPEC §12).
