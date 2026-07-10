@@ -3458,3 +3458,30 @@
   follow-up PROGRESS note per ADR 0004.
 - Next: Phase 6 Task 4 — gateway worker="auto" routing (SPEC §12
   Phase 6 order).
+
+## [2026-07-10] Phase 6 / Task 3 — CI verification on PR #10 — DONE
+- Real CI shapes (PR #10, run 29113687692, head 53b8b06): all four
+  jobs green — lint, compile-linux, test-macos, test-macos-release.
+  - Blocking lanes green with the new pin; the test-model cache
+    rebuilt from the updated fetch-test-model.sh hash as designed
+    (one-time ~650 MB fetch, then re-cached).
+  - test-macos-release green → the rustc 1.96.1 MIR-GVN standing
+    check (rust-lang/rust#158830) holds on this change.
+- Advisory golden lane (ADR 0004, permanently non-blocking) reading,
+  recorded per the ADR's consequence clause:
+  - gemma-2-2b: all 12 rounds token-exact on the foreign GPU.
+  - gemma-3-1b/chat-basic: diverges at generated token 50 of 64,
+    runner 188797 vs fixture 195597 — byte-identical to the pattern
+    ADR 0004 records from run 28753659372 (the 4-fp16-ULP
+    kernel-class coin toss). NO pattern change accompanies this
+    change.
+  - The harness fail-fasts at the first divergence, so the two new
+    fixture dirs (qwen3-0.6b-8bit, smollm2-135m-bf16) received no
+    cross-device datapoint this run; their BINDING bar (same-device,
+    previous entry) is green. If per-model cross-device readings
+    become wanted, the harness needs per-model fail-isolation —
+    noted, not done (advisory-only value; no bar depends on it).
+  - Advisory preemption + prefill_pad committed-fixture comparisons:
+    exact on the foreign device this run.
+- Next: Phase 6 Task 4 — gateway worker="auto" routing (SPEC §12
+  Phase 6 order).
