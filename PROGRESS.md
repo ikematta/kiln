@@ -3805,3 +3805,26 @@
   implemented). Phase 7 not started per instruction.
 - Next: Phase 7 — llguidance structured output, tool-call parsers,
   /v1/messages, paged-attention kernel (SPEC §12).
+
+## [2026-07-10] Phase 6 — CI verification on PR #13 + one flake datapoint — DONE; PHASE 6 CLOSED
+- PR #13 (throughput gate re-aim) merged; real CI shapes green — lint,
+  compile-linux, test-macos, test-macos-release (run 29127458930).
+- Flake datapoint (pre-existing, unrelated to the diff — the change is
+  a single #[ignore]d perf test): first test-macos attempt failed in
+  kiln-worker rpc `cancel_and_drain_rpc_semantics` — the graceful-drain
+  phase asserts a 40-token request finishes inside deadline_ms=2500,
+  a >=16 tok/s decode assumption; the hosted runner decoded at ~4 tok/s
+  under shared-GPU contention (Timings: 3431ms for 15 tokens), so the
+  deadline escalated the short request to Cancelled. Same flake class
+  as the e2e metrics race deflaked earlier this phase (PR #8 entry).
+  Job re-run: green. Deflake filed as a follow-up task (size the
+  deadline from a measured per-token rate, or adjust the short-request/
+  deadline ratio for worst-case CI speeds — without weakening the
+  deadline-escalation semantics under test).
+- **Phase 6 is CLOSED**: all §12 Phase 6 items done (tasks 6.1–6.4 +
+  folded rope_scaling variants), gate review criteria met, the one
+  gate-review finding (stale throughput bar) ruled and implemented,
+  all bars green on the dev machine and CI.
+- Next: Phase 7 — llguidance structured output, tool-call parsers,
+  /v1/messages, paged-attention kernel (SPEC §12). Not started in this
+  session per instruction.
