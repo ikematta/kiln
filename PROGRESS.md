@@ -3733,3 +3733,75 @@
   kernel work, which needs this gate trustworthy.
 - Next (on the ruling): Phase 7 — llguidance structured output,
   tool-call parsers, /v1/messages, paged-attention kernel (SPEC §12).
+
+## [2026-07-10] Phase 6 — throughput gate re-aimed to the ADR 0003 two-bar split — DONE (PM ruling A on the gate-review DECISION NEEDED)
+- What: crates/kiln-models/tests/throughput.rs rewritten from the
+  superseded single ≥3x bar to the bars ADR 0003 actually established;
+  test renamed batch16_aggregate_is_3x_single_stream →
+  batch16_aggregate_meets_adr0003_bars. Harness (two single-stream
+  denominators, run_engine, medians-of-3) unchanged.
+  1. **Lane → bar mapping, confirmed by measurement:** all-sampled (new
+     lane in the test) is the bar-1 non-deterministic load — one
+     full-width forward per step, B' uninvolved — and measures at the
+     single-forward scale (2.8x). Mixed 8+8 and all-greedy are bar-2
+     deterministic-containing lanes (~1.9x/2.2x, the two-forwards-per-
+     step scale) — matching ADR 0003's own floor table, which lists the
+     mixed number under the deterministic-containing floor.
+  2. **Bar 1 assert:** ratio ≥ 3x (SPEC §11.3, still in force for this
+     lane) OR ≥ recorded-1B-reference (2.68x) × 0.90. The absolute 3x
+     is out of reach on the tiny model for pre-B' reasons (recorded
+     pre-/post-B' 334.1/331.6 tok/s ≈ 2.7x — the small-model sampler
+     artifact named in ADR 0003; 3x is certified at 8B-class, 3.18x),
+     so on this harness the lane gates as no-regression against its
+     recorded reference while the OR keeps the SPEC bar self-documenting.
+  3. **Bar 2 asserts:** ratio ≥ recorded floor × 0.90 per lane (greedy
+     2.10x, mixed 1.80x — the ADR 0003 dev-machine W=9 table), floors
+     as no-regression bounds, not targets, per the ADR.
+  4. **Tolerance = 10% (× 0.90), stated in the test:** exactly SPEC
+     §11.3's bench-regression threshold, which ADR 0003 adopts for
+     floor breaches; it also covers the ~9% run-to-run spread the
+     ledger records for this harness (Phase 4/5 gate runs 3.05x–3.34x).
+     The floors are single measured samples — asserted bare they would
+     flake on ordinary run noise (mixed's recorded 1.80x IS a typical
+     value, not a lower envelope).
+  5. **Floors NOT ratcheted to today's numbers** (the PM's
+     floor-vs-headroom question): today's three measurement sets
+     (sampled 2.81/2.84x, greedy 2.20/2.21/2.22x, mixed 1.87/1.87/1.90x)
+     sit +4–6% over the recorded values — inside the historical ~9% run
+     spread, single machine, single day. Treated as headroom; recorded
+     values stand. Ratcheting floors is an ADR 0003 revisit action (and
+     floors go stale at the next mlx-c pin bump); the test constants
+     cite the ADR and say exactly that.
+- Decisions:
+  - "Mixed-majority" (ADR 0003 bar-1 wording) gets no asserted ≥3x lane:
+    any deterministic admixture pays the extra full weight pass under B'
+    (50/50 measures ~1.9x; a 15-sampled+1-greedy load has the same
+    two-forward step shape), so a mixed-majority ≥3x lane would fail
+    structurally at W=9. The ADR's own floor table already places mixed
+    under bar 2; the test follows the table. The pin-bump revisit
+    re-opens this if dispatch changes.
+- Deviations: none.
+- Acceptance (release, dev machine, KILN_TEST_MODELS set):
+  ```
+  $ cargo test -p kiln-models --release --test throughput -- --ignored --nocapture
+  prompt: 27 tokens, decode: 128 tokens, deterministic width 9
+  single-stream decode: 123.9 tok/s (phase-3 pipelined path), 123.1 tok/s (engine batch 1)
+  batch-16 aggregate vs the stricter single-stream rate:
+    all-sampled 352.5 tok/s -> 2.84x (bar 1),
+    mixed 235.1 tok/s -> 1.90x (bar 2, floor 1.8x),
+    all-greedy (B' sub-batched) 275.2 tok/s -> 2.22x (bar 2, floor 2.1x)
+  test batch16_aggregate_meets_adr0003_bars ... ok
+  test result: ok. 1 passed; finished in 75.47s
+  $ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+  clean
+  $ cargo build --workspace --no-default-features
+    cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+  clean (linux CI shape)
+  ```
+  CI matrix verification recorded on the PR thread per precedent (the
+  test is #[ignore]d in CI; the blocking lanes gate its compilation via
+  clippy --all-targets).
+- **Phase 6 is CLOSED** (gate-review criteria met + this ruling
+  implemented). Phase 7 not started per instruction.
+- Next: Phase 7 — llguidance structured output, tool-call parsers,
+  /v1/messages, paged-attention kernel (SPEC §12).
