@@ -3652,3 +3652,84 @@
 - Next: PM phase gate on Phase 6 (SPEC §13.4), then Phase 7 —
   llguidance structured output, tool-call parsers, /v1/messages,
   paged-attention kernel (SPEC §12).
+
+## [2026-07-10] Phase 6 — PM gate review (SPEC §13.4 / §13.1) — CRITERIA MET; one DECISION NEEDED
+- Scope: PR #12 merged to main (f6284c3; tree bit-identical to the
+  CI-verified PR head). Adversarial review of the whole phase
+  (baseline 268d4f6 = Phase 5 closeout → f6284c3) against SPEC
+  §7.2/§7.3/§8.1/§10/§11/§12; dynamic gates re-run on the dev/PM
+  machine against merged main.
+- Static review (git-diff audit over the phase span) — ALL CLEAN:
+  - proto freeze: one additive WorkerInfo field
+    (max_deterministic_decode_width = 13, diagnostics); no renumber/
+    retype/repurpose. Allowed under the post-Phase-2 additive clause.
+  - docs/decisions/: exactly the three PM-ruled ADRs (0002/0003/0004)
+    added; 0001 untouched.
+  - SPEC.md: only the two recorded amendments (ADR 0003 perf clause,
+    ADR 0004 golden bar).
+  - Dependencies: only the rust-version=1.96.1 MSRV pin (GVN incident,
+    recorded); zero new runtime deps in Cargo.toml/pyproject.
+  - Golden fixtures: additions only (new model dirs + the sanctioned
+    llama raw-tiny-remainder case); zero modifications to committed
+    fixtures.
+  - Modified pre-existing test files (9): each maps to a recorded ledger
+    entry (B'/ADR 0002-0004 harness work, sampler-SIGBUS fix, CI Option
+    B advisory mode, e2e metrics deflake, task 6.4 conftest). Leak-gate
+    diffs are API adaptations only; 0→0 assertions intact. No silent
+    weakening found.
+  - unwrap()/expect() outside test modules in library code: none.
+    Monkey-patching idioms in the python worker: none. dead_code allows:
+    none.
+- Phase 6 acceptance criteria (SPEC §12):
+  1. "Golden parity exact for all fixture models × dtypes" — PASS.
+     Fresh same-device run on this tree: 7 models (llama/qwen2.5/qwen3/
+     gemma2/gemma3 4-bit, qwen3 8-bit, smollm2 bf16) × all fixtures ×
+     both rounds (batched/paged + width-16 B') exact (295s). CI advisory
+     lane: only the known ADR 0004 gemma-3 pattern.
+  2. "An unsupported-arch model transparently serves via python worker"
+     — PASS via the task-6.4 e2e (unsupported-QUANT config end-to-end,
+     output byte-identical to the rust twin; the PM's task prompt
+     sanctioned the quant example). Arch rejection is covered at
+     routing-unit level; no unsupported-arch model is pinned, and the
+     post-resolution serving path is identical. Noted; no action.
+- Dynamic gates on merged main (this machine):
+  - e2e suite: 36 passed (both worker kinds + auto-routing +
+    /v1/completions + parity).
+  - scripts/bench.sh still does not exist (flagged since Phase 4;
+    Phase 10 tooling item) — the release throughput test is the stand-in.
+  - **Throughput: the committed gate test FAILS as written; the
+    measurements PASS every PM-approved bar.** Numbers (llama-3.2-1b-
+    4bit, release, W=9; two runs, medians):
+    ```
+    single-stream        122.6-125.0 tok/s   (recorded post-B': 123.8)
+    all-sampled batch-16 350.9 tok/s -> 2.81x (recorded: 331.6 -> 2.68x)
+    mixed 8+8 batch-16   233.4-234.0 -> 1.87x (ADR 0003 floor: 1.80x) OK
+    all-greedy batch-16  274.7-276.3 -> 2.20x (ADR 0003 floor: 2.10x) OK
+    ```
+    Every lane is at or above its recorded post-B' value — NO regression
+    (>10% bar, SPEC §11.3); the non-deterministic 1B lane improved ~5%.
+- FINDING (the one executable-vs-ADR inconsistency in the phase):
+  crates/kiln-models/tests/throughput.rs still asserts the PRE-ruling
+  bar — ≥3x on BOTH the mixed 8+8 and all-greedy lanes. It was authored
+  with the B' landing (ed32598), before the ADR 0003 ruling; the ruling
+  task then executed as "doc-only" and never re-aimed the test. Today's
+  gate was the first recorded execution of the amended test: mixed 1.87x
+  and greedy 2.20x fail its ≥3x asserts while clearing their ADR 0003
+  floors. Per CLAUDE.md (never adjust a test without saying so), the
+  test is untouched; measurements came from a temporary uncommitted
+  probe copy, deleted after the run (working tree clean).
+- DECISION NEEDED (test re-aim; picking nothing):
+  A) Rewrite throughput.rs to the ADR 0003 two-bar split — assert
+     bar (1) on the all-sampled lane as no-regression vs the recorded 1B
+     number (the absolute ≥3x holds at 8B per the ADR; 1B is the known
+     sampler artifact), and bar (2) as no-regression-below-floor for the
+     greedy/mixed lanes (2.10x/1.80x recorded). Keeps an executable gate
+     aligned with the ruled bars. RECOMMENDED.
+  B) Strip the asserts (report-only) and defer gating to bench.sh
+     (Phase 10) — loses the executable gate for two phases.
+- Verdict: **Phase 6 acceptance criteria are MET.** The stale test is a
+  Task 6.1 closure leftover, not a Phase 6 functional or performance
+  regression; recommend ruling A/B before Phase 7's paged-attention
+  kernel work, which needs this gate trustworthy.
+- Next (on the ruling): Phase 7 — llguidance structured output,
+  tool-call parsers, /v1/messages, paged-attention kernel (SPEC §12).
