@@ -3828,3 +3828,57 @@
 - Next: Phase 7 — llguidance structured output, tool-call parsers,
   /v1/messages, paged-attention kernel (SPEC §12). Not started in this
   session per instruction.
+
+## [2026-07-10] Phase 6 — rpc.rs graceful-drain deflake (PR #13 red run 29127458930) — DONE
+- What: `cancel_and_drain_rpc_semantics` (crates/kiln-worker/tests/rpc.rs)
+  flaked on PR #13's CI: the graceful-drain phase hardcoded a 40-token
+  "short" request against `deadline_ms: 2500` — a ≥16 tok/s decode
+  assumption. The hosted runner decoded at ~4 tok/s under shared-GPU
+  contention (Finished.timings: decode_ms 3431 for 15 tokens), so the
+  deadline escalated the short request to CANCELLED and the Length
+  assert failed. Fix, following the PR #8 poll-all-counters precedent
+  (encode the actual contract instead of tuning constants): the
+  escalation contract is about ORDERING, not absolute speed — the
+  deadline must outlive the short request yet expire well before the
+  long one could finish, and both bounds scale with the decode rate.
+  The cancel phase (which runs first on the same worker) now reads one
+  warmup chunk then times 12 generated tokens; the drain phase sizes
+  `deadline_ms = max(8 x 16-token short request x measured period,
+  2500ms floor)` and the long request's max_tokens to 5x whatever the
+  deadline can decode. Ratios are rate-independent: short finishes at
+  ~16p << deadline (>=128p) << long (5x deadline). Failure messages and
+  an eprintln now carry the measured period + computed sizing for
+  future CI-log diagnosis.
+- Decisions: measured-rate sizing chosen over widening fixed constants —
+  any fixed deadline/token pair embeds a bounded rate window (a faster
+  future machine would let the long request FINISH before the deadline,
+  silently un-testing escalation; a slower runner re-flakes the short
+  side). Short request shrunk 40 -> 16 tokens to bound worst-case wall
+  time on slow runners (deadline = 128 x per-token period). 2500ms
+  floor keeps fast-machine behavior identical to the old constant.
+- Deviations: none. Escalation is still exercised on every run (long
+  request must end CANCELLED); no assertion was weakened — the short
+  request still must finish Length with exact completion_tokens.
+- Acceptance:
+  ```
+  $ cargo clippy --workspace --all-targets -- -D warnings   -> clean (exit 0)
+  $ cargo fmt --check                                       -> clean
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-worker --test rpc -- --nocapture
+  running 2 tests
+  measured decode 12.2 ms/token -> drain deadline 2500 ms, long request 1025 tokens
+  test prefix_cache_stats_and_ssd_restart ... ok
+  worker 1: cancel + graceful drain (deadline escalation) ok
+  worker 2: immediate drain ok
+  test cancel_and_drain_rpc_semantics ... ok
+  test result: ok. 2 passed; 0 failed; ... finished in 5.16s
+  (second run: measured 15.0 ms/token -> long request 832 tokens; 2 passed)
+  $ ruff check python/ tests/e2e -> All checks passed!  ruff format --check -> clean
+  ```
+  On this dev machine the 2500ms floor dominates (short ~200ms, long
+  would need ~12.5s), so the local run exercises the floor regime; the
+  measured regime (deadline 128p > 2500ms) engages exactly on runners
+  slower than ~78 tok/s — the flake population.
+- Next: land this as its own PR to main — PR #13 merged (after a
+  manual job re-run went green) while this fix was in flight, so this
+  is the deflake follow-up filed in the phase-close entry above. Then
+  Phase 7 (SPEC §12).
