@@ -10,6 +10,14 @@
 //! Skips (with a note) when `KILN_TEST_MODELS` is unset or Metal is
 //! unavailable. Single `#[test]` because the kiln-mlx live-object counter
 //! is process-global.
+//!
+//! `KILN_FIXTURE_PARITY` splits the scenarios for CI (PROGRESS 2026-07-05,
+//! Option B ruling): `skip` runs only the device-independent scenarios
+//! (pressured run vs a same-device solo run — valid on any GPU) as a
+//! blocking step; `only` runs only scenario 4's comparison against the
+//! committed dev-machine fixture, which is cross-device sensitive
+//! (ADR 0002) and runs as an advisory step on foreign GPUs. Unset runs
+//! everything — the dev-machine bar is unchanged.
 
 #![cfg(feature = "metal")]
 
@@ -38,6 +46,38 @@ fn model_dir() -> Option<PathBuf> {
     let root = std::env::var_os("KILN_TEST_MODELS")?;
     let dir = PathBuf::from(root).join(MODEL_NAME);
     dir.join("config.json").is_file().then_some(dir)
+}
+
+/// CI scenario split — see the module doc. Keep in sync with the copy in
+/// `tests/prefill_pad.rs` (integration tests cannot share modules without
+/// a common-mod file; two 15-line copies beat that machinery).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    All,
+    DeviceIndependent,
+    FixtureOnly,
+}
+
+impl Scope {
+    /// Pressured-vs-solo scenarios: same-device comparisons, valid on any GPU.
+    fn runs_device_independent(self) -> bool {
+        self != Scope::FixtureOnly
+    }
+    /// Comparisons against the committed dev-machine fixture (ADR 0002).
+    fn runs_fixture(self) -> bool {
+        self != Scope::DeviceIndependent
+    }
+}
+
+fn scope() -> Scope {
+    match std::env::var("KILN_FIXTURE_PARITY").as_deref() {
+        Err(_) | Ok("") => Scope::All,
+        Ok("skip") => Scope::DeviceIndependent,
+        Ok("only") => Scope::FixtureOnly,
+        Ok(other) => {
+            panic!("KILN_FIXTURE_PARITY must be unset, empty, \"skip\", or \"only\": {other:?}")
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -146,6 +186,16 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
         eprintln!("skipping: KILN_TEST_MODELS not set or {MODEL_NAME} missing");
         return;
     };
+    let scope = scope();
+    match scope {
+        Scope::All => {}
+        Scope::DeviceIndependent => eprintln!(
+            "KILN_FIXTURE_PARITY=skip: committed-fixture scenario deferred to the advisory CI step"
+        ),
+        Scope::FixtureOnly => eprintln!(
+            "KILN_FIXTURE_PARITY=only: device-independent scenarios skipped (they gate in the blocking CI step)"
+        ),
+    }
 
     let baseline = debug::live_objects();
     {
@@ -173,12 +223,19 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
             prefix_cache: false,
             ..EngineConfig::default()
         };
-        let solo_senior = solo(&model, squeeze.clone(), senior, 60);
-        let solo_junior = solo(&model, squeeze.clone(), junior, 48);
+        // The solo references feed only the device-independent scenarios.
+        let (solo_senior, solo_junior) = if scope.runs_device_independent() {
+            (
+                solo(&model, squeeze.clone(), senior, 60),
+                solo(&model, squeeze.clone(), junior, 48),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // 1) Same priority: the most recently admitted request is the
         //    victim; it resumes and both streams stay bit-exact.
-        {
+        if scope.runs_device_independent() {
             let mut engine = new_engine(&model, squeeze.clone());
             let (a, a_out) = request(senior, 60, Priority::Interactive);
             let (b, b_out) = request(junior, 48, Priority::Interactive);
@@ -200,13 +257,13 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
                 solo_junior,
                 "preempted junior did not resume onto its solo stream"
             );
+            eprintln!("same-priority preemption: victim resumed bit-exact");
         }
-        eprintln!("same-priority preemption: victim resumed bit-exact");
 
         // 2) Priority order: a BATCH request self-preempts under pressure
         //    even though it is senior to the INTERACTIVE one (SPEC §6.1:
         //    lowest priority first, then most recently admitted).
-        {
+        if scope.runs_device_independent() {
             let mut engine = new_engine(&model, squeeze.clone());
             let (a, a_out) = request(senior, 60, Priority::Batch);
             let (b, b_out) = request(junior, 48, Priority::Interactive);
@@ -227,11 +284,11 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
             // Priority changes scheduling, never tokens.
             assert_eq!(a_out.tokens(), solo_senior, "batch stream diverged");
             assert_eq!(b_out.tokens(), solo_junior, "interactive stream diverged");
+            eprintln!("priority preemption: BATCH yielded to INTERACTIVE, both bit-exact");
         }
-        eprintln!("priority preemption: BATCH yielded to INTERACTIVE, both bit-exact");
 
         // 3a) Cancel mid-stream stops within the proto's 2-step budget.
-        {
+        if scope.runs_device_independent() {
             let mut engine = new_engine(&model, squeeze.clone());
             let (a, a_out) = request(junior, 60, Priority::Interactive);
             engine.submit(a);
@@ -254,11 +311,11 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
                 "tokens emitted after the cancel flag was set"
             );
             assert!(engine.is_idle(), "cancelled request still active");
+            eprintln!("cancel honored within {} step(s) of the flag", 1);
         }
-        eprintln!("cancel honored within {} step(s) of the flag", 1);
 
         // 3b) Cancel lands while the request sits preempted in WAITING.
-        {
+        if scope.runs_device_independent() {
             let mut engine = new_engine(&model, squeeze.clone());
             let (a, a_out) = request(senior, 60, Priority::Interactive);
             let (b, b_out) = request(junior, 48, Priority::Interactive);
@@ -302,13 +359,15 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
                 solo_senior,
                 "survivor disturbed by preempt-then-cancel"
             );
+            eprintln!("cancel-while-preempted ok, survivor bit-exact");
         }
-        eprintln!("cancel-while-preempted ok, survivor bit-exact");
 
         // 4) Golden fixture under forced preemption: the fixture request
         //    is preempted mid-decode, resumes, and must still reproduce
-        //    the committed mlx-lm reference token-for-token.
-        {
+        //    the committed mlx-lm reference token-for-token. Cross-device
+        //    sensitive (ADR 0002): the fixture was generated on the dev
+        //    machine, so this scenario is advisory on foreign GPUs.
+        if scope.runs_fixture() {
             let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../tests/golden")
                 .join(MODEL_NAME)
@@ -368,15 +427,15 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
                 "golden parity broken by preemption (prompt tokens: {})",
                 fixture_ids.len()
             );
+            eprintln!("golden chat-code under preemption: exact match after resume");
         }
-        eprintln!("golden chat-code under preemption: exact match after resume");
 
         // 5) Sustained pressure: a BATCH request outcompeted by a stream
         //    of younger INTERACTIVE arrivals is preempted on every cycle
         //    but never starved — arrivals are finite, seniority is stable,
         //    and it resumes onto its solo stream (drain()'s MAX_STEPS
         //    guard is the liveness bound).
-        {
+        if scope.runs_device_independent() {
             let mut engine = new_engine(&model, squeeze.clone());
             let (b, b_out) = request(senior, 60, Priority::Batch);
             let (i1, i1_out) = request(junior, 48, Priority::Interactive);
@@ -415,14 +474,14 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
                 assert_eq!(summary.preemptions, 0, "{name} must not be preempted");
                 assert_eq!(out.tokens(), solo_junior, "{name} stream diverged");
             }
+            eprintln!("double preemption under sustained pressure: resumed bit-exact both times");
         }
-        eprintln!("double preemption under sustained pressure: resumed bit-exact both times");
 
         // 6) Arrival seniority is stable across preemption: after J is
         //    preempted and resumes, a younger equal-priority K must be
         //    the next victim — a (buggy) arrival renewed on re-admission
         //    would mark J newest and victimize it again.
-        {
+        if scope.runs_device_independent() {
             let kprompt = &ids[133..198]; // 65 tokens; grows to 113 slots (4 blocks)
             let solo_k = solo(&model, squeeze.clone(), kprompt, 48);
             let mut engine = new_engine(&model, squeeze.clone());
@@ -459,14 +518,14 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
             assert_eq!(a_out.tokens(), solo_senior, "senior stream diverged");
             assert_eq!(j_out.tokens(), solo_junior, "J stream diverged");
             assert_eq!(k_out.tokens(), solo_k, "K stream diverged");
+            eprintln!("arrival seniority stable across resume: younger K preempted, J untouched");
         }
-        eprintln!("arrival seniority stable across resume: younger K preempted, J untouched");
 
         // 7) Preemption mid-prefill: with a small prefill chunk the junior
         //    is still PREFILLING (zero tokens streamed) when the pool
         //    fills; it must rewind to WAITING and later re-prefill from
         //    scratch onto its solo stream.
-        {
+        if scope.runs_device_independent() {
             // Pool 9 = 288 slots; chunk 8 stretches the junior's 149-token
             // prefill across 19 iterations. The 120-token senior needs its
             // 5th block 10 decode steps in — inside that window — so the
@@ -514,8 +573,8 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
                 solo_chunk_j,
                 "mid-prefill preempted request did not re-prefill onto its solo stream"
             );
+            eprintln!("mid-prefill preemption: junior re-prefilled from scratch, bit-exact");
         }
-        eprintln!("mid-prefill preemption: junior re-prefilled from scratch, bit-exact");
 
         // 8) Phase 4 closeout: preemption under the batch-16 load shape,
         //    not a 2-3 request micro-pool. A 16-deep interactive burst
@@ -526,7 +585,7 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
         //    so the youngest requests are preempted mid-decode as seniors
         //    grow, sit out, resume, and every one of the 16 streams must
         //    still equal its solo run bit-exact.
-        {
+        if scope.runs_device_independent() {
             let a_prompt = &ids[..64];
             let b_prompt = &ids[64..160];
             let wide = EngineConfig {

@@ -73,20 +73,34 @@ def test_worker_stats_reexported_with_model_label(stack, client):
     if stack.worker_kind != "rust":
         return  # nothing re-exported; the call above must still succeed
 
-    # Stats is polled on the 1s health cadence; allow a few ticks.
+    # Stats is polled on the 1s health cadence; allow a few ticks. A poll
+    # can land mid-request — engine steps already counted, generated
+    # tokens not yet — and /metrics serves that snapshot until the next
+    # tick (observed: CI run 28754975315), so wait until EVERY counter
+    # this test asserts on has caught up, not just the first.
+    def stats_caught_up(text: str) -> bool:
+        return (
+            _counter(text, "kiln_worker_engine_steps_total", model=stack.model_id) > 0
+            and _counter(text, "kiln_worker_requests_total", model=stack.model_id) >= 1
+            and _counter(
+                text, "kiln_worker_tokens_generated_total", model=stack.model_id
+            )
+            > 0
+        )
+
     deadline = time.time() + 10
     while time.time() < deadline:
         text = stack.metrics_text()
-        if _counter(text, "kiln_worker_engine_steps_total", model=stack.model_id) > 0:
+        if stats_caught_up(text):
             break
         time.sleep(0.5)
     else:
-        raise AssertionError("kiln_worker_engine_steps_total never appeared")
-
-    assert _counter(text, "kiln_worker_requests_total", model=stack.model_id) >= 1
-    assert (
-        _counter(text, "kiln_worker_tokens_generated_total", model=stack.model_id) > 0
-    )
+        raise AssertionError(
+            "worker stats never fully re-exported within the deadline: "
+            f"steps={_counter(text, 'kiln_worker_engine_steps_total', model=stack.model_id)} "
+            f"requests={_counter(text, 'kiln_worker_requests_total', model=stack.model_id)} "
+            f"tokens={_counter(text, 'kiln_worker_tokens_generated_total', model=stack.model_id)}"
+        )
     blocks = _counter(
         text, "kiln_worker_kv_blocks_allocated", model=stack.model_id
     ) + _counter(text, "kiln_worker_kv_blocks_free", model=stack.model_id)

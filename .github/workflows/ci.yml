@@ -90,9 +90,56 @@ jobs:
         with:
           path: target/mlx-c-build
           key: mlx-c-build-${{ runner.os }}-${{ hashFiles('crates/kiln-mlx/vendor/mlx-c/CMakeLists.txt', 'crates/kiln-mlx/build.rs') }}
+      # The pinned revisions/sha256s live in fetch-test-model.sh, so hashing the
+      # script keys the cache to the pins: a pin bump invalidates the cache.
+      # Fetched BEFORE any test step: the model-gated steps below and the
+      # pytest steps at the end both read from it.
+      - name: Cache pinned test models
+        id: test-models
+        uses: actions/cache@v4
+        with:
+          path: ~/.kiln/test-models
+          key: test-models-${{ hashFiles('scripts/fetch-test-model.sh') }}
+      - name: Fetch pinned test models
+        if: steps.test-models.outputs.cache-hit != 'true'
+        run: ./scripts/fetch-test-model.sh
       - run: cargo build --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Deliberately env-less: the KILN_TEST_MODELS-gated suites skip here
+      # and run in the two dedicated steps below (PROGRESS 2026-07-05,
+      # Option B ruling).
       - run: cargo test --workspace
+      # Model-gated integration tier (SPEC §11.3), split per the Option B
+      # ruling: suites asserting device-independent invariants (same-device
+      # warm-vs-cold, pressured-vs-solo, engine-vs-contiguous, leak
+      # counters, RPC semantics) gate the job. KILN_FIXTURE_PARITY=skip
+      # carves the committed-fixture comparisons out of the two mixed
+      # suites (preemption, prefill_pad); dev-machine runs leave it unset
+      # and run everything.
+      - name: Model-gated suites (device-independent, blocking)
+        run: |
+          export KILN_TEST_MODELS="$HOME/.kiln/test-models"
+          export KILN_FIXTURE_PARITY=skip
+          cargo test -p kiln-tokenize --test tokenizer --test detok
+          cargo test -p kiln-models --test batching --test calibration \
+            --test leak --test leak_batched --test preemption \
+            --test prefill_pad --test prefix_cache --test prefix_multiturn
+          cargo test -p kiln-worker --test rpc
+      # PERMANENTLY advisory (ADR 0004): golden bit-exactness is a
+      # same-device bar bound to the fixture-generating device class;
+      # token-id equality on this runner's paravirtual GPU is explicitly
+      # not a correctness bar. Never promote this step to blocking. A
+      # CHANGE in its failure pattern alongside a code change is signal
+      # worth a PROGRESS note; red alone is not.
+      - name: Golden parity vs committed fixtures (advisory, cross-device)
+        continue-on-error: true
+        run: |
+          export KILN_TEST_MODELS="$HOME/.kiln/test-models"
+          status=0
+          cargo test -p kiln-models --test golden -- --nocapture || status=1
+          KILN_FIXTURE_PARITY=only cargo test -p kiln-models \
+            --test preemption --test prefill_pad -- --nocapture || status=1
+          exit $status
       - name: Smoke test (Phase 0 acceptance)
         run: |
           out=$(cargo run -p kiln-mlx --example smoke)
@@ -107,17 +154,6 @@ jobs:
             --grpc_python_out=python/kiln_worker_py/src/kiln_worker_py/gen \
             proto/kiln/v1/worker.proto
           git diff --exit-code python/kiln_worker_py/src/kiln_worker_py/gen
-      # The pinned revisions/sha256s live in fetch-test-model.sh, so hashing the
-      # script keys the cache to the pins: a pin bump invalidates the cache.
-      - name: Cache pinned test models
-        id: test-models
-        uses: actions/cache@v4
-        with:
-          path: ~/.kiln/test-models
-          key: test-models-${{ hashFiles('scripts/fetch-test-model.sh') }}
-      - name: Fetch pinned test models
-        if: steps.test-models.outputs.cache-hit != 'true'
-        run: ./scripts/fetch-test-model.sh
       - name: Python worker tests
         run: |
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
