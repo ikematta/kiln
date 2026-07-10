@@ -17,6 +17,7 @@ skips with an actionable message otherwise.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import pathlib
 import shutil
@@ -88,6 +89,23 @@ class Stack:
                 pids.append(pid)
         return pids
 
+    def worker_command(self, model_id: str) -> str:
+        """Command line of the worker process serving `model_id`, located by
+        its unique --socket path (worker-<sha256(id)[:6]>.sock — mirrors the
+        gateway's socket_path_for). Empty string if not found."""
+        digest = hashlib.sha256(model_id.encode()).hexdigest()[:12]
+        socket_arg = str(self.runtime_dir / f"worker-{digest}.sock")
+        for pid in self.worker_pids():
+            cmd = subprocess.run(
+                ["ps", "-o", "command=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout
+            if socket_arg in cmd:
+                return cmd
+        return ""
+
     def wait_ready(self, timeout: float = READY_TIMEOUT_S) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -134,9 +152,11 @@ def build_binaries() -> pathlib.Path:
 
 
 @contextlib.contextmanager
-def running_stack(models: list[tuple[str, str]]):
-    """Launches a gateway serving `models` ([(id, worker_kind), ...]);
-    tears down with the leaked-worker guard. Callers wait_ready()."""
+def running_stack(models: list[tuple]):
+    """Launches a gateway serving `models` — (id, worker_kind) entries serve
+    the pinned test model; (id, worker_kind, path) entries name their own
+    model directory (auto-routing tests point at doctored configs). Tears
+    down with the leaked-worker guard. Callers wait_ready()."""
     binary = build_binaries()
     key_hash = subprocess.run(
         [binary, "hash-key", API_KEY], capture_output=True, text=True, check=True
@@ -150,11 +170,11 @@ def running_stack(models: list[tuple[str, str]]):
     blocks = "\n".join(
         f"""
 [[model]]
-id = "{mid}"
-path = "{model_path}"
-worker = "{worker}"
+id = "{entry[0]}"
+path = "{entry[2] if len(entry) > 2 else model_path}"
+worker = "{entry[1]}"
 """
-        for mid, worker in models
+        for entry in models
     )
     config_path = runtime_dir / "kiln.toml"
     config_path.write_text(
