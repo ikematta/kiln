@@ -78,3 +78,51 @@ those fixtures.
   quarterly process as ADR 0001's C1 plan: re-run the kernel-class probes
   and the full golden suite; if a bump makes dispatch M-invariant (or adds
   a switch), bar (2) can be tightened.
+
+## Addendum (2026-07-10): bar (3) scope limit — pad does not cover dense trunks
+
+Appended at explicit PM instruction (docs/decisions/ is otherwise agent
+read-only). Records a measured scope limit; bars (1) and (2) are
+unchanged.
+
+**Bar (3)'s pad-to-32 construction does NOT guarantee reference-
+kernel-class placement for dense (unquantized) trunks.** Falsified
+during Phase 6 Task 3 (PROGRESS 2026-07-10) on
+smollm2-135m-bf16/raw-tiny-remainder (133-token prompt → fine-grid
+prefill 128 + 4-row ragged tail padded to 32): greedy divergence at
+generated token index 45 (engine 260 vs fixture 284). A pure-mlx-lm
+replica of the padded fine-grid schedule reproduces the same flip at
+the same index, while the reference-shaped (single 132-row piece)
+replica reproduces the fixture — the implementation is exonerated; the
+padded schedule itself is not bit-reproducible against the reference
+for this dense bf16 trunk at the pin.
+
+The real-tensor bisect is the substance of the falsification:
+synthetic probes at the exact shapes and geometry — Gaussian and
+outlier-heavy — false-negatived every op family; only real activations
+exposed the divergence. On real tensors, the unpadded tail's layer-1
+SDPA (query length 5, vector class) diverges from the reference class
+(measured real-data query-class boundary: 9), and under the pad
+(query length 32, reference class at layer 1, all layer-1 sub-ops
+bit-equal) the full padded schedule STILL flips — an op in a deeper
+layer crosses kernel class on its own data, independent of the padded
+piece's row count. Kernel-class placement is therefore not certifiable
+per-op for dense trunks, and the pad guarantee has no measurable
+foundation there.
+
+**Resolution: dense trunks never fragment prefill.** Unquantized
+checkpoints take the monolithic prefill override
+(`AnyModel::monolithic_prefill_required` = gemma2-softcap OR
+`quantization.is_none()`, honored by engine builders as
+`prefill_fine_chunk = prefill_chunk`): every prefill piece is
+reference-shaped by construction — identical to mlx-lm's own prefill
+loop — and bar (3)'s pad rule never triggers (every piece starts on a
+`prefill_chunk` boundary). This sidesteps the pad guarantee entirely
+rather than repairing it.
+
+**Bar (3) remains valid and in effect for quantized trunks only**,
+where it continues to hold empirically: all quantized fixture models
+(4-bit and 8-bit, fp16 activations) are token-exact at every committed
+prompt length under the fine-grid schedule, re-verified in the same
+Task 3 run. Re-examine, with the rest of this ADR, at every
+mlx-c/core-MLX bump under ADR 0001's standing quarterly process.
