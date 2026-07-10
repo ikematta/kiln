@@ -74,15 +74,30 @@ impl AnyModel {
         }
     }
 
-    /// `true` when the architecture's attention math is only
-    /// reference-defined for monolithic (offset-0, per-`prefill_chunk`)
-    /// prefill pieces — gemma2's manual softcapped attention. Engine
-    /// builders honor it as `prefill_fine_chunk = prefill_chunk` (the
-    /// single-tail schedule; Phase 5's fine grid stays on elsewhere).
+    /// `true` when this model's prefill is only reference-defined for
+    /// monolithic (offset-0, per-`prefill_chunk`) pieces. Engine builders
+    /// honor it as `prefill_fine_chunk = prefill_chunk` (the single-tail
+    /// schedule; Phase 5's fine grid stays on elsewhere). Two causes:
+    /// - gemma2's manual softcapped attention (see gemma2.rs);
+    /// - dense (unquantized) checkpoints: the ADR 0002 kernel-class pad
+    ///   does not make fine-grid pieces bit-reproduce the reference's
+    ///   single-piece pass for bf16 dense trunks at the pinned MLX — a
+    ///   pure-mlx-lm replica of the padded 128+4→32 schedule flips the
+    ///   same greedy token the Rust engine does, while the
+    ///   reference-shaped replica matches the fixture (PROGRESS
+    ///   2026-07-10, smollm2-135m-bf16/raw-tiny-remainder). The fine
+    ///   grid was only ever validated on quantized checkpoints.
     pub fn monolithic_prefill_required(&self) -> bool {
+        let dense = match self {
+            Self::Llama(m) => m.config().quantization.is_none(),
+            Self::Qwen2(m) => m.config().quantization.is_none(),
+            Self::Qwen3(m) => m.config().quantization.is_none(),
+            Self::Gemma2(m) => m.config().quantization.is_none(),
+            Self::Gemma3(m) => m.config().quantization.is_none(),
+        };
         match self {
-            Self::Gemma2(m) => m.monolithic_prefill_required(),
-            _ => false,
+            Self::Gemma2(m) => dense || m.monolithic_prefill_required(),
+            _ => dense,
         }
     }
 

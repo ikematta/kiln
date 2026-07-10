@@ -3337,3 +3337,124 @@
   ```
 - Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
   unchanged.
+
+## [2026-07-10] Phase 6 / Task 3 — 8-bit + BF16 quantization paths (SPEC §7.3) — DONE
+- What:
+  1. **ADR 0001 B1 alignment re-verified before generating** (per task
+     instruction): worker venv mlx.core 0.31.1 / mlx-lm 0.31.2; mlx-c
+     submodule at 0726ca922 (v0.6.0 → MLX v0.31.1). gen-golden.py's
+     version gate passed.
+  2. **New pin** `qwen3-0.6b-8bit` = mlx-community/Qwen3-0.6B-8bit @
+     11de96878523501bcaa86104e3c186de07ff9068 (fetch-test-model.sh;
+     sha256-verified). Uniform affine {group_size: 64, bits: 8}, no
+     per-module overrides (verified in the fetched config — checkpoints
+     with overrides stay rejected by the Phase 3 fail-loud check in
+     config.rs). Same base model as the qwen3-0.6b-4bit pin, so the
+     4-bit/8-bit matrix cells differ only in quantization. BF16 is the
+     existing smollm2-135m-bf16 pin (weights verified pure-BF16
+     safetensors; llama arch, tied embeddings → dense as_linear head).
+  3. **12 fixtures generated** (explicitly instructed):
+     tests/golden/qwen3-0.6b-8bit/ and tests/golden/smollm2-135m-bf16/
+     (6 each, full CASES list).
+  4. **Code audit: the dtype stack was already generic** — config.rs
+     gates bits 4|8 / group 32|64|128; nn.rs Linear/Embedding resolve
+     quantized-vs-dense per tensor (`.scales` presence, mlx-lm
+     class_predicate rule); weights.rs maps BF16 safetensors; paged-KV
+     pools adopt the model dtype at first write; B' calibration probes
+     through Linear::forward (quantized and dense alike). **8-bit:
+     green with zero code changes** (W = 9, same as 4-bit).
+  5. **BF16 initially FAILED single-stream** on raw-tiny-remainder
+     (divergence at generated token ~44, 260 vs fixture 284). Root
+     cause, established by pure-python bisect against the reference
+     stack (no Rust suspect left standing):
+     - an mlx-lm replica of the reference schedule (single 132-row
+       prefill piece + M=1 step) reproduces the fixture; a replica of
+       Kiln's fine-grid schedule (128 + 4-row tail padded to 32 per
+       ADR 0002) flips the same token the Rust engine flips → **the
+       ADR 0002 kernel-class pad does not make fine-grid pieces
+       bit-reproduce the reference's single-piece pass for dense bf16
+       trunks at this pin**; the Rust implementation is exonerated.
+     - op bisect on real tensors: layer-1 q/k/v bit-equal; SDPA output
+       differs for (Lq=5, Lk=133) vs (Lq=133) — real-data only
+       (synthetic probes, incl. outlier-heavy, false-negative: kernel
+       classes differ but benign values round identically). Real-data
+       SDPA query-class boundary here is 9, so the padded-32 piece IS
+       reference-class at layer 1 — yet the full padded schedule still
+       flips: some deeper layer's op crosses class on its own data.
+       Per-op auditing is not a viable guarantee for dense trunks.
+     - **Fix: dense (unquantized) checkpoints take the
+       gemma2-precedented monolithic prefill override.**
+       AnyModel::monolithic_prefill_required is now gemma2-softcap OR
+       `quantization.is_none()`; engine builders already honor it as
+       prefill_fine_chunk = prefill_chunk. Reference-shaped pieces by
+       construction (identical to mlx-lm's own prefill loop), and the
+       ADR 0002 pad rule never triggers (every piece starts on a
+       prefill_chunk boundary). Quantized models keep the fine grid —
+       behavior unchanged, all previously-green rounds re-verified.
+  6. **Dense-bf16 deterministic width is 1** (calibration: dense
+     gemv/gemm row-stability boundary at M=2, vs qmv thresholds ~10).
+     Under B', deterministic rows on this model decode fully serial;
+     the width-16 golden rounds pass by construction. Recorded as an
+     ADR 0003 bar-(2) datapoint (measured floor framework; W adapts
+     per model/device). WorkerInfo.max_deterministic_decode_width
+     reports it truthfully.
+  7. Comment corrections at the three override sites (model.rs,
+     golden.rs, kiln-worker engine.rs) and generate.rs (the Phase-3
+     contiguous path always uses the fine grid → documented as
+     parity-meaningful for quantized checkpoints only; all its callers
+     are llama-4bit tests/benches).
+- Decisions:
+  - 8-bit model choice (task latitude "at least one"): Qwen3-0.6B-8bit
+    — smallest uniform-quant 8-bit candidate; isolates the bits axis
+    against the existing 4-bit pin of the same model.
+  - Monolithic-prefill keyed on `quantization.is_none()`, not on bf16:
+    the fine grid was never validated on ANY dense trunk, and
+    reference-shaped prefill is parity-safe by construction for
+    fp16-dense too. Cost is bounded: the schedule equals mlx-lm's own;
+    prefix-cache boundary granularity coarsens to prefill_chunk for
+    dense models (same posture gemma2 already has).
+  - **ADR 0002 scope note (proposing via PROGRESS per CLAUDE.md;
+    docs/decisions is agent-read-only):** bar (3)'s pad mechanism is
+    now measured insufficient for dense trunks; dense models bypass
+    the fine grid entirely instead. An ADR 0002 addendum recording
+    this scope limit would keep the ADR accurate.
+- Deviations: none.
+- Acceptance (real output, trimmed; dev machine = fixture-generating
+  device, the binding scope per ADR 0004):
+  ```
+  $ uv run --project python/kiln_worker_py python -c "import mlx.core..."
+  mlx.core 0.31.1 / mlx_lm 0.31.2   (B1 holds; submodule 0726ca922 v0.6.0)
+  $ ./scripts/fetch-test-model.sh --only qwen3-0.6b-8bit
+  ==> qwen3-0.6b-8bit (mlx-community/Qwen3-0.6B-8bit @ 11de96878523)
+      fetching model.safetensors (633.4 MB) ... done
+  $ uv run ... python scripts/gen-golden.py --model qwen3-0.6b-8bit ...
+  wrote 6 fixtures to tests/golden/qwen3-0.6b-8bit
+  $ uv run ... python scripts/gen-golden.py --model smollm2-135m-bf16 ...
+  wrote 6 fixtures to tests/golden/smollm2-135m-bf16
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --test golden -- --nocapture
+  == qwen3-0.6b-8bit: model_type=qwen3, 6 fixture(s), deterministic width 9
+  golden qwen3-0.6b-8bit/*: exact match (batched/paged engine) x6
+  golden qwen3-0.6b-8bit/*: exact match at decode width 16 (B') x6
+  == smollm2-135m-bf16: model_type=llama, 6 fixture(s), deterministic width 1
+  golden smollm2-135m-bf16/*: exact match (batched/paged engine) x6
+  golden smollm2-135m-bf16/*: exact match at decode width 16 (B') x6
+  (all 5 pre-existing models: exact match, both rounds, unchanged)
+  test result: ok. 1 passed; finished in 292.28s
+  $ cargo test --workspace                  -> exit 0 (38 result blocks, 0 failed)
+  $ cargo test -p kiln-tokenize --test tokenizer --test detok
+    cargo test -p kiln-models --test batching --test calibration --test leak
+      --test leak_batched --test preemption --test prefill_pad
+      --test prefix_cache --test prefix_multiturn   (dev posture: fixture
+      comparisons INCLUDED)
+    cargo test -p kiln-worker --test rpc    -> all green, 0 failed
+  $ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+    -> clean
+  $ uv run ... ruff check python/ tests/e2e scripts/ && ruff format --check ...
+    -> All checks passed! / 16 files already formatted
+  ```
+  CI matrix verification (real CI shapes) recorded on this branch's PR
+  thread per the PR #7/#8 precedent; the advisory golden lane's pattern
+  change (two new fixture dirs) to be read there and recorded in a
+  follow-up PROGRESS note per ADR 0004.
+- Next: Phase 6 Task 4 — gateway worker="auto" routing (SPEC §12
+  Phase 6 order).

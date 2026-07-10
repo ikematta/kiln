@@ -317,9 +317,10 @@ pub fn engine_main(
         ..EngineConfig::default()
     };
     if model.monolithic_prefill_required() {
-        // gemma2 manual softcapped attention: prefill must run in the
-        // reference's own single-tail shape (no Phase 5 fine grid); values
-        // >= prefill_chunk select exactly that schedule.
+        // gemma2 softcapped attention / dense (unquantized) checkpoints:
+        // prefill must run in the reference's own single-tail shape (no
+        // Phase 5 fine grid); values >= prefill_chunk select exactly that
+        // schedule. See AnyModel::monolithic_prefill_required.
         config.prefill_fine_chunk = config.prefill_chunk;
     }
     let mut engine = match Engine::new(model, dims, config, stream) {
