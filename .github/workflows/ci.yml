@@ -14,8 +14,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # dtolnay/rust-toolchain does not read rust-toolchain.toml; the explicit
+      # input keeps the action's install in lockstep with the repo pin (the
+      # rustup directory override would enforce the pin on every cargo call
+      # regardless, but implicitly — this makes it visible in the step log).
+      # Bump together with rust-toolchain.toml + workspace rust-version
+      # (see rust-toolchain.toml for the bump protocol, rust-lang/rust#158830).
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.96.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
@@ -33,6 +40,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1 # lockstep with rust-toolchain.toml (see lint job)
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -50,6 +59,8 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1 # lockstep with rust-toolchain.toml (see lint job)
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: brew install protobuf
@@ -69,6 +80,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.96.1 # lockstep with rust-toolchain.toml (see lint job)
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc

@@ -3089,3 +3089,251 @@
   ```
 - Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order).
   No blockers.
+## [2026-07-05] Phase 6 — sampler SIGBUS: independent verification (chip session) + kiln-free upstream repro — DONE
+- Scope: this is the independently-started chip session anticipated in
+  the 2026-07-05 sampler-SIGBUS entry ("the two will conflict if both
+  land"). The authoritative fix (495bc3c, eager PRNG key) had already
+  merged to main via PR #6 when this session ran, so this session lands
+  NO code change: this branch was fast-forwarded onto main (4c74379)
+  and this entry records an independent re-derivation of the diagnosis
+  from scratch — plus the kiln-free minimization the original entry
+  left as a standing item for the upstream report.
+- What (verification, all evidence re-derived without consulting the
+  original session's intermediate artifacts):
+  1. Reproduced the crash at the pre-fix base: restored
+     `crates/kiln-engine` to cce71d7 inside the main checkout —
+     `cargo test -p kiln-engine --test sampler --release` SIGSEGVs
+     deterministically; lldb: fault in `mlx::core::array::~array()` via
+     `mlx_array_free` inside `Sampler::sample`, called from the
+     `same_seed_same_tokens` closure, freeing a garbage handle
+     (`0x573b0916…`). Matches the original entry's frames 1-3. Checkout
+     restored to HEAD afterwards (`git status` clean).
+  2. **Kiln-free zero-unsafe reproducer** (closes the original entry's
+     upstream-report standing item — their naive reductions were
+     defeated by niche layouts/IPSCCP; this shape survives both):
+     `Sampler { options: Options, key: Option<Box<Key>> }` where
+     `Options` mirrors SamplingOptions' field mix, `Key` carries a Drop
+     impl with new/drop counters, `new()` returns the constant
+     `Self { options, key: None }`, a closure takes the sampler BY
+     VALUE and advances the key chain 16x via `take()`/`Some(...)`
+     reassignment, and is called twice with `Sampler::new(opts)` from
+     one constant local. rustc 1.96.1 (31fca3adb, aarch64-apple-darwin),
+     no unsafe, no FFI: opt-level 0/1 pass; **opt-level 2/3 die in
+     libsystem_malloc `mfm_free.cold.4` (double free)** — safe Rust
+     double-freeing is a compiler bug by definition. (Note: the kiln
+     shape triggered at >= 1 per the original entry; the kiln-free
+     Box-niche shape needs >= 2 — inlining-threshold difference, same
+     defect.) Source preserved below for the rust-lang/rust filing.
+  3. **Pass-level isolation** (new evidence, not in the original
+     chain): `RUSTC_BOOTSTRAP=1 rustc -C opt-level=3
+     -Zmir-enable-passes=-GVN` on the identical source runs clean
+     ("ok: streams match, 34 keys minted, 34 dropped"). Disabling the
+     single MIR GVN pass removes the double free — the miscompiling
+     pass is pinned, not inferred.
+  4. MIR confirmation on the kiln-free shape (`--emit=mir`, opt 3):
+     one construction `_6 = Sampler { options: copy _1, key: const
+     Option::<Box<Key>>::None }` feeds both closure calls through one
+     tuple local — call 1 `copy _5`, call 2 `move _5` — exactly the
+     merged-argument-temporary structure the original entry read out of
+     the kiln reproducer's MIR (`_22`/`_21`).
+  5. Fix verification at HEAD (4c74379): the previously-crashing test
+     passes in release x3 consecutive runs (plus the earlier pre-revert
+     run: x4 total). Test NOT weakened — confirmed the committed test
+     preserves the trigger structure (constant options, by-value
+     closure, back-to-back draws per the REGRESSION SHAPE contract) and
+     the same assertions, and the new `test-macos-release` CI lane
+     executes it in the miscompiling configuration.
+- Verdict: the 495bc3c diagnosis is CONFIRMED from an independent
+  angle — rustc 1.96.1 MIR-GVN miscompilation of safe code; kiln-mlx
+  FFI surface exonerated (wrapper audit of array/ops/random/stream/error
+  found the SAFETY contracts sound). The eager-key workaround is the
+  right shape: an opaque FFI call in the constructor is exactly what
+  GVN cannot prove identical.
+- Upstream-report payload (standing item now unblocked; file against
+  rust-lang/rust with: rustc 1.96.1 aarch64-apple-darwin, opt-level>=2,
+  disappears under -Zmir-enable-passes=-GVN):
+  ```rust
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  static NEWS: AtomicUsize = AtomicUsize::new(0);
+  static DROPS: AtomicUsize = AtomicUsize::new(0);
+  struct Key(u64);
+  impl Key {
+      fn mint(v: u64) -> Box<Key> {
+          NEWS.fetch_add(1, Ordering::SeqCst);
+          Box::new(Key(v))
+      }
+  }
+  impl Drop for Key {
+      fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); }
+  }
+  #[derive(Clone, Copy)]
+  struct Options { temperature: f32, top_p: f32, top_k: u32,
+                   min_p: f32, seed: u64, explicit_seed: bool }
+  struct Sampler { options: Options, key: Option<Box<Key>> }
+  impl Sampler {
+      fn new(options: Options) -> Self { Self { options, key: None } }
+      fn sample(&mut self) -> u64 {
+          let key = match self.key.take() {
+              Some(key) => key,
+              None => Key::mint(self.options.seed),
+          };
+          let v = key.0;
+          self.key = Some(Key::mint(v + 1));
+          v
+      }
+  }
+  fn main() {
+      let opts = Options { temperature: 1.0, top_p: 0.95, top_k: 0,
+                           min_p: 0.0, seed: 42, explicit_seed: false };
+      let draw = |mut sampler: Sampler| -> Vec<u64> {
+          (0..16).map(|_| sampler.sample()).collect()
+      };
+      let a = draw(Sampler::new(opts));
+      let b = draw(Sampler::new(opts)); // double free at opt-level >= 2
+      assert_eq!(a, b);
+      assert_eq!(NEWS.load(Ordering::SeqCst), DROPS.load(Ordering::SeqCst));
+      println!("ok");
+  }
+  ```
+- Decisions: fast-forwarded this session branch onto main instead of
+  re-implementing on the stale cce71d7 base — avoids the double-land
+  conflict the original entry predicted; PROGRESS stays append-only.
+- Deviations: none (no code touched; diagnosis used the main checkout
+  read-only plus one temporary `git restore --source=cce71d7` of
+  crates/kiln-engine, reverted and verified clean).
+- Acceptance (real output, trimmed):
+  ```
+  $ git -C ~/KILN checkout cce71d7 -- crates/kiln-engine
+  $ cargo test -p kiln-engine --test sampler --release
+  process didn't exit successfully: (signal: 11, SIGSEGV)
+  lldb: frame #0 mlx::core::array::~array() +36
+        frame #1 mlx_array_free  frame #2 kiln_engine::sampler::Sampler::sample
+        frame #3 sampler::same_seed_same_tokens::{{closure}}
+  $ git -C ~/KILN restore --source=HEAD --staged --worktree crates/kiln-engine
+  $ rustc -C opt-level=3 repro.rs && ./repro          # kiln-free, no unsafe
+  EXC_BREAKPOINT libsystem_malloc mfm_free.cold.4 (double free); opt 0/1 ok
+  $ RUSTC_BOOTSTRAP=1 rustc -C opt-level=3 -Zmir-enable-passes=-GVN repro.rs && ./repro
+  ok: streams match, 34 keys minted, 34 dropped
+  $ cargo test -p kiln-engine --test sampler --release   (HEAD 4c74379, x3)
+  test sampler_behavior ... ok   |   test result: ok. 1 passed (x3)
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
+  unchanged. Standing item updated: rustc miscompile upstream report is
+  ready to file (payload above); re-test the eager-key workaround at
+  every toolchain bump.
+
+## [2026-07-05] Phase 6 — rustc MIR-GVN miscompile: upstream report FILED — DONE
+- What (closes the "file upstream" standing item from the two 2026-07-05
+  sampler-SIGBUS entries):
+  1. **Filed https://github.com/rust-lang/rust/issues/158830** — "MIR GVN
+     merges by-value argument temporaries with drop glue, causing double
+     free in safe code (1.95/1.96, aarch64-apple-darwin)". Payload: the
+     kiln-free zero-unsafe reproducer (previous entry), the
+     `-Zmir-enable-passes=-GVN` clean-run isolation, the MIR excerpt
+     (`_6 = Sampler {...}` built once; `_5 = (copy _6,)`; call 1
+     `copy _5`, call 2 `move _5`), and the opt-level threshold finding
+     stated as an inlining artifact of one defect (kiln shape — no-niche
+     `Option<FfiHandle>` — triggers at >= 1; minimized niched
+     `Option<Box>` shape needs >= 2), target rustc 1.96.1
+     aarch64-apple-darwin. Labels applied via rustbot: T-compiler,
+     C-bug, I-unsound, A-mir-opt, A-mir-opt-GVN (+ auto I-prioritize).
+  2. New pre-filing evidence gathered for the report:
+     - rustc 1.95.0 (59807616e) also crashes (opt 2/3) — NOT a 1.96
+       regression; introduction unbisected, stated as such.
+     - nightly 1.98.0 (c397dae80 2026-07-02) does NOT crash **but emits
+       the identical merged MIR** — the report asks upstream to
+       determine fixed-needs-backport vs masked-latent.
+     - duplicate search (gh, several phrasings incl. broad "GVN"
+       sanity check): no existing report of this defect.
+  3. **rust-toolchain.toml created** (did not previously exist) with the
+     issue link + workaround/bump-protocol comment, `channel = "stable"`.
+- Decisions: `channel = "stable"`, not a 1.96.1 pin — CI already floats
+  on dtolnay/rust-toolchain@stable so this changes no behavior anywhere,
+  the landed eager-key workaround makes 1.96.1 safe for Kiln, and
+  freezing onto a known-miscompiling compiler would invert the intent;
+  the comment (not the pin) carries the warning, and the
+  test-macos-release lane is the enforcement at every bump.
+- Deviations: none (no Rust code touched).
+- Acceptance (real output, trimmed):
+  ```
+  $ gh issue create -R rust-lang/rust --title "MIR GVN merges by-value
+    argument temporaries with drop glue, causing double free in safe
+    code (1.95/1.96, aarch64-apple-darwin)" --body-file issue-body.md
+  https://github.com/rust-lang/rust/issues/158830
+  $ gh issue view 158830 -R rust-lang/rust --json number,state,labels
+  158830 [OPEN] | labels: T-compiler, I-unsound, C-bug, A-mir-opt,
+  I-prioritize, needs-triage, A-mir-opt-GVN
+  $ rustup run 1.95.0 rustc -C opt-level=2 main.rs && ./repro -> exit 133
+  $ rustup run nightly rustc -C opt-level=3 main.rs && ./repro -> exit 0
+    (nightly --emit=mir: same single _6/_5 construction, copy/move pair)
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
+  unchanged. Standing item updated: upstream report FILED (#158830);
+  at every toolchain bump re-run the release suite and check #158830
+  for the fix/backport landing.
+
+## [2026-07-05] Phase 6 — MSRV history audit + retroactive toolchain pin (1.96.1) — DONE
+- History audit (PM-directed; whether "MSRV 1.96.1" was ever enforced):
+  - `git log --all -- rust-toolchain.toml` (+ `rust-toolchain*` glob,
+    `--follow`): the file exists in exactly ONE commit — d726468
+    (2026-07-05, this session), which created it with `channel =
+    "stable"`. No pin was ever committed before, on any ref.
+  - Ruled out every disappearance mechanism: not reverted (nothing to
+    revert), not history-rewritten (all 7 `git fsck` unreachable
+    commits scanned — none contain the file), not stashed (no stashes),
+    not gitignored (no matching pattern ever), not sitting uncommitted
+    in the primary checkout (absent).
+  - Origin of the gap: Phase 0 entry (2026-07-02), Decisions: "MSRV
+    left unset — SPEC §14 lists it as an open pre-Phase-0 PM decision.
+    Non-blocking; flagging for review." The flag was never picked up:
+    zero MSRV mentions in PROGRESS between that line and 2026-07-05,
+    no ADR touches it, no `rust-version` in any manifest, all four CI
+    jobs floated on dtolnay/rust-toolchain@stable.
+  - **Plainly: MSRV was an unenforced assumption from Phase 0 through
+    this pin landing — ~3 days, Phases 0 through 6 — coincidentally
+    stable at 1.96.1 only because the project is young and upstream
+    stable did not move in that window, not because anything enforced
+    it.** 1.96.1 is simply the stable that was current when the Phase 0
+    session installed rustup on this machine.
+- What (the pin, now formalized in all three layers):
+  1. rust-toolchain.toml: `channel = "1.96.1"` (hard pin, replacing
+     "stable"); comment records the retroactive formalization date +
+     this entry, the rust-lang/rust#158830 context, and the lockstep
+     rule.
+  2. Cargo.toml `[workspace.package] rust-version = "1.96.1"` +
+     `rust-version.workspace = true` in all 8 crate manifests — cargo
+     itself now gates the floor (verified via `cargo metadata`: all 8
+     packages report 1.96.1). Belt-and-suspenders: rust-toolchain.toml
+     controls what rustup fetches; rust-version is what the crates
+     declare they need.
+  3. ci.yml: explicit `toolchain: 1.96.1` input on all four
+     dtolnay/rust-toolchain steps. Confirmed the action does NOT read
+     rust-toolchain.toml (toolchain comes from the action ref or the
+     `toolchain:` input); rustup's directory override would still have
+     enforced the pin on every cargo invocation once the file exists,
+     but the explicit input removes the dead-weight stable install and
+     makes the pinned version visible in the action step log.
+- Standing practice (bump protocol, same tier as ADR 0001's C1 quarterly
+  process): toolchain bumps are deliberate — (a) update the pin in all
+  three places (rust-toolchain.toml, workspace rust-version, 4 CI
+  steps), (b) re-run the full workspace suite in debug AND release
+  (test-macos-release lane), (c) check rust-lang/rust#158830 and its
+  resolution/backport status before trusting a new stable on the
+  GVN-affected shape.
+- Deviations: none.
+- Acceptance (local, real output trimmed; CI matrix run + 1.96.1
+  visibility verified on this branch's PR — run ids and confirmation in
+  the PR thread, per the PR #7 precedent):
+  ```
+  $ rustup show active-toolchain        (in repo, after pin)
+  1.96.1-aarch64-apple-darwin (overridden by '.../rust-toolchain.toml')
+  $ cargo metadata --no-deps | ... rust_version
+  all 8 kiln crates -> 1.96.1
+  $ cargo fmt --all --check -> clean
+  $ cargo build --workspace --no-default-features -> Finished dev 21.70s
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean
+  $ uv run ... ruff check python/ tests/e2e -> All checks passed!
+  $ uv run ... ruff format --check python/ tests/e2e -> 16 files already formatted
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order),
+  unchanged.
