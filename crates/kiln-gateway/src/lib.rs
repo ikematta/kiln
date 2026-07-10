@@ -5,6 +5,7 @@
 pub mod app;
 pub mod auth;
 pub mod chat;
+pub mod completions;
 pub mod config;
 pub mod error;
 pub mod metrics;

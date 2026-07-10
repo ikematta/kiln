@@ -60,8 +60,56 @@ use crate::openai::{
 };
 use crate::registry::{ModelEntry, WorkerStatus};
 
-/// Request body cap; chat requests are text, not uploads.
-const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// Request body cap; completion requests are text, not uploads. Shared with
+/// `/v1/completions` (crate::completions).
+pub(crate) const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Registry lookup + worker-status gate shared by every completion-shaped
+/// endpoint: only a Ready worker receives requests; every other state maps
+/// to the matching client-visible error.
+pub(crate) fn ready_entry(state: &AppState, model: &str) -> Result<Arc<ModelEntry>, ApiError> {
+    let entry = state
+        .registry
+        .get(model)
+        .cloned()
+        .ok_or_else(|| ApiError::model_not_found(model))?;
+    match entry.status() {
+        WorkerStatus::Ready => Ok(entry),
+        WorkerStatus::Starting | WorkerStatus::Stopped => Err(ApiError::model_loading(&entry.id)),
+        WorkerStatus::Restarting { .. } => Err(ApiError::worker_crashed(format!(
+            "the worker for model '{}' crashed and is restarting; retry shortly",
+            entry.id
+        ))),
+        WorkerStatus::Failed => Err(ApiError::worker_failed(&entry.id)),
+    }
+}
+
+/// Prompt-text → token ids under the entry's tokenization ownership: locally
+/// for Rust-worker models, via the worker's `Tokenize` RPC otherwise.
+/// `add_special_tokens` follows the BOS contract: false when the text came
+/// through a chat template (the template supplies BOS), true for raw
+/// completions prompts.
+pub(crate) async fn encode_prompt(
+    entry: &ModelEntry,
+    client: &mut WorkerClient<Channel>,
+    prompt: String,
+    add_special_tokens: bool,
+) -> Result<Vec<u32>, ApiError> {
+    match &entry.tokenizer {
+        Some(tokenizer) => tokenizer
+            .encode(&prompt, add_special_tokens)
+            .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}"))),
+        None => Ok(client
+            .tokenize(TokenizeRequest {
+                text: prompt,
+                add_special_tokens,
+            })
+            .await
+            .map_err(|status| ApiError::from_worker_status(&status))?
+            .into_inner()
+            .token_ids),
+    }
+}
 
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
@@ -111,49 +159,15 @@ async fn handle(
     request: ChatCompletionRequest,
     request_id: RequestId,
 ) -> Result<Response, ApiError> {
-    let entry = state
-        .registry
-        .get(&request.model)
-        .cloned()
-        .ok_or_else(|| ApiError::model_not_found(&request.model))?;
-
-    match entry.status() {
-        WorkerStatus::Ready => {}
-        WorkerStatus::Starting | WorkerStatus::Stopped => {
-            return Err(ApiError::model_loading(&entry.id));
-        }
-        WorkerStatus::Restarting { .. } => {
-            return Err(ApiError::worker_crashed(format!(
-                "the worker for model '{}' crashed and is restarting; retry shortly",
-                entry.id
-            )));
-        }
-        WorkerStatus::Failed => return Err(ApiError::worker_failed(&entry.id)),
-    }
+    let entry = ready_entry(&state, &request.model)?;
 
     let validated = request.validate()?;
     let prompt = render_prompt(&entry, &validated)?;
 
     let mut client = WorkerClient::new(entry.channel.clone());
     // BOS contract (kiln-tokenize crate docs): the rendered template already
-    // contains BOS, so both paths encode WITHOUT special tokens — locally
-    // for Rust workers, via the Tokenize RPC for tokenizer-owning workers.
-    let token_ids = match &entry.tokenizer {
-        Some(tokenizer) => tokenizer
-            .encode(&prompt, false)
-            .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?,
-        None => {
-            client
-                .tokenize(TokenizeRequest {
-                    text: prompt,
-                    add_special_tokens: false,
-                })
-                .await
-                .map_err(|status| ApiError::from_worker_status(&status))?
-                .into_inner()
-                .token_ids
-        }
-    };
+    // contains BOS, so encode WITHOUT special tokens.
+    let token_ids = encode_prompt(&entry, &mut client, prompt, false).await?;
     if token_ids.is_empty() {
         return Err(ApiError::invalid_request("rendered prompt is empty"));
     }
@@ -197,6 +211,7 @@ async fn handle(
         .map_err(|status| ApiError::from_worker_status(&status))?
         .into_inner();
 
+    let requests_total = state.metrics.chat_completions_total.clone();
     let ctx = CompletionCtx {
         state,
         model: entry.id.clone(),
@@ -204,6 +219,7 @@ async fn handle(
         created: unix_now(),
         request_id: request_id.0.clone(),
         channel: entry.channel.clone(),
+        requests_total,
     };
     if validated.stream {
         Ok(stream_response(
@@ -219,8 +235,10 @@ async fn handle(
     }
 }
 
-/// Turns worker `TokenChunk`s into client-visible text.
-enum TextPipeline {
+/// Turns worker `TokenChunk`s into client-visible text. Shared with
+/// `/v1/completions`, whose text pipeline is identical (module docs above
+/// on finish-reason precedence and usage apply to both endpoints).
+pub(crate) enum TextPipeline {
     /// Tokenizer-owning worker: chunks carry final text (stops already
     /// applied worker-side).
     Passthrough,
@@ -238,7 +256,7 @@ enum TextPipeline {
 }
 
 impl TextPipeline {
-    fn for_entry(entry: &ModelEntry, stop_strings: &[String]) -> Self {
+    pub(crate) fn for_entry(entry: &ModelEntry, stop_strings: &[String]) -> Self {
         match &entry.tokenizer {
             Some(tokenizer) => TextPipeline::Decode {
                 decoder: StreamingDecoder::new(Arc::clone(tokenizer)),
@@ -252,7 +270,7 @@ impl TextPipeline {
 
     /// Text safe to emit for this chunk. Flips [`Self::stop_matched`] when a
     /// stop string fires; everything after the match is dropped.
-    fn push(&mut self, chunk: TokenChunk) -> Result<String, ApiError> {
+    pub(crate) fn push(&mut self, chunk: TokenChunk) -> Result<String, ApiError> {
         match self {
             TextPipeline::Passthrough => Ok(chunk.text),
             TextPipeline::Decode {
@@ -281,7 +299,7 @@ impl TextPipeline {
 
     /// Final text at natural end-of-stream: decoder tail + held stop-string
     /// prefix (a tokenizer-owning worker already flushed on its side).
-    fn finish(&mut self) -> Result<String, ApiError> {
+    pub(crate) fn finish(&mut self) -> Result<String, ApiError> {
         match self {
             TextPipeline::Passthrough => Ok(String::new()),
             TextPipeline::Decode {
@@ -307,7 +325,7 @@ impl TextPipeline {
         }
     }
 
-    fn stop_matched(&self) -> bool {
+    pub(crate) fn stop_matched(&self) -> bool {
         matches!(
             self,
             TextPipeline::Decode {
@@ -322,7 +340,7 @@ impl TextPipeline {
     /// match) — the worker's total includes cancel overshoot the client
     /// never saw, and the tokenizer-owning worker stops (and counts) at
     /// exactly this point, so usage agrees across workers.
-    fn apply_usage(&self, finished: &mut Finished) {
+    pub(crate) fn apply_usage(&self, finished: &mut Finished) {
         if let TextPipeline::Decode {
             tokens_at_match: Some(count),
             ..
@@ -345,20 +363,25 @@ fn render_prompt(entry: &ModelEntry, validated: &ValidatedChat) -> Result<String
         .map_err(|err| ApiError::invalid_request(format!("chat template rejected messages: {err}")))
 }
 
-struct CompletionCtx {
-    state: Arc<AppState>,
-    model: String,
-    completion_id: String,
-    created: u64,
-    request_id: String,
-    channel: Channel,
+/// Per-request context shared by the chat and text-completions handlers:
+/// response identity, metrics wiring (`requests_total` is the endpoint's own
+/// counter), and the worker channel for post-match cancellation.
+pub(crate) struct CompletionCtx {
+    pub(crate) state: Arc<AppState>,
+    pub(crate) model: String,
+    pub(crate) completion_id: String,
+    pub(crate) created: u64,
+    pub(crate) request_id: String,
+    pub(crate) channel: Channel,
+    /// `kiln_chat_completions_total` or `kiln_completions_total`.
+    pub(crate) requests_total: prometheus::IntCounterVec,
 }
 
 impl CompletionCtx {
     /// Best-effort worker-side cancellation after a gateway-side stop-string
     /// match; generation past the match is wasted work, not a correctness
     /// problem, so failures only log.
-    async fn cancel_worker(&self) {
+    pub(crate) async fn cancel_worker(&self) {
         let mut client = WorkerClient::new(self.channel.clone());
         if let Err(status) = client
             .cancel(CancelRequest {
@@ -374,10 +397,9 @@ impl CompletionCtx {
 }
 
 impl CompletionCtx {
-    fn record_ok(&self, finished: &Finished) {
+    pub(crate) fn record_ok(&self, finished: &Finished) {
         let metrics = &self.state.metrics;
-        metrics
-            .chat_completions_total
+        self.requests_total
             .with_label_values(&[&self.model, "ok"])
             .inc();
         metrics
@@ -390,17 +412,15 @@ impl CompletionCtx {
             .inc_by(u64::from(finished.completion_tokens));
     }
 
-    fn record_err(&self, err: &ApiError) {
-        self.state
-            .metrics
-            .chat_completions_total
+    pub(crate) fn record_err(&self, err: &ApiError) {
+        self.requests_total
             .with_label_values(&[&self.model, err.outcome()])
             .inc();
     }
 }
 
 /// Terminal outcome of a worker stream, normalized.
-enum StreamEnd {
+pub(crate) enum StreamEnd {
     Done {
         finished: Finished,
         finish_reason: &'static str,
@@ -408,7 +428,7 @@ enum StreamEnd {
     Failed(ApiError),
 }
 
-fn classify_finished(finished: Finished, stop_matched: bool) -> StreamEnd {
+pub(crate) fn classify_finished(finished: Finished, stop_matched: bool) -> StreamEnd {
     // A gateway-side stop-string match ends the request as a normal "stop"
     // regardless of how the worker's stream terminates afterwards (usually
     // CANCELLED, from our own Cancel; racily STOP/LENGTH). The client's
@@ -639,7 +659,7 @@ fn stream_response(
         .into_response()
 }
 
-fn sse_json<T: serde::Serialize>(value: &T) -> SseEvent {
+pub(crate) fn sse_json<T: serde::Serialize>(value: &T) -> SseEvent {
     match serde_json::to_string(value) {
         Ok(json) => SseEvent::default().data(json),
         Err(err) => {
@@ -651,7 +671,7 @@ fn sse_json<T: serde::Serialize>(value: &T) -> SseEvent {
     }
 }
 
-fn usage_of(finished: &Finished) -> Usage {
+pub(crate) fn usage_of(finished: &Finished) -> Usage {
     Usage {
         prompt_tokens: finished.prompt_tokens,
         completion_tokens: finished.completion_tokens,
@@ -659,7 +679,7 @@ fn usage_of(finished: &Finished) -> Usage {
     }
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
