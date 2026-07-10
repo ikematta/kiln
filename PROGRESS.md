@@ -3070,3 +3070,22 @@
   ```
 - Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order).
   Blocked externally only on CI: Actions billing needs owner action.
+
+## [2026-07-10] Phase 6 — deferred CI acceptance fulfilled: PR #8 green — DONE
+- What: the Actions billing block cleared account-side; run 29106462796
+  (deflake commit f4c9aa2) completed with ALL FOUR checks green — the
+  previously flaky e2e metrics test passed on the runner under the new
+  poll-all-counters predicate. The advisory golden step reproduced the
+  gemma-3-1b/chat-basic divergence identically for the third consecutive
+  run (fresh runner, five days later) and the job stayed green — the
+  ADR 0004 permanent-advisory contract behaving exactly as specified.
+- Decisions / Deviations: none.
+- Acceptance:
+  ```
+  $ gh run view 29106462796 -> run: success
+    test-macos / test-macos-release / lint / compile-linux: all success
+    advisory step log: gemma-3 chat-basic divergence, same fixture,
+    same position (per-device deterministic); only-mode probes ok
+  ```
+- Next: Task 3 — 8-bit and BF16 dtype matrix (SPEC §12 Phase 6 order).
+  No blockers.
