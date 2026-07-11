@@ -182,6 +182,28 @@ async fn read_chunks(stream: &mut EventStream, n: usize) {
     }
 }
 
+/// Times `min_tokens` generated tokens on an open stream, returning the
+/// observed wall-clock per-token period. Call only after at least one
+/// chunk has been read so prefill and kernel warmup don't inflate it.
+async fn measured_token_period(stream: &mut EventStream, min_tokens: u32) -> Duration {
+    let started = Instant::now();
+    let mut tokens = 0;
+    while tokens < min_tokens {
+        match next_event(stream).await {
+            Some(token_event::Event::Tokens(chunk)) => tokens += chunk.token_ids.len() as u32,
+            Some(token_event::Event::Finished(finished)) => {
+                panic!("stream finished while measuring decode rate: {finished:?}")
+            }
+            Some(_) => {}
+            None => panic!("stream ended while measuring decode rate"),
+        }
+    }
+    started
+        .elapsed()
+        .div_f64(f64::from(tokens))
+        .max(Duration::from_millis(1))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_and_drain_rpc_semantics() {
     if !kiln_mlx::memory::metal_is_available() {
@@ -199,13 +221,19 @@ async fn cancel_and_drain_rpc_semantics() {
         let mut client = worker.client_when_ready().await;
 
         // Cancel mid-stream: ack found, stream ends CANCELLED, second
-        // cancel reports the request gone.
+        // cancel reports the request gone. The first chunk absorbs
+        // prefill and kernel warmup; the next 12 tokens are timed to
+        // size the drain deadline below — hosted runners have decoded
+        // this model at ~4 tok/s under shared-GPU contention (run
+        // 29127458930) vs ~125 tok/s on a dev M-series, so no fixed
+        // deadline suits both.
         let mut stream = client
             .submit(submission("cancel-1", 400))
             .await
             .expect("submit ok")
             .into_inner();
-        read_chunks(&mut stream, 3).await;
+        read_chunks(&mut stream, 1).await;
+        let per_token = measured_token_period(&mut stream, 12).await;
         let ack = client
             .cancel(CancelRequest {
                 request_id: "cancel-1".to_owned(),
@@ -232,13 +260,36 @@ async fn cancel_and_drain_rpc_semantics() {
         // GRACEFUL drain: the short request finishes, the long one is
         // escalated to CANCELLED at the deadline, new Submits get the
         // in-band DRAINING error, Health reports DRAINING.
+        //
+        // The escalation contract is about ordering, not speed: the
+        // deadline must outlive the short request yet expire well
+        // before the long one could finish. Contention on a shared
+        // runner is non-stationary — PR #14 run 29139947140 measured
+        // 188 ms/token while a sibling test held the GPU, then decoded
+        // the drain phase 11x faster once it finished — so the long
+        // side cannot be a predicted-rate multiple. Instead its
+        // max_tokens is a constant near the KV-pool admission ceiling
+        // (prompt + max_tokens < 512 blocks x 32): finishing 12000
+        // tokens inside the deadline would take a >=37x
+        // measurement-to-execution rate swing, or >=2400 tok/s in the
+        // floor regime. Only the deadline scales with the measured
+        // period — 20x the short request's decode time, floored at
+        // 5000ms — where over-estimating the period only adds margin.
+        const SHORT_TOKENS: u32 = 16;
+        const LONG_TOKENS: u32 = 12_000;
+        let deadline = (per_token * (20 * SHORT_TOKENS)).max(Duration::from_millis(5000));
+        eprintln!(
+            "measured decode {:.1} ms/token -> drain deadline {} ms",
+            per_token.as_secs_f64() * 1e3,
+            deadline.as_millis()
+        );
         let mut short = client
-            .submit(submission("drain-short", 40))
+            .submit(submission("drain-short", SHORT_TOKENS))
             .await
             .expect("submit ok")
             .into_inner();
         let mut long = client
-            .submit(submission("drain-long", 2000))
+            .submit(submission("drain-long", LONG_TOKENS))
             .await
             .expect("submit ok")
             .into_inner();
@@ -246,7 +297,7 @@ async fn cancel_and_drain_rpc_semantics() {
         let ack = client
             .drain(DrainRequest {
                 mode: DrainMode::Graceful as i32,
-                deadline_ms: 2500,
+                deadline_ms: deadline.as_millis() as u64,
             })
             .await
             .expect("drain ok")
@@ -275,16 +326,22 @@ async fn cancel_and_drain_rpc_semantics() {
         assert_eq!(
             finished.finish_reason(),
             FinishReason::Length,
-            "graceful drain must let in-flight requests finish: {finished:?}"
+            "graceful drain must let in-flight requests finish \
+             (deadline {}ms at {:.1} ms/token): {finished:?}",
+            deadline.as_millis(),
+            per_token.as_secs_f64() * 1e3,
         );
-        assert_eq!(finished.completion_tokens, 40);
+        assert_eq!(finished.completion_tokens, SHORT_TOKENS);
         let (finished, _) = read_to_finished(&mut long).await;
         assert_eq!(
             finished.finish_reason(),
             FinishReason::Cancelled,
-            "drain deadline must escalate stragglers: {finished:?}"
+            "drain deadline must escalate stragglers \
+             (deadline {}ms at {:.1} ms/token): {finished:?}",
+            deadline.as_millis(),
+            per_token.as_secs_f64() * 1e3,
         );
-        assert!(finished.completion_tokens < 2000);
+        assert!(finished.completion_tokens < LONG_TOKENS);
         eprintln!("worker 1: cancel + graceful drain (deadline escalation) ok");
     }
 
