@@ -263,16 +263,23 @@ async fn cancel_and_drain_rpc_semantics() {
         //
         // The escalation contract is about ordering, not speed: the
         // deadline must outlive the short request yet expire well
-        // before the long one could finish. Both bounds scale with the
-        // decode rate, so size them from the period measured above —
-        // 8x the short request's decode time (floored at 2500ms for
-        // RPC overheads), with the long request's max_tokens at 5x
-        // whatever the deadline can decode.
+        // before the long one could finish. Contention on a shared
+        // runner is non-stationary — PR #14 run 29139947140 measured
+        // 188 ms/token while a sibling test held the GPU, then decoded
+        // the drain phase 11x faster once it finished — so the long
+        // side cannot be a predicted-rate multiple. Instead its
+        // max_tokens is a constant near the KV-pool admission ceiling
+        // (prompt + max_tokens < 512 blocks x 32): finishing 12000
+        // tokens inside the deadline would take a >=37x
+        // measurement-to-execution rate swing, or >=2400 tok/s in the
+        // floor regime. Only the deadline scales with the measured
+        // period — 20x the short request's decode time, floored at
+        // 5000ms — where over-estimating the period only adds margin.
         const SHORT_TOKENS: u32 = 16;
-        let deadline = (per_token * (8 * SHORT_TOKENS)).max(Duration::from_millis(2500));
-        let long_tokens = (5.0 * deadline.as_secs_f64() / per_token.as_secs_f64()).ceil() as u32;
+        const LONG_TOKENS: u32 = 12_000;
+        let deadline = (per_token * (20 * SHORT_TOKENS)).max(Duration::from_millis(5000));
         eprintln!(
-            "measured decode {:.1} ms/token -> drain deadline {} ms, long request {long_tokens} tokens",
+            "measured decode {:.1} ms/token -> drain deadline {} ms",
             per_token.as_secs_f64() * 1e3,
             deadline.as_millis()
         );
@@ -282,7 +289,7 @@ async fn cancel_and_drain_rpc_semantics() {
             .expect("submit ok")
             .into_inner();
         let mut long = client
-            .submit(submission("drain-long", long_tokens))
+            .submit(submission("drain-long", LONG_TOKENS))
             .await
             .expect("submit ok")
             .into_inner();
@@ -334,7 +341,7 @@ async fn cancel_and_drain_rpc_semantics() {
             deadline.as_millis(),
             per_token.as_secs_f64() * 1e3,
         );
-        assert!(finished.completion_tokens < long_tokens);
+        assert!(finished.completion_tokens < LONG_TOKENS);
         eprintln!("worker 1: cancel + graceful drain (deadline escalation) ok");
     }
 

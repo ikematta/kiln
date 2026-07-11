@@ -3882,3 +3882,54 @@
   manual job re-run went green) while this fix was in flight, so this
   is the deflake follow-up filed in the phase-close entry above. Then
   Phase 7 (SPEC §12).
+
+## [2026-07-10] Phase 6 follow-up — drain deflake v2: long side made structural (PR #14 red run 29139947140) — DONE
+- What: the measured-rate deflake's FIRST CI execution failed the
+  OPPOSITE assert (rpc.rs:329 "drain deadline must escalate
+  stragglers"): the long request finished Length (all 640 tokens)
+  before the 24097ms deadline. Log: measured 188.3 ms/token during the
+  cancel phase, but the long request decoded at 17.3 ms/token
+  (Timings: decode_ms 11045 for 640; 57.85 tok/s) — an 11x
+  intra-run swing. Cause: contention on the shared runner is
+  NON-STATIONARY — the sibling test in the same binary
+  (prefix_cache_stats_and_ssd_restart) held the GPU through our
+  measurement window (its "ok" logged at 04:47:06, mid-way through our
+  16.9s run), then finished, and the drain phase ran uncontended. Any
+  predicted-rate multiple on the long side loses to an
+  order-of-magnitude swing in that direction.
+- Fix (v2): the long request is no longer sized from the measured rate.
+  Its max_tokens is a constant 12_000, chosen against the two hard
+  bounds: (a) admission — engine rejects prompt + max_tokens over the
+  KV-pool capacity (512 blocks x 32 = 16384; 8 + 12000 fits, and
+  runtime usage before escalation stays far under the pool); (b)
+  escalation coverage — finishing 12000 tokens inside the deadline
+  needs a >=37x measurement-to-execution swing (observed worst: 11x),
+  or >=2400 tok/s in the floor regime (~20x current hardware). The
+  deadline still scales from the measured period — now 20x the short
+  request's decode time, floored at 5000ms (was 8x/2500) — because on
+  the short side over-estimating the period only adds margin; a
+  post-measurement SLOWDOWN now needs >23x to break it.
+- Reconciliation: PR #14 IS the deflake follow-up task filed in the
+  phase-close entry above ("Deflake filed as a follow-up task", commit
+  a7aa48a) — one effort, not two; no other drain-deflake work is
+  outstanding once PR #14 merges.
+- Deviations: none. Same semantics as v1: short must finish Length
+  with exact completion_tokens under GRACEFUL drain; long must be
+  escalated to Cancelled; DRAINING rejection and Health checks
+  unchanged.
+- Acceptance:
+  ```
+  $ cargo fmt --check -> clean; cargo clippy -p kiln-worker --all-targets -- -D warnings -> clean
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-worker --test rpc -- --nocapture
+  measured decode 14.8 ms/token -> drain deadline 5000 ms
+  worker 1: cancel + graceful drain (deadline escalation) ok
+  worker 2: immediate drain ok
+  test result: ok. 2 passed; 0 failed (8.19s)
+  contention stress (two staggered concurrent instances of the rpc
+  binary, exercising both swing directions): exit A=0 B=0, both
+  "2 passed; 0 failed"
+  ```
+  CI on PR #14 is the acceptance for the contended-runner regime; the
+  dev GPU cannot reproduce CI-grade contention swings.
+- Next: PR #14 green on CI -> merge -> Phase 7 (SPEC §12). Phase 7 not
+  started until PR #14 is resolved and merged.
