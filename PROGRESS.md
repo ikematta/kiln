@@ -3933,3 +3933,26 @@
   dev GPU cannot reproduce CI-grade contention swings.
 - Next: PR #14 green on CI -> merge -> Phase 7 (SPEC §12). Phase 7 not
   started until PR #14 is resolved and merged.
+
+## [2026-07-10] Phase 6 follow-up — PR #14 merged: drain deflake CI-verified; follow-up CLOSED — DONE
+- PR #14 (drain deflake v1+v2) merged to main (c5eb22c) with all four
+  checks green on run 29141387062 — lint, compile-linux, test-macos,
+  test-macos-release. `cancel_and_drain_rpc_semantics` executed THREE
+  times on the shared runner within the run (workspace pass +
+  model-gated suite in test-macos, plus test-macos-release): all ok.
+  (Passing tests' stdout is cargo-captured, so the measured-rate
+  eprintln only appears in logs on failure — by design, it's a
+  diagnosis aid for red runs.)
+- This closes the deflake follow-up filed in the Phase 6 close entry
+  (a7aa48a): that filed task, the PR #13 flake datapoint, and PR #14
+  are ONE effort — reconciled explicitly in the v2 entry above. No
+  drain-deflake work remains outstanding.
+- Verification history for the record: v1 (measured-rate sizing both
+  sides) failed its first CI execution on the long side under a
+  non-stationary 11x contention swing (run 29139947140); v2 (long side
+  structural at max_tokens 12000, deadline-only rate scaling) is what
+  merged. Both attempts and the root-cause analysis are in the two
+  entries above.
+- Next: Phase 7 — llguidance structured output, tool-call parsers,
+  /v1/messages, paged-attention kernel (SPEC §12). Not started in this
+  session per instruction.
