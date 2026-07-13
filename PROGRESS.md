@@ -4220,3 +4220,29 @@
 - Next: Phase 7 part 4 — custom Metal paged-attention kernel behind a flag
   + parity test vs the gather path (SPEC §12). Own session; not started
   here per instruction. This entry closes Phase 7's API surface.
+
+## [2026-07-13] Phase 7 / Task 3 — PR #17 merged: /v1/messages CI-verified — DONE
+- PR #17 (Anthropic Messages API adapter) merged to main (f9961cd) with all
+  four checks green on run 29278581375 — lint (42s), compile-linux (35s),
+  test-macos (14m55s), test-macos-release (3m42s). First CI execution, no
+  re-runs needed.
+- Verified in the test-macos log (not assumed): the e2e step ran all 24
+  test_messages.py tests through the real `anthropic` SDK and every one
+  PASSED on the runner — the 10-test conformance set on BOTH stacks
+  (`[python]` and `[rust]`: non-stream shape, stream-reassembly equality,
+  system-prompt steering, stop_sequence attribution, tool use non-stream/
+  stream/round-trip, forced-choice 400, Anthropic error envelopes, typed
+  NotFoundError) plus the 4 thinking tests on the rust-worker qwen3-0.6b
+  stack (thinking blocks shaped and separated: [thinking, text],
+  streamed block/delta sequence reassembling byte-equal to non-stream,
+  [thinking, tool_use] with tools, thinking-disabled → [text] only).
+  Suite total on the runner: 77 passed, 2 skipped (the pre-existing
+  rust-only structured-output skips on the python stack); python worker
+  35 passed; the think-parser unit tests ran in the env-less
+  `cargo test --workspace` step.
+- This closes Phase 7's API surface (SPEC §12 Phase 7: structured output
+  7.1, tool parsers 7.2, Anthropic API 7.3 — all merged and CI-verified).
+- Next: Phase 7 part 4 — custom Metal paged-attention kernel behind a
+  flag + parity test vs the gather path, ≥15% decode throughput at 8k
+  context or the flag stays off (SPEC §12). Stopped before it per
+  instruction; it is its own session.
