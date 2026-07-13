@@ -124,10 +124,13 @@ def test_validation_errors_are_openai_shaped(stack, client):
             model="no-such-model", messages=[{"role": "user", "content": "x"}]
         )
     with pytest.raises(openai.BadRequestError):
+        # tools are supported since Phase 7; FORCED tool choice is the
+        # still-unsupported feature that must 400 in the OpenAI shape.
         client.chat.completions.create(
             model=stack.model_id,
             messages=[{"role": "user", "content": "x"}],
             tools=[{"type": "function", "function": {"name": "f"}}],
+            tool_choice="required",
         )
     with pytest.raises(openai.BadRequestError):
         client.chat.completions.create(model=stack.model_id, messages=[])

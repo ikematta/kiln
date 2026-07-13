@@ -388,10 +388,7 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
             let template = ChatTemplate::from_model_dir(&model_dir).expect("template loads");
             let rendered = template
                 .render_with(
-                    &[ChatMessage {
-                        role: "user".into(),
-                        content: fixture.prompt.clone(),
-                    }],
+                    &[ChatMessage::text("user", fixture.prompt.clone())],
                     true,
                     &[("date_string", Value::from(PINNED_DATE_STRING))],
                 )

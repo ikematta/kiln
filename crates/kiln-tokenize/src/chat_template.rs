@@ -40,6 +40,38 @@ impl From<minijinja::Error> for TemplateError {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Assistant tool-call history, for templates that re-serialize prior
+    /// calls (Llama/Qwen check `'tool_calls' in message` / truthiness, so
+    /// the key must be absent — not null — when there are none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<MessageToolCall>>,
+}
+
+impl ChatMessage {
+    /// A plain text turn (no tool calls).
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+        }
+    }
+}
+
+/// One prior tool call in an assistant message, template-ready: `arguments`
+/// is the parsed object (templates apply `| tojson` themselves), not the
+/// OpenAI wire's JSON string.
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageToolCall {
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: MessageToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageToolFunction {
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
 /// A compiled chat template plus the special tokens it interpolates.
@@ -49,6 +81,7 @@ pub struct ChatTemplate {
     source_hash: String,
     bos_token: String,
     eos_token: String,
+    tool_call_format: Option<crate::toolcall::ToolCallFormat>,
 }
 
 const TEMPLATE_NAME: &str = "chat";
@@ -104,6 +137,7 @@ impl ChatTemplate {
         eos_token: String,
     ) -> Result<Self, TemplateError> {
         let source_hash = hex_sha256(source.as_bytes());
+        let tool_call_format = crate::toolcall::ToolCallFormat::detect(&source);
         let mut env = Environment::new();
         // HF templates probe optional variables (`tools`, `date_string`, ...)
         // with `is defined`; strict undefined would reject them.
@@ -113,13 +147,27 @@ impl ChatTemplate {
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_function("raise_exception", raise_exception);
         env.add_function("strftime_now", strftime_now);
+        // Override minijinja's builtin tojson: templates interpolate tool
+        // definitions into the PROMPT with it, and the model-visible bytes
+        // must match the reference (transformers) rendering — Python
+        // json.dumps formatting, not serde_json's compact form.
+        env.add_filter("tojson", tojson_python_style);
         env.add_template_owned(TEMPLATE_NAME, source)?;
         Ok(Self {
             env,
             source_hash,
             bos_token,
             eos_token,
+            tool_call_format,
         })
+    }
+
+    /// The tool-call format this model family emits, detected from the
+    /// template source (SPEC §8.2 "selected by model metadata"); `None`
+    /// means the model has no known tool-call convention and tool requests
+    /// must be rejected.
+    pub fn tool_call_format(&self) -> Option<crate::toolcall::ToolCallFormat> {
+        self.tool_call_format
     }
 
     /// Renders the conversation into the model's prompt string.
@@ -129,6 +177,28 @@ impl ChatTemplate {
         add_generation_prompt: bool,
     ) -> Result<String, TemplateError> {
         self.render_with(messages, add_generation_prompt, &[])
+    }
+
+    /// [`Self::render`] with the request's tool definitions exposed to the
+    /// template as the standard `tools` variable (HF convention: the full
+    /// OpenAI-shape objects). An empty slice renders exactly like
+    /// [`Self::render`] — the variable stays undefined, which tool-aware
+    /// templates probe for.
+    pub fn render_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        tools: &[serde_json::Value],
+    ) -> Result<String, TemplateError> {
+        if tools.is_empty() {
+            self.render(messages, add_generation_prompt)
+        } else {
+            self.render_with(
+                messages,
+                add_generation_prompt,
+                &[("tools", Value::from_serialize(tools))],
+            )
+        }
     }
 
     /// [`Self::render`] with extra template variables layered on top of the
@@ -211,6 +281,86 @@ fn hex_sha256(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// `| tojson` with Python `json.dumps` formatting, matching the filter
+/// transformers installs for chat templates: `ensure_ascii=False`,
+/// insertion-order keys, separators `", "`/`": "` (or `","` between items
+/// when `indent` is given, each item then on its own indented line).
+/// serde_json cannot produce these exact bytes, hence the custom writer.
+fn tojson_python_style(
+    value: &minijinja::Value,
+    kwargs: minijinja::value::Kwargs,
+) -> Result<String, minijinja::Error> {
+    let indent: Option<usize> = kwargs.get("indent")?;
+    kwargs.assert_all_used()?;
+    let json = serde_json::to_value(value).map_err(|err| {
+        minijinja::Error::new(
+            ErrorKind::InvalidOperation,
+            format!("value is not JSON-serializable: {err}"),
+        )
+    })?;
+    let mut out = String::new();
+    write_python_json(&json, indent, 0, &mut out);
+    Ok(out)
+}
+
+fn write_python_json(
+    value: &serde_json::Value,
+    indent: Option<usize>,
+    level: usize,
+    out: &mut String,
+) {
+    let newline_pad = |out: &mut String, level: usize| {
+        if let Some(width) = indent {
+            out.push('\n');
+            out.extend(std::iter::repeat_n(' ', width * level));
+        }
+    };
+    match value {
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            out.push('{');
+            for (i, (key, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                    if indent.is_none() {
+                        out.push(' ');
+                    }
+                }
+                newline_pad(out, level + 1);
+                // serde_json string escaping matches json.dumps for the
+                // ensure_ascii=False case (both escape only control chars,
+                // quotes, and backslashes).
+                let _ = write!(out, "{}", serde_json::Value::from(key.as_str()));
+                out.push_str(": ");
+                write_python_json(item, indent, level + 1, out);
+            }
+            newline_pad(out, level);
+            out.push('}');
+        }
+        serde_json::Value::Array(items) if !items.is_empty() => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                    if indent.is_none() {
+                        out.push(' ');
+                    }
+                }
+                newline_pad(out, level + 1);
+                write_python_json(item, indent, level + 1, out);
+            }
+            newline_pad(out, level);
+            out.push(']');
+        }
+        // Empty containers, scalars, strings: serde_json and json.dumps
+        // already agree ("{}", "[]", integers, true/false/null, string
+        // escaping). Exotic floats (1e30: "1e30" vs Python's "1e+30") can
+        // diverge; tool schemas with such values are out of scope.
+        other => {
+            let _ = write!(out, "{other}");
+        }
+    }
 }
 
 /// HF templates call `raise_exception("...")` for unsupported inputs; the

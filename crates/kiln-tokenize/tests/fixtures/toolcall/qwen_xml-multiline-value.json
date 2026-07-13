@@ -1,0 +1,56 @@
+{
+  "family": "qwen_xml",
+  "source": {
+    "kind": "template",
+    "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "note": "official chat template serialization; no pinned model emits this format"
+  },
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "run_tests",
+        "description": "Run the project's test suite.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Test file or directory"
+            },
+            "verbose": {
+              "type": "boolean"
+            },
+            "retries": {
+              "type": "integer"
+            },
+            "env": {
+              "type": "object",
+              "description": "Extra environment vars"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "placeholder"
+    }
+  ],
+  "token_ids": null,
+  "text": "<tool_call>\n<function=run_tests>\n<parameter=path>\ntests/a.py\ntests/b.py\ntests/c.py\n</parameter>\n</function>\n</tool_call>",
+  "expected": {
+    "content": "",
+    "calls": [
+      {
+        "name": "run_tests",
+        "arguments": "{\"path\":\"tests/a.py\\ntests/b.py\\ntests/c.py\"}"
+      }
+    ]
+  }
+}

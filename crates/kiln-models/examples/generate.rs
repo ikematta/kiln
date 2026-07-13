@@ -49,13 +49,7 @@ fn main() {
     let prompt_ids = if chat {
         let template = ChatTemplate::from_model_dir(&model_dir).expect("template loads");
         let rendered = template
-            .render(
-                &[ChatMessage {
-                    role: "user".into(),
-                    content: prompt,
-                }],
-                true,
-            )
+            .render(&[ChatMessage::text("user", prompt)], true)
             .expect("renders");
         tokenizer.encode(&rendered, false).expect("encodes")
     } else {

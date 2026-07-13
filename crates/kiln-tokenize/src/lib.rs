@@ -30,16 +30,20 @@
 //! from the tokenizer itself. Do not copy that flag value onto the
 //! chat-template path.
 //!
-//! Phase 2 shipped chat templating; tokenizer loading lands with the Rust
-//! worker (Phase 3), incremental detokenization and tool-call parsing in
-//! later phases.
+//! Phase 2 shipped chat templating; tokenizer loading landed with the Rust
+//! worker (Phase 3), incremental detokenization with Phase 4, and the
+//! streaming tool-call parsers ([`toolcall`]) with Phase 7.
 
 pub mod chat_template;
 pub mod detok;
 pub mod stops;
 pub mod tokenizer;
+pub mod toolcall;
 
-pub use chat_template::{ChatMessage, ChatTemplate, TemplateError};
+pub use chat_template::{
+    ChatMessage, ChatTemplate, MessageToolCall, MessageToolFunction, TemplateError,
+};
 pub use detok::StreamingDecoder;
 pub use stops::StopStringMatcher;
 pub use tokenizer::{Tokenizer, TokenizerError};
+pub use toolcall::{ToolCallFormat, ToolCallParser, ToolEvent};

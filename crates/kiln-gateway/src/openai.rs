@@ -5,7 +5,7 @@
 //! dropped.
 
 use kiln_proto::v1::{GrammarSpec, SamplingParams, grammar_spec};
-use kiln_tokenize::ChatMessage;
+use kiln_tokenize::{ChatMessage, MessageToolCall, MessageToolFunction};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -49,6 +49,26 @@ pub struct RequestMessage {
     pub role: String,
     pub content: Option<MessageContent>,
     pub name: Option<String>,
+    /// Prior tool calls on assistant messages (multi-turn tool use).
+    pub tool_calls: Option<Vec<RequestToolCall>>,
+    /// Present on `role: "tool"` messages; accepted but unused — the
+    /// supported templates key tool results on position, not id.
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RequestToolCall {
+    pub id: Option<String>,
+    #[serde(rename = "type")]
+    pub call_type: Option<String>,
+    pub function: RequestFunctionCall,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RequestFunctionCall {
+    pub name: String,
+    /// JSON-encoded arguments object (OpenAI wire form).
+    pub arguments: Option<String>,
 }
 
 /// `content` is a plain string or an array of typed parts; only `text`
@@ -107,6 +127,10 @@ pub struct ValidatedChat {
     /// Structured-output constraint from `response_format`; requires the
     /// worker to advertise `CAPABILITY_GRAMMAR` (checked at submit).
     pub grammar: Option<GrammarSpec>,
+    /// Tool definitions, verbatim OpenAI shape: rendered into the chat
+    /// template (`tools` variable) and used as parser type hints. Empty
+    /// when the request has none or `tool_choice` is `"none"`.
+    pub tools: Vec<serde_json::Value>,
     pub stream: bool,
     pub include_usage: bool,
 }
@@ -128,8 +152,52 @@ impl ChatCompletionRequest {
                 "'logprobs' is not supported by this model's worker",
             ));
         }
-        if self.tools.is_some() || self.tool_choice.is_some() {
-            return Err(invalid("tool calling is not supported yet (Kiln Phase 7)"));
+        // Tools (SPEC §8.2): definitions pass to the chat template verbatim;
+        // the completion streams back through the family's tool-call parser.
+        // `tool_choice` "none" drops the tools entirely (the model never
+        // sees them); "required" and named forcing need grammar-coupled
+        // decoding and are out of scope for v1.
+        let mut tools = match &self.tools {
+            None => Vec::new(),
+            Some(serde_json::Value::Array(tools)) => {
+                for tool in tools {
+                    let tool_type = tool.get("type").and_then(|t| t.as_str());
+                    if !matches!(tool_type, Some("function") | None) {
+                        return Err(ApiError::invalid_request(format!(
+                            "unsupported tool type '{}' (only 'function')",
+                            tool_type.unwrap_or_default()
+                        )));
+                    }
+                    if tool
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .is_none_or(str::is_empty)
+                    {
+                        return Err(invalid("each tool requires 'function.name'"));
+                    }
+                }
+                tools.clone()
+            }
+            Some(_) => return Err(invalid("'tools' must be an array")),
+        };
+        match &self.tool_choice {
+            None => {}
+            Some(serde_json::Value::String(choice)) => match choice.as_str() {
+                "auto" => {}
+                "none" => tools.clear(),
+                other => {
+                    return Err(ApiError::invalid_request(format!(
+                        "'tool_choice' '{other}' is not supported (only 'auto' or 'none'; \
+                         forced tool calls need grammar-coupled decoding)"
+                    )));
+                }
+            },
+            Some(_) => {
+                return Err(invalid(
+                    "named 'tool_choice' is not supported (only 'auto' or 'none')",
+                ));
+            }
         }
         let grammar = match &self.response_format {
             None => None,
@@ -181,12 +249,24 @@ impl ChatCompletionRequest {
             let role = match message.role.as_str() {
                 // OpenAI treats `developer` as the successor of `system`.
                 "developer" => "system".to_string(),
-                "system" | "user" | "assistant" => message.role.clone(),
+                "system" | "user" | "assistant" | "tool" => message.role.clone(),
                 other => {
                     return Err(ApiError::invalid_request(format!(
-                        "unsupported message role '{other}' (tool messages arrive with Kiln Phase 7)"
+                        "unsupported message role '{other}'"
                     )));
                 }
+            };
+            if message.tool_calls.is_some() && role != "assistant" {
+                return Err(invalid("'tool_calls' is only valid on assistant messages"));
+            }
+            let tool_calls = match &message.tool_calls {
+                None => None,
+                Some(calls) => Some(
+                    calls
+                        .iter()
+                        .map(validate_message_tool_call)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
             };
             let content = match &message.content {
                 None => String::new(),
@@ -205,7 +285,11 @@ impl ChatCompletionRequest {
                     combined
                 }
             };
-            messages.push(ChatMessage { role, content });
+            messages.push(ChatMessage {
+                role,
+                content,
+                tool_calls,
+            });
         }
 
         Ok(ValidatedChat {
@@ -214,6 +298,7 @@ impl ChatCompletionRequest {
             max_tokens,
             stop_strings,
             grammar,
+            tools,
             stream: self.stream,
             include_usage: self
                 .stream_options
@@ -221,6 +306,34 @@ impl ChatCompletionRequest {
                 .is_some_and(|o| o.include_usage),
         })
     }
+}
+
+/// Wire tool call (arguments as a JSON string) → template-ready form
+/// (arguments as the parsed object — templates re-serialize themselves).
+fn validate_message_tool_call(call: &RequestToolCall) -> Result<MessageToolCall, ApiError> {
+    if let Some(call_type) = &call.call_type
+        && call_type != "function"
+    {
+        return Err(ApiError::invalid_request(format!(
+            "unsupported tool call type '{call_type}' (only 'function')"
+        )));
+    }
+    let arguments = match call.function.arguments.as_deref() {
+        None | Some("") => serde_json::json!({}),
+        Some(text) => serde_json::from_str(text).map_err(|err| {
+            ApiError::invalid_request(format!(
+                "tool call '{}' has non-JSON 'arguments': {err}",
+                call.function.name
+            ))
+        })?,
+    };
+    Ok(MessageToolCall {
+        call_type: "function".to_owned(),
+        function: MessageToolFunction {
+            name: call.function.name.clone(),
+            arguments,
+        },
+    })
 }
 
 /// Wraps a JSON Schema document string as the proto grammar spec.
@@ -470,7 +583,26 @@ pub struct Usage {
 #[derive(Debug, Serialize)]
 pub struct AssistantMessage {
     pub role: &'static str,
-    pub content: String,
+    /// `null` (never omitted — OpenAI shape) when the completion was only
+    /// tool calls.
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ResponseToolCall>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResponseToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: &'static str, // "function"
+    pub function: ResponseFunction,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResponseFunction {
+    pub name: String,
+    /// JSON-encoded arguments object (OpenAI wire form).
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -497,6 +629,28 @@ pub struct Delta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+/// Streaming tool-call delta: the first chunk for a call carries
+/// id/type/name and empty arguments; later chunks carry only argument
+/// fragments (OpenAI accumulation contract, keyed by `index`).
+#[derive(Debug, Serialize)]
+pub struct DeltaToolCall {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<&'static str>,
+    pub function: DeltaFunction,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeltaFunction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -665,11 +819,37 @@ mod tests {
                 "logprobs",
             ),
             (
-                serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "x"}], "tools": []}),
-                "tool calling",
+                serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "x"}],
+                    "tools": [{"type": "function", "function": {}}]}),
+                "function.name",
             ),
             (
-                serde_json::json!({"model": "m", "messages": [{"role": "tool", "content": "x"}]}),
+                serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "x"}],
+                    "tools": [{"type": "retrieval", "function": {"name": "f"}}]}),
+                "unsupported tool type",
+            ),
+            (
+                serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "x"}],
+                    "tool_choice": "required"}),
+                "tool_choice",
+            ),
+            (
+                serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "x"}],
+                    "tool_choice": {"type": "function", "function": {"name": "f"}}}),
+                "tool_choice",
+            ),
+            (
+                serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "x",
+                    "tool_calls": [{"function": {"name": "f", "arguments": "{}"}}]}]}),
+                "only valid on assistant",
+            ),
+            (
+                serde_json::json!({"model": "m", "messages": [{"role": "assistant",
+                    "tool_calls": [{"function": {"name": "f", "arguments": "{oops"}}]}]}),
+                "non-JSON 'arguments'",
+            ),
+            (
+                serde_json::json!({"model": "m", "messages": [{"role": "critic", "content": "x"}]}),
                 "unsupported message role",
             ),
             (
@@ -689,6 +869,48 @@ mod tests {
             assert!(err.message.contains(needle), "{} !~ {needle}", err.message);
             assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[test]
+    fn tools_flow_through_validation() {
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        });
+        // Tool history + tool result messages validate into template shape.
+        let v = request(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 21}"},
+            ],
+            "tools": [tool.clone()],
+        }))
+        .validate()
+        .expect("valid");
+        assert_eq!(v.tools, vec![tool.clone()]);
+        let calls = v.messages[1].tool_calls.as_ref().expect("kept");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(
+            calls[0].function.arguments,
+            serde_json::json!({"city": "Paris"})
+        );
+        assert_eq!(v.messages[2].role, "tool");
+
+        // tool_choice "none" drops the tools entirely.
+        let v = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [tool],
+            "tool_choice": "none",
+        }))
+        .validate()
+        .expect("valid");
+        assert!(v.tools.is_empty());
     }
 
     #[test]

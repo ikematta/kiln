@@ -1,0 +1,76 @@
+{
+  "family": "hermes",
+  "source": {
+    "kind": "generation",
+    "model": "qwen3-0.6b-4bit",
+    "mlx_lm_version": "0.31.2",
+    "template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_time",
+        "description": "Get the current local time for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Just say hello, no tools needed."
+    }
+  ],
+  "prompt_text": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the current local time for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nJust say hello, no tools needed.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "token_ids": [
+    9707,
+    0,
+    2308,
+    7375,
+    525,
+    4362,
+    369,
+    419,
+    4285,
+    42113,
+    13
+  ],
+  "text": "Hello! No tools are needed for this simple greeting.",
+  "expected": {
+    "content": "Hello! No tools are needed for this simple greeting.",
+    "calls": []
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "family": "llama",
+  "source": {
+    "kind": "template",
+    "model": "llama-3.2-1b-4bit",
+    "note": "the template's own tool_calls serialization: bare JSON, no <|python_tag|>"
+  },
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the weather in Paris right now?"
+    }
+  ],
+  "token_ids": null,
+  "text": "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
+  "expected": {
+    "content": "",
+    "calls": [
+      {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\"}"
+      }
+    ]
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "family": "qwen_xml",
+  "source": {
+    "kind": "template",
+    "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "note": "official chat template serialization; no pinned model emits this format"
+  },
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "placeholder"
+    }
+  ],
+  "token_ids": null,
+  "text": "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+  "expected": {
+    "content": "",
+    "calls": [
+      {
+        "name": "get_weather",
+        "arguments": "{\"city\":\"Paris\"}"
+      }
+    ]
+  }
+}
