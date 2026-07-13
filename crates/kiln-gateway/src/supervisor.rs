@@ -80,6 +80,10 @@ impl Supervisor {
                         argv.push("--ssd-max-gb".to_owned());
                         argv.push(config.defaults.ssd_cache_max_gb.to_string());
                     }
+                    // SPEC §7.4: opt-in paged-attention kernel flag.
+                    if config.defaults.paged_attention_kernel {
+                        argv.push("--paged-attention-kernel".to_owned());
+                    }
                     argv
                 }
                 _ => config.server.python_worker_argv.clone(),

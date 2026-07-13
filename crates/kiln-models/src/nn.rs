@@ -391,6 +391,10 @@ pub(crate) struct Attention {
     n_kv_heads: i32,
     head_dim: i32,
     scale: f32,
+    /// `scale` as an ndim-0 f32 array — the paged-attention kernel's
+    /// `scale_val` input, built once so the per-step hot path allocates
+    /// nothing for it.
+    scale_arr: Array,
     traditional_rope: bool,
     attn_softcap: Option<f32>,
     q_proj: Linear,
@@ -419,16 +423,18 @@ impl Attention {
             }),
             None => None,
         };
+        // Python computes the scale in double precision and the FFI
+        // narrows it; same here. Gemma passes its own
+        // `query_pre_attn_scalar` formula through `scale_override`.
+        let scale = shape
+            .scale_override
+            .unwrap_or_else(|| f64::from(shape.head_dim).powf(-0.5)) as f32;
         Ok(Self {
             n_heads: shape.n_heads,
             n_kv_heads: shape.n_kv_heads,
             head_dim: shape.head_dim,
-            // Python computes the scale in double precision and the FFI
-            // narrows it; same here. Gemma passes its own
-            // `query_pre_attn_scalar` formula through `scale_override`.
-            scale: shape
-                .scale_override
-                .unwrap_or_else(|| f64::from(shape.head_dim).powf(-0.5)) as f32,
+            scale,
+            scale_arr: Array::from_f32(scale),
             traditional_rope: shape.traditional_rope,
             attn_softcap: shape.attn_logit_softcapping,
             q_proj: Linear::load(store, &format!("{prefix}.q_proj"), quantization)?,
@@ -723,13 +729,32 @@ impl Attention {
             start += l;
         }
 
-        // Phase 2: per-sequence gather + SDPA over the full history. Pad
-        // queries sit in FRONT of the real rows (SDPA's causal mask is
-        // bottom-right aligned, so real rows keep their exact spans); the
-        // pad outputs are sliced away, then refilled as zero lanes so the
-        // o_proj keeps the padded row count.
+        // Phase 2: per-sequence attention over the full history. Decode-
+        // shaped segments take the block-table-aware kernel when the SPEC
+        // §7.4 flag prepared inputs for them (same values, same reduction
+        // order, no gather copy — see kiln-engine's paged_attn module docs
+        // for the parity argument); everything else (prefill pieces,
+        // padded pieces, softcapped architectures) gathers + fused SDPA
+        // exactly as before. Pad queries sit in FRONT of the real rows
+        // (SDPA's causal mask is bottom-right aligned, so real rows keep
+        // their exact spans); the pad outputs are sliced away, then
+        // refilled as zero lanes so the o_proj keeps the padded row count.
         let mut outs: Vec<Array> = Vec::with_capacity(seqs.len());
         for (seq, q) in seqs.iter().zip(&roped) {
+            if pad == 0
+                && self.attn_softcap.is_none()
+                && let Some(paged) = &seq.paged_attn
+            {
+                debug_assert_eq!(seq.len, 1, "kernel inputs on a multi-row segment");
+                let o = kv.paged_sdpa(layer, q, paged, &self.scale_arr, s)?;
+                let o = ops::transpose(&o, &[0, 2, 1, 3], s)?;
+                outs.push(ops::reshape(
+                    &o,
+                    &[1, seq.len, self.n_heads * self.head_dim],
+                    s,
+                )?);
+                continue;
+            }
             let (k, v) = kv.gather(layer, &seq.blocks, seq.offset + seq.len, s)?;
             let mask = if seq.len > 1 || pad > 0 {
                 SdpaMask::Causal

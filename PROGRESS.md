@@ -4271,3 +4271,150 @@
   stay bit-identical (golden/parity gates apply to any adoption).
 - Next: Phase 7 part 4 — paged-attention Metal kernel session, now
   including the mlx_compile rider above.
+## [2026-07-13] Phase 7 / Task 4 — custom Metal paged-attention kernel (SPEC §7.4/§12) — DONE
+- What: block-table-aware paged attention via `mlx_fast_metal_kernel_new`,
+  replacing the gather copy for decode steps, behind
+  `EngineConfig::paged_attention_kernel` / `--paged-attention-kernel` /
+  `[defaults] paged_attention_kernel` (DEFAULT OFF — not flipped in this
+  session, per instruction, even though both acceptance bars passed).
+  - kiln-mlx: `fast::MetalKernel` safe wrapper (custom-kernel handle +
+    per-call config, RAII/leak-counted), `device::gpu_architecture()`;
+    `VectorArray` out-param support; custom-kernel smoke test in wrappers.
+  - kiln-engine `paged_attn.rs`: ports of the pinned MLX v0.31.1
+    `sdpa_vector` / `sdpa_vector_2pass_1/2` kernels with ONLY the K/V
+    addressing changed (pool + u32 block table instead of contiguous seq
+    strides); the reference's variant-dispatch predicate and device-class
+    `blocks` table replicated exactly (keyed on the architecture string's
+    last char, from `mlx_device_info`). `PagedKv::paged_sdpa` +
+    `enable_attention_kernel`; per-seq per-step inputs (`PagedAttnInputs`)
+    prepared once in `build_seq_step` (covers sync + pipelined decode) and
+    shared across all layers' calls.
+  - kiln-models nn.rs: decode-shaped segments (`len==1`, `pad==0`,
+    non-softcap) route to the kernel when inputs are prepared; everything
+    else (prefill pieces, ADR 0002 padded pieces, gemma2 softcap) stays on
+    gather+SDPA. gemma2 therefore never uses the kernel (documented).
+  - Plumbing: worker `EngineOptions` (renamed from `CacheOptions`) +
+    CLI flag; gateway `EngineDefaults.paged_attention_kernel` + supervisor
+    argv; kiln.toml.example.
+- Parity guarantee (stated per session instruction BEFORE writing the
+  kernel, recorded here): NOT assumed bit-exact — designed bit-exact BY
+  CONSTRUCTION and then MEASURED. Basis: (1) the kernels are ports of the
+  exact kernels the gather path executes, same iteration order, same
+  f32-accumulator/`fast::exp`/`simd_sum` algebra — reduction order
+  preserved, which is precisely what ADR 0002 says defines a kernel class;
+  (2) both compile paths are non-fast-math at the pin (builtin metallib
+  `-fno-fast-math`, custom-kernel JIT `setFastMathEnabled(false)`);
+  (3) the one unresolvable-from-source risk — offline metallib compiler vs
+  runtime JIT codegen (e.g. fma contraction) — was named up front and
+  measured directly; (4) variant dispatch (1-pass vs 2-pass at
+  `((devc=='d'|'s')&&N>=1024)||(GQA&&N>=4096)`, plus the devc x N `blocks`
+  quantization) is replicated so the port never sits in a different
+  variant than the reference at any (device, N). Fallback bar if any bit
+  divergence appeared: token-id equality per ADR 0002, characterized,
+  tests not weakened, DECISION NEEDED. Outcome: bit-exactness HELD
+  everywhere measured (below), so the fallback was not needed. Scope
+  unchanged by this session: same-device claims only (ADR 0004); B'
+  untouched (attention was always per-sequence — no M-dependence).
+- Measured results (dev machine, M4-class, W=9):
+  - Kernel-vs-gather BIT equality (new `kiln-engine/tests/paged_attn.rs`):
+    raw output bytes identical across {f16, bf16} x {32/8/64, 16/8/128,
+    4/1/256 (H/HK/D)} x 14 context lengths {1..8193} straddling every
+    dispatch boundary, outlier-heavy values, rotated (non-identity) block
+    table, ragged tails. The offline-vs-JIT compiler risk did NOT
+    materialize at this pin on this device.
+  - Golden (flag ON and OFF, every fixture model): exact token-id match,
+    single-stream AND width-16 (corrected bars: ADR 0002 B' + ADR 0004
+    same-device scope). golden.rs now runs the full round set on BOTH
+    attention paths.
+  - 8k-context decode throughput (new `#[ignore]`d release gate
+    `kiln-models/tests/paged_attn_gate.rs`, llama-3.2-1b-4bit, 8064-token
+    prompt + 128 decode, single-stream, median of 3): gather 42.3 tok/s
+    (23.65 ms/step) -> kernel 61.8 tok/s (16.19 ms/step) = **1.461x**,
+    vs the SPEC §12 >=15% bar. Greedy tokens identical between paths at 8k
+    (kernel engagement proven end-to-end). Batched 8k deferred: 16GB dev
+    machine; the bar is single-stream-measurable and the 14B-class bench
+    machine records its own numbers per ADR 0003's deferral pattern.
+- mlx_compile rider (PROGRESS 2026-07-13 scoping): CLOSED under exit
+  condition (a) — no fusion/dispatch-bound hotspot; experiments not
+  warranted at this pin. Evidence (decode step @8k, kernel path,
+  16.19 ms): isolated per-layer attention 0.667 ms x 16 layers = 66% of
+  the step, a single fused kernel either way (gather variant costs
+  1.431 ms/layer; engine-level delta reconciles at 61% of 16x the
+  isolated delta — isolated timing pays per-rep eval, engine overlaps,
+  so the isolated delta is an upper bound). The 5.52 ms non-attention
+  residual is trunk qmv + sampler + dispatch, which the 2026-07-05
+  op-level-split investigation (ADR 0003) already measured as ~93%
+  kernel(weight-streaming)-time at 1B — dispatch is not a hotspot, and
+  every hot op is already a single fused kernel (qmv, SDPA/paged-SDPA,
+  fast::rms_norm, fast::rope). mlx_compile fuses elementwise chains only;
+  its recoverable surface here is the small elementwise slice of the
+  residual — far below a phase-gate-visible win. Greedy bit invariants
+  untouched (nothing adopted).
+- Decisions:
+  - Kernel scope is decode-shaped segments only (qL=1). Multi-row
+    attention (prefill/padded pieces) keeps gather+SDPA: that is where
+    the reference runs tiled/padded classes, and the gather cost there is
+    amortized over the piece's rows. This is the vLLM-shaped split and
+    keeps the ADR 0002 pad machinery untouched.
+  - `blocks` table + 2-pass predicate transcribed as pure functions with
+    pin-referenced unit tests (paged_attn.rs) so a future mlx-c bump that
+    changes dispatch fails loudly in review, not silently in parity.
+  - Block tables are zero-padded to >=8 entries: mlx-c's custom-kernel
+    signature generator switches an input between `constant`/`device`
+    address spaces at size 8, which would otherwise flip the generated
+    source (and force a JIT rebuild) between short and long contexts.
+  - Template args (D/V/GQA/HK/BS/BLOCKS + dtype) specialize per model at
+    JIT; per-step runtime inputs are only the block table + context
+    length (built once per seq per step in build_seq_step, shared across
+    layers) and a cached scale array on Attention — no per-layer host
+    allocation on the hot path.
+  - The bit probe is BLOCKING in `cargo test --workspace` (it asserts a
+    same-device two-implementation invariant, not a committed-fixture
+    comparison — ADR 0004's advisory carve-out does not apply). Known
+    residual: a CI runner whose Xcode/driver compiler pairing bit-diverges
+    the JIT from the runner-built metallib would fail this lane; that is
+    a REAL kernel-class finding on that device class, wanted loudly.
+    Advisory-izing it preemptively would be a unilateral scope call —
+    if it fires on CI, options (characterize + explicit advisory ruling
+    vs fix) come back here for a ruling. Golden flag-ON rounds ride the
+    existing PERMANENTLY-advisory golden lane unchanged (ADR 0004); the
+    8k gate is `#[ignore]`d like the ADR 0003 throughput gate (CI never
+    runs either).
+  - Worker `CacheOptions` renamed `EngineOptions` (it now carries a
+    non-cache engine switch); argv contract extended additively.
+- Deviations: none. (SPEC §12's "else flag stays off" branch not taken —
+  both bars passed; the default nevertheless stays OFF per the session
+  instruction. Flipping it is a PM decision.)
+- Acceptance:
+  ```
+  $ cargo test -p kiln-engine --test paged_attn      # kernel-vs-gather BIT probe
+  test kernel_output_is_bit_identical_to_gather_sdpa ... ok   (5.16s)
+  $ cargo test -p kiln-engine --lib paged_attn       # dispatch-table transcription tests
+  test paged_attn::tests::two_pass_blocks_matches_the_pin ... ok
+  test paged_attn::tests::two_pass_predicate_matches_the_pin ... ok
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --test golden
+  test greedy_parity_is_exact_for_every_fixture_model ... ok  (579.90s;
+    every fixture model x {single-stream, width-16} x {gather, kernel})
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --release --test paged_attn_gate -- --ignored --nocapture
+  decode @8k: gather 42.3 tok/s (23.65 ms/step), kernel 61.8 tok/s (16.19 ms/step) -> 1.461x (bar 1.15x)
+  profile @8k: isolated per-layer attention gather 1.431 ms vs kernel 0.667 ms;
+    step delta 7.46 ms vs 16 x attention delta 12.23 ms (composition 61%);
+    non-attention residual 5.52 ms/step
+  test paged_attention_kernel_meets_the_8k_bar ... ok
+  $ KILN_TEST_MODELS=... cargo test --workspace      -> 46 suites, all ok
+    (incl. golden both paths 585s; 3 ignored = the perf gates)
+  $ cargo build --workspace --no-default-features    -> clean (linux shape)
+  $ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings  -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings       -> clean
+  $ ruff check / format --check python/ tests/e2e    -> clean (23 files)
+  $ pytest python/kiln_worker_py/tests               -> 35 passed
+  $ uv run --project tests/e2e pytest tests/e2e      -> 77 passed, 2 skipped
+    (identical to the pre-change baseline; default config = flag off)
+  ```
+- Next: Phase 7 is functionally complete (7.1–7.4 + compile rider). Phase
+  gate review per SPEC §13.4 (PM runs bench.sh + e2e on their hardware),
+  then Phase 8 — speculative decoding. Open PM decisions parked here:
+  (1) flip `paged_attention_kernel` default ON (both §12 bars passed on
+  the dev machine; suggest observing the CI bit-probe lane on a few runs
+  first); (2) nothing else — no DECISION NEEDED items.
+

@@ -18,6 +18,8 @@ mod array;
 #[cfg(feature = "metal")]
 pub mod debug;
 #[cfg(feature = "metal")]
+pub mod device;
+#[cfg(feature = "metal")]
 pub mod error;
 #[cfg(feature = "metal")]
 pub mod fast;

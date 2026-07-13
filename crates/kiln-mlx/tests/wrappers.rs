@@ -27,6 +27,64 @@ fn wrapper_discipline() {
     shape_mismatch_is_checked();
     host_reads_reject_wrong_dtype();
     host_reads_reject_non_contiguous_views();
+    custom_metal_kernel_smoke();
+}
+
+/// End-to-end custom-kernel check (SPEC §7.4 machinery): a templated
+/// gather-by-index kernel JIT-compiles, respects template args and thread
+/// geometry, produces correct values, and leaks nothing. Metal-only: the
+/// primitive has no CPU implementation.
+fn custom_metal_kernel_smoke() {
+    if !kiln_mlx::memory::metal_is_available() {
+        return;
+    }
+    use kiln_mlx::fast::{KernelInvocation, KernelOutput, MetalKernel};
+    let baseline = debug::live_objects();
+    {
+        let s = Stream::gpu();
+        let kernel = MetalKernel::new(
+            "kiln_wrapper_smoke",
+            &["src", "idx"],
+            &["out"],
+            // One thread per (row, column): out[r, c] = src[idx[r], c] * W.
+            "  uint r = thread_position_in_grid.y;\n\
+             uint c = thread_position_in_grid.x;\n\
+             out[r * D + c] = src[idx[r] * D + c] * static_cast<T>(W);\n",
+            "",
+        )
+        .unwrap();
+        let src = Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]).unwrap();
+        let idx = Array::from_u32_slice(&[2, 0, 2, 1, 1, 0, 2, 0], &[8]).unwrap();
+        let outputs = kernel
+            .apply(
+                &[&src, &idx],
+                &KernelInvocation {
+                    template_dtypes: &[("T", Dtype::Float32)],
+                    template_ints: &[("D", 2), ("W", 3)],
+                    grid: (2, 8, 1),
+                    threadgroup: (2, 8, 1),
+                    outputs: &[KernelOutput {
+                        shape: vec![8, 2],
+                        dtype: Dtype::Float32,
+                    }],
+                },
+                &s,
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        let got = outputs[0].data_f32().unwrap();
+        let want: Vec<f32> = [2, 0, 2, 1, 1, 0, 2, 0]
+            .iter()
+            .flat_map(|&r: &usize| [src_row(r).0 * 3.0, src_row(r).1 * 3.0])
+            .collect();
+        assert_eq!(got, want);
+    }
+    assert_eq!(debug::live_objects(), baseline);
+}
+
+fn src_row(r: usize) -> (f32, f32) {
+    let flat = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    (flat[r * 2], flat[r * 2 + 1])
 }
 
 /// MLX's item<T>/data<T> are raw reinterpreting accessors; the safe wrappers

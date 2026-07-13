@@ -36,22 +36,27 @@ const DEFAULT_REPETITION_WINDOW: usize = 64;
 /// SPEC §10 `[defaults]` ssd_cache_max_gb default.
 const DEFAULT_SSD_MAX_BYTES: u64 = 64 << 30;
 
-/// Prefix-cache/SSD settings from the CLI (SPEC §10 config flags).
+/// Engine settings from the CLI (SPEC §10 config flags): prefix cache,
+/// SSD tier, and the paged-attention kernel switch.
 #[derive(Debug, Clone)]
-pub struct CacheOptions {
+pub struct EngineOptions {
     pub prefix_cache: bool,
     /// Root cache directory (`$KILN_CACHE_DIR`); the worker stores slabs
     /// under `<root>/<model_fingerprint>/blocks/` (SPEC §6.4).
     pub ssd_dir: Option<PathBuf>,
     pub ssd_max_bytes: u64,
+    /// Custom block-table-aware attention kernel for decode steps (SPEC
+    /// §7.4 Phase 7). Default OFF: the gather path is the reference.
+    pub paged_attention_kernel: bool,
 }
 
-impl Default for CacheOptions {
+impl Default for EngineOptions {
     fn default() -> Self {
         Self {
             prefix_cache: true,
             ssd_dir: None,
             ssd_max_bytes: DEFAULT_SSD_MAX_BYTES,
+            paged_attention_kernel: false,
         }
     }
 }
@@ -137,12 +142,12 @@ pub struct Shared {
 }
 
 impl Shared {
-    pub fn new(model_id: String, info: StaticInfo, cache: &CacheOptions) -> Self {
+    pub fn new(model_id: String, info: StaticInfo, opts: &EngineOptions) -> Self {
         use kiln_proto::v1::Capability;
         let mut capabilities = Vec::new();
-        if cache.prefix_cache {
+        if opts.prefix_cache {
             capabilities.push(Capability::PrefixCache as i32);
-            if cache.ssd_dir.is_some() {
+            if opts.ssd_dir.is_some() {
                 capabilities.push(Capability::SsdTier as i32);
             }
         }
@@ -292,7 +297,7 @@ pub fn engine_main(
     model_dir: PathBuf,
     shared: Arc<Shared>,
     rx: Receiver<Submission>,
-    cache: CacheOptions,
+    opts: EngineOptions,
 ) {
     kiln_mlx::init(); // swap out mlx-c's exit()-ing error handler first
     let stream = Stream::gpu();
@@ -350,17 +355,18 @@ pub fn engine_main(
     // Prefix cache/SSD per the CLI flags (SPEC §6.3/§6.4): slabs live
     // under `<ssd_dir>/<model_fingerprint>/blocks/`.
     let mut config = EngineConfig {
-        prefix_cache: cache.prefix_cache,
-        ssd: cache
+        prefix_cache: opts.prefix_cache,
+        ssd: opts
             .ssd_dir
             .as_ref()
-            .filter(|_| cache.prefix_cache)
+            .filter(|_| opts.prefix_cache)
             .map(|root| SsdParams {
                 dir: root.join(&shared.info.weights_fingerprint).join("blocks"),
-                max_bytes: cache.ssd_max_bytes,
+                max_bytes: opts.ssd_max_bytes,
                 fingerprint: shared.info.weights_fingerprint.clone(),
             }),
         deterministic_decode_width: det_width,
+        paged_attention_kernel: opts.paged_attention_kernel,
         ..EngineConfig::default()
     };
     if model.monolithic_prefill_required() {
@@ -666,11 +672,11 @@ fn random_seed() -> u64 {
 pub fn spawn(
     model_dir: PathBuf,
     shared: Arc<Shared>,
-    cache: CacheOptions,
+    opts: EngineOptions,
 ) -> std::io::Result<Sender<Submission>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("kiln-engine".to_owned())
-        .spawn(move || engine_main(model_dir, shared, rx, cache))?;
+        .spawn(move || engine_main(model_dir, shared, rx, opts))?;
     Ok(tx)
 }

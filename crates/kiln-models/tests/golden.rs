@@ -227,24 +227,6 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
         model.model_type(),
         fixture_paths.len()
     );
-    // Production config except pool size: 256 blocks x 32 = 8192 token
-    // slots, ample for every fixture. The engine is reused across
-    // fixtures, exercising block recycling between requests.
-    let mut config = EngineConfig {
-        num_blocks: 256,
-        deterministic_decode_width: det_width,
-        ..EngineConfig::default()
-    };
-    if model.monolithic_prefill_required() {
-        // gemma2 softcapped attention / dense (unquantized) checkpoints:
-        // reference-shaped (single-tail) prefill only — the same override
-        // the worker applies at load (see kiln-worker engine_main and
-        // AnyModel::monolithic_prefill_required).
-        config.prefill_fine_chunk = config.prefill_chunk;
-    }
-    let mut engine =
-        Engine::new(&model, model.kv_dims(), config, Stream::gpu()).expect("engine builds");
-
     let fixtures: Vec<(String, Fixture, Vec<u32>)> = fixture_paths
         .iter()
         .map(|path| {
@@ -278,48 +260,87 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
         })
         .collect();
 
-    for (name, fixture, prompt_ids) in &fixtures {
-        let output = engine_generate(&mut engine, prompt_ids, fixture.max_tokens);
-        assert_eq!(
-            output,
-            fixture.expected_token_ids,
-            "greedy token divergence on fixture {model_name}/{name} \
-             (prompt tokens: {})",
-            prompt_ids.len()
-        );
-        eprintln!(
-            "golden {model_name}/{name}: {} prompt tokens, {} generated — exact match \
-             (batched/paged engine)",
-            prompt_ids.len(),
-            fixture.max_tokens
-        );
-    }
-
-    // Width-16 rounds: greedy fixtures are deterministic traffic, so the
-    // ADR 0002 B' sub-batched decode makes them bit-identical to
-    // single-stream at any admitted width. A divergence here with the
-    // sequential rounds green means the deterministic partition itself is
-    // broken (grouping, calibration, or replay), not kernel noise.
     let filler_prompt = tokenizer
         .encode("Pottery is one of the oldest human inventions", true)
         .expect("encodes");
-    for (name, fixture, prompt_ids) in &fixtures {
-        let output =
-            engine_generate_at_width16(&mut engine, prompt_ids, fixture.max_tokens, &filler_prompt);
-        assert_eq!(
-            output,
-            fixture.expected_token_ids,
-            "greedy divergence on fixture {model_name}/{name} at decode width 16 \
-             (prompt tokens: {}) — the ADR 0002 B' deterministic path must be \
-             bit-exact at every width",
-            prompt_ids.len()
-        );
-        eprintln!(
-            "golden {model_name}/{name}: {} prompt tokens, {} generated — exact match \
-             at decode width 16 (B' deterministic sub-batching)",
-            prompt_ids.len(),
-            fixture.max_tokens
-        );
+
+    // Both attention paths take the full round set: the gather path is the
+    // standing SPEC §11.2 bar; the paged-attention kernel rounds are the
+    // SPEC §12 Phase 7 acceptance ("golden parity exact under the kernel
+    // path, flag enabled, single-stream AND width-16"). The kernel is
+    // bit-identical to gather+SDPA by port construction (measured by
+    // kiln-engine's paged_attn probe), so a divergence ONLY here means
+    // that construction broke on this device — treat as a kernel-class
+    // finding (ADR 0002): characterize, don't weaken, stop.
+    for kernel in [false, true] {
+        let path = if kernel {
+            "paged-attention kernel"
+        } else {
+            "gather"
+        };
+        // Production config except pool size: 256 blocks x 32 = 8192 token
+        // slots, ample for every fixture. The engine is reused across
+        // fixtures, exercising block recycling between requests.
+        let mut config = EngineConfig {
+            num_blocks: 256,
+            deterministic_decode_width: det_width,
+            paged_attention_kernel: kernel,
+            ..EngineConfig::default()
+        };
+        if model.monolithic_prefill_required() {
+            // gemma2 softcapped attention / dense (unquantized) checkpoints:
+            // reference-shaped (single-tail) prefill only — the same override
+            // the worker applies at load (see kiln-worker engine_main and
+            // AnyModel::monolithic_prefill_required).
+            config.prefill_fine_chunk = config.prefill_chunk;
+        }
+        let mut engine =
+            Engine::new(&model, model.kv_dims(), config, Stream::gpu()).expect("engine builds");
+
+        for (name, fixture, prompt_ids) in &fixtures {
+            let output = engine_generate(&mut engine, prompt_ids, fixture.max_tokens);
+            assert_eq!(
+                output,
+                fixture.expected_token_ids,
+                "greedy token divergence on fixture {model_name}/{name} \
+                 (prompt tokens: {}, attention path: {path})",
+                prompt_ids.len()
+            );
+            eprintln!(
+                "golden {model_name}/{name}: {} prompt tokens, {} generated — exact match \
+                 (batched/paged engine, {path})",
+                prompt_ids.len(),
+                fixture.max_tokens
+            );
+        }
+
+        // Width-16 rounds: greedy fixtures are deterministic traffic, so the
+        // ADR 0002 B' sub-batched decode makes them bit-identical to
+        // single-stream at any admitted width. A divergence here with the
+        // sequential rounds green means the deterministic partition itself is
+        // broken (grouping, calibration, or replay), not kernel noise.
+        for (name, fixture, prompt_ids) in &fixtures {
+            let output = engine_generate_at_width16(
+                &mut engine,
+                prompt_ids,
+                fixture.max_tokens,
+                &filler_prompt,
+            );
+            assert_eq!(
+                output,
+                fixture.expected_token_ids,
+                "greedy divergence on fixture {model_name}/{name} at decode width 16 \
+                 (prompt tokens: {}, attention path: {path}) — the ADR 0002 B' \
+                 deterministic path must be bit-exact at every width",
+                prompt_ids.len()
+            );
+            eprintln!(
+                "golden {model_name}/{name}: {} prompt tokens, {} generated — exact match \
+                 at decode width 16 (B' deterministic sub-batching, {path})",
+                prompt_ids.len(),
+                fixture.max_tokens
+            );
+        }
     }
 }
 
