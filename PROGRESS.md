@@ -4121,3 +4121,22 @@
   ```
 - Next: Phase 7 part 3 — `POST /v1/messages` (Anthropic API adapter,
   thinking passthrough), then the paged-attention Metal kernel (SPEC §12).
+
+## [2026-07-13] Phase 7 / Task 2 — PR #16 merged: tool-call parsers CI-verified — DONE
+- PR #16 (tool-call streaming parsers) merged to main (f1c6b45) with all
+  four checks green on run 29273399967 — lint, compile-linux, test-macos,
+  test-macos-release. First CI execution, no re-runs needed.
+- Verified in the test-macos log (not assumed): the model-gated blocking
+  step ran `--test toolcall_fixtures` with the models present — the
+  decoder-fed replay (`fixtures_reassemble_from_streaming_decoder_segments`)
+  executed for ~13s (real run, not an env-less skip) and the
+  transformers render-parity test passed on the runner; the e2e suite
+  passed all 11 tool tests on BOTH stacks (`[python]` and `[rust]`:
+  non-stream, stream-reassembly equality, round trip, tool_choice
+  none/400) plus `test_hermes_tool_call_streaming` on the rust-worker
+  qwen3-0.6b stack. test-macos-release ran the fixture suite green in
+  release as well.
+- Next: Phase 7 part 3 — `POST /v1/messages` (Anthropic API adapter,
+  thinking passthrough as `thinking` content blocks), then the
+  paged-attention Metal kernel (SPEC §12). Stopped before them per
+  instruction.
