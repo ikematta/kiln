@@ -123,7 +123,7 @@ jobs:
           cargo test -p kiln-tokenize --test tokenizer --test detok --test toolcall_fixtures
           cargo test -p kiln-engine --test grammar
           cargo test -p kiln-models --test batching --test calibration \
-            --test leak --test leak_batched --test preemption \
+            --test draft --test leak --test leak_batched --test preemption \
             --test prefill_pad --test prefix_cache --test prefix_multiturn
           cargo test -p kiln-worker --test rpc --test grammar
       # PERMANENTLY advisory (ADR 0004): golden bit-exactness is a

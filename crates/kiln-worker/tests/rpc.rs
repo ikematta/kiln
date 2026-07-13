@@ -30,14 +30,22 @@ use kiln_proto::v1::{
 use tonic::transport::{Channel, Endpoint, Uri};
 
 const MODEL_NAME: &str = "llama-3.2-1b-4bit";
+/// Draft checkpoint for the SPEC §6.5 coexistence test (deliberately a
+/// cross-tokenizer pair with MODEL_NAME — Phase 8 part 1 proves loading,
+/// not drafting compatibility).
+const DRAFT_MODEL_NAME: &str = "qwen3-0.6b-4bit";
 /// Generous cap: model load on a cold CI runner dominates.
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Cap on any single stream read; real events arrive per decode step.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn model_dir() -> Option<PathBuf> {
+    named_model_dir(MODEL_NAME)
+}
+
+fn named_model_dir(name: &str) -> Option<PathBuf> {
     let root = std::env::var_os("KILN_TEST_MODELS")?;
-    let dir = PathBuf::from(root).join(MODEL_NAME);
+    let dir = PathBuf::from(root).join(name);
     dir.join("config.json").is_file().then_some(dir)
 }
 
@@ -161,6 +169,19 @@ async fn read_to_finished(stream: &mut EventStream) -> (Finished, usize) {
                 return (finished, chunks);
             }
             Some(token_event::Event::Tokens(_)) => chunks += 1,
+            Some(_) => {}
+            None => panic!("stream ended without a Finished event"),
+        }
+    }
+}
+
+/// Reads to the terminal `Finished`, collecting every streamed token id.
+async fn read_token_ids(stream: &mut EventStream) -> (Finished, Vec<u32>) {
+    let mut ids = Vec::new();
+    loop {
+        match next_event(stream).await {
+            Some(token_event::Event::Finished(finished)) => return (finished, ids),
+            Some(token_event::Event::Tokens(chunk)) => ids.extend(chunk.token_ids),
             Some(_) => {}
             None => panic!("stream ended without a Finished event"),
         }
@@ -542,4 +563,115 @@ async fn prefix_cache_stats_and_ssd_restart() {
         eprintln!("worker restart served the prefix from SSD: {hit:?}");
     }
     let _ = std::fs::remove_dir_all(&ssd_dir);
+}
+
+/// Phase 8 part 1 (SPEC §6.5): `--draft-model` loads a second model into
+/// the worker process. Over the frozen proto this must look like: the
+/// worker reaches READY, `MemoryReport.weights_bytes` grows by exactly
+/// the draft checkpoint's bytes (worker totals, SPEC §2.3 — the gateway
+/// budgets whole workers), CAPABILITY_SPECULATIVE stays un-advertised
+/// (no verify loop yet), and target greedy output is IDENTICAL to a
+/// draft-less worker on the same device (loading isolation).
+#[tokio::test(flavor = "multi_thread")]
+async fn draft_model_loads_alongside_target() {
+    use kiln_proto::v1::{Capability, InfoRequest};
+
+    if !kiln_mlx::memory::metal_is_available() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let (Some(model), Some(draft)) = (model_dir(), named_model_dir(DRAFT_MODEL_NAME)) else {
+        eprintln!("skipping: KILN_TEST_MODELS not set or {MODEL_NAME}/{DRAFT_MODEL_NAME} missing");
+        return;
+    };
+
+    /// `.safetensors` bytes — the `StaticInfo.weights_bytes` convention
+    /// both workers' reports are built from.
+    fn fs_weights_bytes(dir: &PathBuf) -> u64 {
+        std::fs::read_dir(dir)
+            .expect("model dir readable")
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".safetensors")
+                    .then(|| entry.metadata().ok().map(|meta| meta.len()))?
+            })
+            .sum()
+    }
+
+    // --- Baseline: no draft.
+    let (base_weights, base_tokens) = {
+        let worker = Worker::spawn(&model, "nodraft");
+        let mut client = worker.client_when_ready().await;
+        let health = client
+            .health(HealthRequest {})
+            .await
+            .expect("health ok")
+            .into_inner();
+        let memory = health.memory.expect("memory report");
+        assert_eq!(memory.weights_bytes, fs_weights_bytes(&model));
+        let mut stream = client
+            .submit(submission("nodraft-1", 24))
+            .await
+            .expect("submit ok")
+            .into_inner();
+        let (finished, tokens) = read_token_ids(&mut stream).await;
+        assert_eq!(finished.finish_reason(), FinishReason::Length);
+        (memory.weights_bytes, tokens)
+    };
+
+    // --- Same target with the draft loaded alongside.
+    let draft_arg = draft.display().to_string();
+    let worker = Worker::spawn_with(&model, "draft", &["--draft-model", &draft_arg]);
+    let mut client = worker.client_when_ready().await;
+
+    let info = client
+        .get_info(InfoRequest {})
+        .await
+        .expect("info ok")
+        .into_inner();
+    assert!(
+        !info
+            .capabilities
+            .contains(&(Capability::Speculative as i32)),
+        "SPECULATIVE must not be advertised before the verify loop exists: {:?}",
+        info.capabilities
+    );
+
+    let health = client
+        .health(HealthRequest {})
+        .await
+        .expect("health ok")
+        .into_inner();
+    assert_eq!(health.state(), WorkerState::Ready);
+    let memory = health.memory.expect("memory report");
+    assert_eq!(
+        memory.weights_bytes,
+        base_weights + fs_weights_bytes(&draft),
+        "weights_bytes must be the worker total: target + draft"
+    );
+    assert_eq!(
+        memory.kv_pool_allocated_bytes, 0,
+        "no pool (target or draft) is materialized before the first request"
+    );
+
+    let mut stream = client
+        .submit(submission("draft-1", 24))
+        .await
+        .expect("submit ok")
+        .into_inner();
+    let (finished, tokens) = read_token_ids(&mut stream).await;
+    assert_eq!(finished.finish_reason(), FinishReason::Length);
+    assert_eq!(
+        tokens, base_tokens,
+        "greedy output changed when the draft model was loaded alongside"
+    );
+    eprintln!(
+        "draft coexistence over RPC ok: weights {} -> {} bytes, {} identical tokens",
+        base_weights,
+        memory.weights_bytes,
+        tokens.len()
+    );
 }

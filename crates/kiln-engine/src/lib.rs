@@ -10,6 +10,8 @@
 
 pub mod block;
 #[cfg(feature = "metal")]
+pub mod drafter;
+#[cfg(feature = "metal")]
 pub mod engine;
 #[cfg(feature = "metal")]
 pub mod grammar;
@@ -25,6 +27,8 @@ pub mod ssd;
 pub mod step;
 
 pub use block::{AppendPlan, BlockError, BlockId, BlockManager, BlockTable, CowCopy, CowOutcome};
+#[cfg(feature = "metal")]
+pub use drafter::{DEFAULT_GAMMA, DEFAULT_SPEC_MAX_BATCH, DraftError, Drafter, DrafterMemory};
 #[cfg(feature = "metal")]
 pub use engine::{
     DEFAULT_BLOCK_SIZE, DEFAULT_DETERMINISTIC_DECODE_WIDTH, DEFAULT_MAX_BATCH_TOKENS,

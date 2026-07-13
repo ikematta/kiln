@@ -25,7 +25,7 @@ fn main() -> std::process::ExitCode {
 
     const USAGE: &str = "usage: kiln-worker --model <dir> --socket <path> [--model-id <id>] \
                          [--no-prefix-cache] [--ssd-dir <dir>] [--ssd-max-gb <n>] \
-                         [--paged-attention-kernel]";
+                         [--paged-attention-kernel] [--draft-model <dir>]";
 
     let mut model: Option<PathBuf> = None;
     let mut socket: Option<PathBuf> = None;
@@ -54,6 +54,11 @@ fn main() -> std::process::ExitCode {
             "--paged-attention-kernel" => {
                 opts.paged_attention_kernel = true;
                 Ok(())
+            }
+            // SPEC §6.5: draft model for speculative decoding (Phase 8),
+            // loaded alongside the target in this process.
+            "--draft-model" => {
+                value("--draft-model").map(|v| opts.draft_model = Some(PathBuf::from(v)))
             }
             other => Err(format!("unknown argument {other:?}")),
         };

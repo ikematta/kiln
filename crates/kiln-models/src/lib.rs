@@ -11,6 +11,8 @@
 
 pub mod config;
 #[cfg(feature = "metal")]
+pub mod draft;
+#[cfg(feature = "metal")]
 pub mod gemma2;
 #[cfg(feature = "metal")]
 pub mod gemma3;
@@ -35,6 +37,8 @@ pub use config::{
     ArchConfig, ConfigError, Gemma2Config, Gemma3Config, LlamaConfig, Quantization, Qwen2Config,
     Qwen3Config, RopeScaling, SUPPORTED_ARCHITECTURES,
 };
+#[cfg(feature = "metal")]
+pub use draft::{DraftLoadError, DraftModel, DraftPoolSpec};
 #[cfg(feature = "metal")]
 pub use gemma2::Gemma2Model;
 #[cfg(feature = "metal")]
