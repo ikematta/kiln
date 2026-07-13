@@ -4418,3 +4418,34 @@
   the dev machine; suggest observing the CI bit-probe lane on a few runs
   first); (2) nothing else — no DECISION NEEDED items.
 
+## [2026-07-13] Phase 7 / Task 4 — PR #18 merged: paged-attention kernel CI-verified — DONE
+- PR #18 (block-table-aware paged-attention Metal kernel, flag default
+  OFF) merged to main (314d490) with all four checks green on run
+  29289929704 — lint, compile-linux, test-macos, test-macos-release.
+- Verified in the run logs (not assumed):
+  - `kernel_output_is_bit_identical_to_gather_sdpa` EXECUTED (no
+    Metal-skip message in either lane) and PASSED in BOTH macOS lanes
+    (debug 22:30:45Z, release 22:30:11Z). This is the first
+    foreign-device datapoint for the offline-metallib-vs-runtime-JIT
+    codegen question: the runner's Xcode/driver pairing also produces
+    bit-identical kernel-vs-gather output. CI bit-probe green run #1.
+  - Advisory golden lane (permanently advisory per ADR 0004): gemma-2-2b
+    all 24 rounds exact (6 fixtures x {single-stream, width-16} x
+    {gather, kernel}); gemma-3-1b/chat-basic diverged on the GATHER path,
+    single-stream — the exact recorded ADR 0004 baseline (4-ULP fp16
+    kernel-class coin toss, cf. run 28753659372), on the path this PR
+    does not modify, aborting the remaining models' rounds as before.
+    NO pattern change accompanying this code change; nothing to
+    investigate. The dispatch-table unit tests also ran green both lanes.
+- PM ruling (2026-07-13, recorded verbatim in intent): the default stays
+  OFF at merge. The blocking bit-probe lane is the deliberate safety net:
+  each CI run on GitHub's runners is free continuous validation on a
+  device/compiler pairing different from the dev machine. Flip the
+  default only in a small DEDICATED follow-up commit after the probe has
+  stayed green across a handful of real CI runs. If the probe ever fires
+  on CI, that is the DECISION NEEDED it was built to surface — bring it
+  back for a ruling; never pre-emptively soften the gate.
+- Next: Phase 7 complete (7.1-7.4 + mlx_compile rider closed). SPEC §13.4
+  phase-gate review (PM: bench.sh + e2e on their hardware), then Phase 8 —
+  speculative decoding. Parked: the default-flip follow-up above, gated
+  on accumulated green CI bit-probe runs.
