@@ -4024,3 +4024,19 @@
 - Next: Phase 7 continues — tool-call streaming parsers (Hermes/Llama3/Qwen)
   in kiln-tokenize with unit fixtures (SPEC §12). Stopped before them per
   instruction.
+
+## [2026-07-13] Phase 7 / Task 1 — PR #15 merged: structured output CI-verified — DONE
+- PR #15 (llguidance structured output) merged to main (b00f8bb) with all
+  four checks green on run 29267386981 — lint 48s, compile-linux 47s,
+  test-macos 16m43s, test-macos-release 4m59s. First CI execution, no
+  re-runs needed.
+- Verified in the test-macos log (not assumed): the model-gated blocking
+  step ran both new suites — `grammar_constrained_decoding` passed on the
+  shared runner in ~40s (16:50:13 → 16:50:52), kiln-engine's host-level
+  grammar tests passed — and the e2e structured-output tests passed on
+  both stacks (`[rust]`: schema-valid + streaming + json_object;
+  `[python]`: the 400 capability gate; `test_grammar_is_unsupported`
+  intact in the python worker suite). The workspace (env-less) lanes ran
+  the grammar test binaries as skips, as designed.
+- Next: Phase 7 continues — tool-call streaming parsers (Hermes/Llama3/
+  Qwen) in kiln-tokenize with unit fixtures (SPEC §12).
