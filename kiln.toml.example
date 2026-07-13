@@ -33,6 +33,10 @@ prefill_chunk = 2048
 block_size = 32          # tokens per KV block; must be a power of two
 ssd_cache_max_gb = 64
 ssd_tier = true
+# Block-table-aware paged-attention Metal kernel for decode steps (SPEC
+# §7.4, rust workers only). Opt-in: leave off unless the kernel's parity
+# and throughput bars are proven for your device (docs/decisions/, Phase 7).
+paged_attention_kernel = false
 
 # One [[model]] block per servable model.
 [[model]]

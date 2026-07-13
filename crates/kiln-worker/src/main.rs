@@ -24,12 +24,13 @@ fn main() -> std::process::ExitCode {
         .init();
 
     const USAGE: &str = "usage: kiln-worker --model <dir> --socket <path> [--model-id <id>] \
-                         [--no-prefix-cache] [--ssd-dir <dir>] [--ssd-max-gb <n>]";
+                         [--no-prefix-cache] [--ssd-dir <dir>] [--ssd-max-gb <n>] \
+                         [--paged-attention-kernel]";
 
     let mut model: Option<PathBuf> = None;
     let mut socket: Option<PathBuf> = None;
     let mut model_id: Option<String> = None;
-    let mut cache = engine::CacheOptions::default();
+    let mut opts = engine::EngineOptions::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -39,15 +40,21 @@ fn main() -> std::process::ExitCode {
             "--model-id" => value("--model-id").map(|v| model_id = Some(v)),
             // SPEC §10 [defaults]: prefix cache + SSD tier config flags.
             "--no-prefix-cache" => {
-                cache.prefix_cache = false;
+                opts.prefix_cache = false;
                 Ok(())
             }
-            "--ssd-dir" => value("--ssd-dir").map(|v| cache.ssd_dir = Some(PathBuf::from(v))),
+            "--ssd-dir" => value("--ssd-dir").map(|v| opts.ssd_dir = Some(PathBuf::from(v))),
             "--ssd-max-gb" => value("--ssd-max-gb").and_then(|v| {
                 v.parse::<u64>()
-                    .map(|gb| cache.ssd_max_bytes = gb << 30)
+                    .map(|gb| opts.ssd_max_bytes = gb << 30)
                     .map_err(|_| format!("--ssd-max-gb needs an integer, got {v:?}"))
             }),
+            // SPEC §7.4: block-table-aware attention kernel (Phase 7),
+            // opt-in — the gather path stays the default.
+            "--paged-attention-kernel" => {
+                opts.paged_attention_kernel = true;
+                Ok(())
+            }
             other => Err(format!("unknown argument {other:?}")),
         };
         if let Err(err) = result {
@@ -67,7 +74,7 @@ fn main() -> std::process::ExitCode {
             .unwrap_or_else(|| "unknown".to_owned())
     });
 
-    match run(model, socket, model_id, cache) {
+    match run(model, socket, model_id, opts) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("kiln-worker: {err}");
@@ -81,7 +88,7 @@ fn run(
     model: std::path::PathBuf,
     socket: std::path::PathBuf,
     model_id: String,
-    cache: engine::CacheOptions,
+    opts: engine::EngineOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
 
@@ -102,8 +109,8 @@ fn run(
     tracing::info!(model = %model_id, path = %model.display(),
         dtype = %info.dtype, "starting worker");
 
-    let shared = Arc::new(engine::Shared::new(model_id, info, &cache));
-    let submissions = engine::spawn(model.clone(), Arc::clone(&shared), cache)?;
+    let shared = Arc::new(engine::Shared::new(model_id, info, &opts));
+    let submissions = engine::spawn(model.clone(), Arc::clone(&shared), opts)?;
     let service = service::WorkerService::new(shared, submissions);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -399,14 +399,21 @@ pub(crate) struct VectorArray {
 }
 
 impl VectorArray {
+    /// New empty vector for use as an mlx-c output parameter.
     #[allow(unsafe_code)]
-    pub(crate) fn from_arrays(arrays: &[&Array]) -> Result<Self, MlxError> {
+    pub(crate) fn new_handle() -> Self {
         crate::init();
         debug::track_new();
         // SAFETY: constructor with no preconditions; freed in Drop.
-        let raw = unsafe { sys::mlx_vector_array_new() };
-        let vec = Self { raw };
+        Self {
+            raw: unsafe { sys::mlx_vector_array_new() },
+        }
+    }
+
+    pub(crate) fn from_arrays(arrays: &[&Array]) -> Result<Self, MlxError> {
+        let vec = Self::new_handle();
         for arr in arrays {
+            #[allow(unsafe_code)]
             // SAFETY: vector and array handles are live; append copies the
             // (refcounted) array handle into the vector.
             check(unsafe { sys::mlx_vector_array_append_value(vec.raw, arr.raw()) })?;
@@ -414,8 +421,30 @@ impl VectorArray {
         Ok(vec)
     }
 
+    pub(crate) fn len(&self) -> usize {
+        #[allow(unsafe_code)]
+        // SAFETY: live handle.
+        unsafe {
+            sys::mlx_vector_array_size(self.raw)
+        }
+    }
+
+    /// Extracts element `idx` as a new owning [`Array`] handle.
+    #[allow(unsafe_code)]
+    pub(crate) fn get(&self, idx: usize) -> Result<Array, MlxError> {
+        let mut out = Array::new_handle();
+        // SAFETY: live handles; `get` re-points `out` at the refcounted
+        // element (bounds-checked by mlx-c, non-zero status on error).
+        check(unsafe { sys::mlx_vector_array_get(out.raw_out(), self.raw, idx) })?;
+        Ok(out)
+    }
+
     pub(crate) fn raw(&self) -> sys::mlx_vector_array {
         self.raw
+    }
+
+    pub(crate) fn raw_out(&mut self) -> *mut sys::mlx_vector_array {
+        &mut self.raw
     }
 }
 

@@ -15,6 +15,8 @@ pub mod engine;
 pub mod grammar;
 #[cfg(feature = "metal")]
 pub mod paged;
+#[cfg(feature = "metal")]
+pub mod paged_attn;
 pub mod radix;
 #[cfg(feature = "metal")]
 pub mod sampler;
@@ -34,6 +36,8 @@ pub use engine::{
 pub use grammar::{Grammar, GrammarEnv, GrammarError};
 #[cfg(feature = "metal")]
 pub use paged::{KvSpec, PagedKv, WriteRun};
+#[cfg(feature = "metal")]
+pub use paged_attn::PagedAttnInputs;
 pub use radix::{ChainHash, RadixCache};
 #[cfg(feature = "metal")]
 pub use sampler::{PenaltyOptions, Sampler, SamplingOptions, apply_penalties};

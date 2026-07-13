@@ -23,6 +23,7 @@
 use kiln_mlx::{Array, Dtype, MlxError, Stream, ops};
 
 use crate::block::{BlockId, CowCopy};
+use crate::paged_attn::{PagedAttn, PagedAttnInputs};
 
 /// Static dimensions of one paged pool set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,17 +64,64 @@ pub struct PagedKv {
     /// `(keys, values)` per layer; `None` until the first write fixes the
     /// dtype (the model's activation dtype, known only at runtime).
     pools: Vec<Option<(Array, Array)>>,
+    /// Custom block-table-aware attention kernels (SPEC §7.4 Phase 7),
+    /// present iff the config flag enabled them. `None` = gather path only.
+    attn: Option<PagedAttn>,
 }
 
 impl PagedKv {
     pub fn new(spec: KvSpec) -> Self {
         let mut pools = Vec::with_capacity(spec.layers);
         pools.resize_with(spec.layers, || None);
-        Self { spec, pools }
+        Self {
+            spec,
+            pools,
+            attn: None,
+        }
     }
 
     pub fn spec(&self) -> &KvSpec {
         &self.spec
+    }
+
+    /// Builds the custom paged-attention kernels (SPEC §7.4 flag ON). The
+    /// gather path stays available; models route decode-shaped steps here
+    /// via [`Self::paged_sdpa`] only when this succeeded.
+    pub fn enable_attention_kernel(&mut self) -> Result<(), MlxError> {
+        if self.attn.is_none() {
+            self.attn = Some(PagedAttn::new()?);
+        }
+        Ok(())
+    }
+
+    pub fn attention_kernel_enabled(&self) -> bool {
+        self.attn.is_some()
+    }
+
+    /// Block-table-aware decode attention over this sequence's pooled
+    /// history: `q` `[1, H, 1, D]` (post-RoPE, this step's K/V already
+    /// written), output `[1, H, 1, D]` — same contract as gathering
+    /// `inputs.context_len` tokens and calling fused SDPA, without the
+    /// copy. Callers gate on [`Self::attention_kernel_enabled`].
+    pub fn paged_sdpa(
+        &self,
+        layer: usize,
+        q: &Array,
+        inputs: &PagedAttnInputs,
+        scale: &Array,
+        s: &Stream,
+    ) -> Result<Array, MlxError> {
+        let attn = self.attn.as_ref().ok_or_else(|| MlxError {
+            message: "paged_sdpa called with the attention kernel disabled".to_owned(),
+        })?;
+        let (k_pool, v_pool) = self
+            .pools
+            .get(layer)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| MlxError {
+                message: format!("paged sdpa on unwritten layer {layer}"),
+            })?;
+        attn.sdpa(&self.spec, k_pool, v_pool, q, inputs, scale, s)
     }
 
     /// Writes one step segment's post-RoPE `keys`/`values`

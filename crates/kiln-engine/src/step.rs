@@ -7,6 +7,7 @@ use kiln_mlx::{Array, MlxError, Stream};
 
 use crate::block::BlockId;
 use crate::paged::{PagedKv, WriteRun};
+use crate::paged_attn::PagedAttnInputs;
 
 /// One sequence's contribution to a step.
 #[derive(Debug)]
@@ -24,6 +25,12 @@ pub struct SeqStep {
     pub blocks: Vec<BlockId>,
     /// Where this step's K/V rows land in the pools.
     pub writes: Vec<WriteRun>,
+    /// Prepared inputs for the block-table-aware attention kernel (SPEC
+    /// §7.4 Phase 7). `Some` only when the engine's kernel flag is on AND
+    /// the segment is decode-shaped (`len == 1`); models take the
+    /// [`PagedKv::paged_sdpa`] route iff this is set and the step carries
+    /// no pad rows and the architecture uses fused SDPA (no softcap).
+    pub paged_attn: Option<PagedAttnInputs>,
 }
 
 /// The step's input tokens: host-known ids on the synchronous path, or a

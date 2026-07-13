@@ -66,6 +66,7 @@ use thiserror::Error;
 use crate::block::{BlockError, BlockId, BlockManager, BlockTable};
 use crate::grammar::Grammar;
 use crate::paged::{KvSpec, PagedKv, WriteRun};
+use crate::paged_attn::PagedAttnInputs;
 use crate::radix::{ChainHash, ROOT, RadixCache};
 use crate::sampler::{PenaltyOptions, Sampler, SamplingOptions, apply_penalties, neg_inf_like};
 use crate::ssd::{SlabGeometry, SsdStore};
@@ -184,6 +185,11 @@ pub struct EngineConfig {
     /// see [`DEFAULT_DETERMINISTIC_DECODE_WIDTH`]. Non-deterministic rows
     /// always ride one unrestricted full-width forward.
     pub deterministic_decode_width: usize,
+    /// Custom block-table-aware paged-attention kernel for decode steps
+    /// (SPEC §7.4 Phase 7). OFF by default: the gather path is the
+    /// correctness reference; this flag stays opt-in until the kernel's
+    /// parity and throughput bars are proven on the serving device.
+    pub paged_attention_kernel: bool,
 }
 
 impl Default for EngineConfig {
@@ -197,6 +203,7 @@ impl Default for EngineConfig {
             prefix_cache: true,
             ssd: None,
             deterministic_decode_width: DEFAULT_DETERMINISTIC_DECODE_WIDTH,
+            paged_attention_kernel: false,
         }
     }
 }
@@ -824,13 +831,16 @@ impl<M: StepModel> Engine<M> {
                 ))
             })?;
         let mgr = BlockManager::new(config.num_blocks, config.block_size)?;
-        let kv = PagedKv::new(KvSpec {
+        let mut kv = PagedKv::new(KvSpec {
             layers: dims.layers,
             kv_heads: dims.kv_heads,
             head_dim: dims.head_dim,
             num_blocks: config.num_blocks,
             block_size: config.block_size,
         });
+        if config.paged_attention_kernel {
+            kv.enable_attention_kernel()?;
+        }
         let mut ssd_error = None;
         let cache = config.prefix_cache.then(|| {
             let material = config
@@ -2171,12 +2181,28 @@ fn build_seq_step(
         });
         pos += run;
     }
+    // Kernel-path inputs (SPEC §7.4): decode-shaped segments only. Built
+    // here — once per sequence per step — so every layer's attention call
+    // shares the same block-table/length arrays. A `len == 1` ragged
+    // PREFILL piece may also land here; if the planner later pads it
+    // (ADR 0002), the model's `pad == 0` gate skips the kernel route and
+    // these inputs go unused, which is correct (padded pieces must run the
+    // reference's padded-SDPA class).
+    let paged_attn = if kv.attention_kernel_enabled() && len == 1 {
+        Some(PagedAttnInputs::build(
+            seq.table.blocks().iter().map(|b| b.index() as u32),
+            offset as i32 + 1,
+        )?)
+    } else {
+        None
+    };
     Ok(Some(SeqStep {
         len: len as i32,
         offset: offset as i32,
         sample,
         blocks: seq.table.blocks().to_vec(),
         writes,
+        paged_attn,
     }))
 }
 

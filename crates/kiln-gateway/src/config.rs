@@ -89,6 +89,12 @@ pub struct EngineDefaults {
     pub ssd_cache_max_gb: u64,
     #[serde(default = "defaults::ssd_tier")]
     pub ssd_tier: bool,
+    /// Custom block-table-aware paged-attention kernel for decode steps
+    /// (SPEC §7.4 Phase 7). Opt-in: the gather path is the default until
+    /// the kernel's parity/throughput bars are proven on the serving
+    /// device. Rust workers only.
+    #[serde(default = "defaults::paged_attention_kernel")]
+    pub paged_attention_kernel: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -264,6 +270,7 @@ impl Default for EngineDefaults {
             block_size: defaults::block_size(),
             ssd_cache_max_gb: defaults::ssd_cache_max_gb(),
             ssd_tier: defaults::ssd_tier(),
+            paged_attention_kernel: defaults::paged_attention_kernel(),
         }
     }
 }
@@ -326,6 +333,9 @@ mod defaults {
     }
     pub(super) fn ssd_tier() -> bool {
         true
+    }
+    pub(super) fn paged_attention_kernel() -> bool {
+        false
     }
     pub(super) fn gamma() -> u32 {
         4
