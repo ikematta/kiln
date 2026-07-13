@@ -4040,3 +4040,84 @@
   the grammar test binaries as skips, as designed.
 - Next: Phase 7 continues — tool-call streaming parsers (Hermes/Llama3/
   Qwen) in kiln-tokenize with unit fixtures (SPEC §12).
+
+## [2026-07-13] Phase 7 / Task 2 — tool-call streaming parsers (Hermes/Llama/Qwen-XML) — DONE
+- What: SPEC §8.2 tool-call extraction. New `kiln-tokenize/src/toolcall.rs`:
+  three streaming parsers behind one `ToolCallParser` (events: Content /
+  CallStart / CallArgs / CallEnd) — Hermes `<tool_call>{json}</tool_call>`
+  (Qwen 2.5/3), Llama 3.x (optional `<|python_tag|>` + bare JSON,
+  `;`-separated multi-call, and the `{"type":"function","function":{...}}`
+  wrapper real Llama-3.2 output mirrors back), Qwen3-Coder XML-ish
+  (`<function=`/`<parameter=`, values coerced via the request's tool
+  schemas). Format selected from model metadata: `ToolCallFormat::detect`
+  over the chat template source (`<function=` → XML, `<tool_call>` →
+  Hermes, `Environment: ipython`/`<|python_tag|>` → Llama), exposed as
+  `ChatTemplate::tool_call_format()`. Parsers consume the StreamingDecoder
+  text stream; argument bytes stream verbatim (never re-serialized).
+  Gateway: `tools`/`tool_choice` (`auto`/`none`; forced choice is a clear
+  400), assistant `tool_calls` + `tool` role messages render through the
+  template (`ChatMessage.tool_calls`, `render_with_tools`); parser output
+  becomes OpenAI `tool_calls` deltas (stream) / `message.tool_calls`
+  (non-stream), `finish_reason: "tool_calls"`, ids `call_<uuidv7>`.
+  Fixtures: scripts/gen-tool-fixtures.py captures REAL greedy completions
+  from the pinned models (llama-3.2-1b, qwen3-0.6b — 11 generation
+  fixtures incl. `<think>` + call, two-call, multibyte args, python-tag
+  call, post-tool-result turns) plus template-derived serializations for
+  formats no pinned model emits (Qwen3-Coder XML from the official
+  template; Llama bare-JSON) → crates/kiln-tokenize/tests/fixtures/toolcall/.
+  Tests: toolcall unit tests (18) + fixture suite — chunk-split invariance
+  (whole vs 1/2/3/5/11-char chunks), token-level replay through the real
+  StreamingDecoder (1/2/3 tokens per chunk), and byte-for-byte prompt
+  render parity vs the captured transformers rendering. e2e
+  test_tool_calls.py: openai SDK round trip on BOTH worker kinds (llama
+  stack ×2) + a rust-worker qwen3 stack for Hermes; streaming deltas must
+  reassemble to exactly the non-streaming response. ci.yml model-gated
+  blocking step now also runs `--test toolcall_fixtures`. test_chat.py's
+  validation-shape probe swapped its obsolete premise (tools 400'd in
+  Phase 2) for a still-unsupported feature (`tool_choice: "required"`) —
+  same guarantee under test, current feature set.
+- Decisions: parser events are gateway-agnostic (kiln-tokenize stays
+  HTTP-free). Text runs outside calls: whitespace-only runs dropped,
+  substantive runs verbatim (keeps inter-call `\n` separators out of
+  content without eating think-blocks). Malformed blocks degrade — before
+  the name is known the block replays as content; after (CallStart already
+  emitted) the call closes with what streamed; truncation (length) flushes
+  partial arguments then CallEnd, mirroring OpenAI under
+  `finish_reason: "length"`. Real capture drove two shape extensions the
+  docs don't mention: Llama-3.2 emits `<|python_tag|>` for CUSTOM tools
+  under the default template (the "JSON format" docs imply bare JSON), and
+  after a tool result it mirrors the OpenAI wrapper shape back — both are
+  committed fixtures. Qwen XML values coerce by declared schema type
+  (template serializes Python-style `True`; reference parser behavior),
+  unknown params fall back to JSON-parse-else-string. Feature flags
+  `preserve_order` on serde_json + minijinja (no new crates; indexmap was
+  already in the graph): tool JSON renders into the PROMPT, so key order
+  is model-visible; with a Kiln-owned Python-style `tojson` filter
+  (json.dumps separators/indent semantics) our render is byte-identical
+  to the transformers reference — asserted per fixture. `tool_choice`
+  forcing ("required"/named) deliberately 400s: honest forcing needs
+  grammar-coupled decoding (natural later marriage with llguidance).
+- Deviations: none.
+- Acceptance:
+  ```
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-tokenize
+  lib 31 passed (18 toolcall unit incl. chunk-split invariance on edge inputs)
+  toolcall_fixtures 3 passed: 16 fixtures x {whole, 1/2/3/5/11-char chunks};
+    11 generation fixtures x token-level replay through StreamingDecoder
+    (1/2/3 ids per chunk); prompt render parity vs transformers byte-for-byte
+  detok/model_dir/tokenizer suites unchanged, green
+  $ KILN_TEST_MODELS=... cargo test --workspace  -> 23 targets, exit 0
+    (incl. golden: exact match every fixture — preserve_order + the
+     python-style tojson filter perturb nothing outside tool rendering)
+  $ cargo build/clippy --workspace --no-default-features -> clean (linux shape)
+  $ cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ ruff check / format --check python/ tests/e2e -> clean
+  $ pytest python/kiln_worker_py/tests -> 35 passed
+  $ uv run --project tests/e2e pytest tests/e2e -> 53 passed, 2 skipped
+    (test_tool_calls.py: 11 new — non-stream + stream-reassembly + round
+     trip + tool_choice none/required on BOTH worker kinds vs llama-3.2-1b;
+     Hermes via a rust-worker qwen3-0.6b stack, think-block as content;
+     2 skips = pre-existing rust-only structured-output tests on python stack)
+  ```
+- Next: Phase 7 part 3 — `POST /v1/messages` (Anthropic API adapter,
+  thinking passthrough), then the paged-attention Metal kernel (SPEC §12).

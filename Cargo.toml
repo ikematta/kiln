@@ -38,14 +38,20 @@ thiserror = "2"
 # templates rely on; chrono backs the strftime_now() template function;
 # serde_json parses tokenizer_config.json; sha2 computes the template hash
 # compared against WorkerInfo.chat_template_hash.
-minijinja = { version = "2", features = ["json"] }
+# preserve_order (here and on serde_json below) keeps JSON object keys in
+# insertion order end-to-end: tool definitions render into the PROMPT
+# (`tools | tojson`), so key order is model-visible and must match the
+# client's JSON and the HF reference rendering (parity-tested against
+# transformers in kiln-tokenize/tests/toolcall_fixtures.rs). Pulls indexmap
+# (BSD/MIT, already ubiquitous) transitively.
+minijinja = { version = "2", features = ["json", "preserve_order"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 # Gateway-side tokenization for Rust workers (SPEC §3): loads the model's
 # tokenizer.json; HF's Rust crate — the same library lineage the Python
 # worker's tokenizer wraps, so token ids agree across workers. Apache-2.0.
 tokenizers = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 # Gateway (SPEC §3, §8): axum/tower/tokio HTTP+async stack, hyper-util for the
 # tokio<->hyper IO bridge in the UDS gRPC connector, tracing(+subscriber) for

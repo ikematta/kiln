@@ -264,10 +264,7 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
             let prompt_ids = if fixture.chat_template {
                 let rendered = template
                     .render_with(
-                        &[ChatMessage {
-                            role: "user".into(),
-                            content: fixture.prompt.clone(),
-                        }],
+                        &[ChatMessage::text("user", fixture.prompt.clone())],
                         true,
                         &[("date_string", Value::from(PINNED_DATE_STRING))],
                     )

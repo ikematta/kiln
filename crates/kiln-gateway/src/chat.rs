@@ -48,7 +48,7 @@ use kiln_proto::v1::{
     CancelRequest, FinishReason, Finished, Priority, StoppingParams, SubmitRequest, TokenChunk,
     TokenEvent, TokenIds, TokenizeRequest, submit_request, token_event,
 };
-use kiln_tokenize::{StopStringMatcher, StreamingDecoder};
+use kiln_tokenize::{StopStringMatcher, StreamingDecoder, ToolCallParser, ToolEvent};
 use tonic::Streaming;
 use tonic::transport::Channel;
 
@@ -56,7 +56,8 @@ use crate::app::{AppState, RequestId};
 use crate::error::ApiError;
 use crate::openai::{
     AssistantMessage, ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, Choice,
-    ChunkChoice, Delta, Usage, ValidatedChat,
+    ChunkChoice, Delta, DeltaFunction, DeltaToolCall, ResponseFunction, ResponseToolCall, Usage,
+    ValidatedChat,
 };
 use crate::registry::{ModelEntry, WorkerStatus};
 
@@ -163,6 +164,24 @@ async fn handle(
 
     let mut validated = request.validate()?;
     let prompt = render_prompt(&entry, &validated)?;
+    // Tool-call parsing (SPEC §8.2): the family format comes from the
+    // model's own chat template; a model without a known format cannot
+    // honor `tools`, so reject up front rather than stream raw markers.
+    let tool_parser = if validated.tools.is_empty() {
+        None
+    } else {
+        let format = entry
+            .template
+            .as_ref()
+            .and_then(|template| template.tool_call_format())
+            .ok_or_else(|| {
+                ApiError::invalid_request(format!(
+                    "model '{}' has no known tool-call format; 'tools' is not supported for it",
+                    entry.id
+                ))
+            })?;
+        Some(ToolCallParser::new(format, &validated.tools))
+    };
 
     let mut client = WorkerClient::new(entry.channel.clone());
     // BOS contract (kiln-tokenize crate docs): the rendered template already
@@ -240,10 +259,11 @@ async fn handle(
             ctx,
             events,
             pipeline,
+            tool_parser,
             validated.include_usage,
         ))
     } else {
-        collect_response(ctx, events, pipeline)
+        collect_response(ctx, events, pipeline, tool_parser)
             .await
             .map(IntoResponse::into_response)
     }
@@ -373,8 +393,114 @@ fn render_prompt(entry: &ModelEntry, validated: &ValidatedChat) -> Result<String
         ))
     })?;
     template
-        .render(&validated.messages, true)
+        .render_with_tools(&validated.messages, true, &validated.tools)
         .map_err(|err| ApiError::invalid_request(format!("chat template rejected messages: {err}")))
+}
+
+// ---------------------------------------------------------------------------
+// Tool-call assembly (shared by the streaming and non-streaming paths)
+// ---------------------------------------------------------------------------
+
+/// Routes the text pipeline's output through the tool-call parser when the
+/// request has tools, or passes it through as plain content otherwise.
+struct ToolRoute {
+    parser: Option<ToolCallParser>,
+    /// Calls whose arguments finished cleanly — drives the
+    /// `finish_reason: "tool_calls"` upgrade.
+    calls_completed: usize,
+}
+
+impl ToolRoute {
+    fn new(parser: Option<ToolCallParser>) -> Self {
+        Self {
+            parser,
+            calls_completed: 0,
+        }
+    }
+
+    fn push(&mut self, text: String) -> Vec<ToolEvent> {
+        match &mut self.parser {
+            None if text.is_empty() => Vec::new(),
+            None => vec![ToolEvent::Content(text)],
+            Some(parser) => {
+                let events = parser.push(&text);
+                self.count(&events);
+                events
+            }
+        }
+    }
+
+    /// End-of-stream: the pipeline's tail plus the parser's flush.
+    fn finish(&mut self, tail: String) -> Vec<ToolEvent> {
+        match &mut self.parser {
+            None if tail.is_empty() => Vec::new(),
+            None => vec![ToolEvent::Content(tail)],
+            Some(parser) => {
+                let mut events = parser.push(&tail);
+                events.extend(parser.finish());
+                self.count(&events);
+                events
+            }
+        }
+    }
+
+    fn count(&mut self, events: &[ToolEvent]) {
+        self.calls_completed += events
+            .iter()
+            .filter(|e| matches!(e, ToolEvent::CallEnd { .. }))
+            .count();
+    }
+
+    /// OpenAI reports a completion that ended by emitting tool calls as
+    /// `finish_reason: "tool_calls"`; a truncated one stays `"length"`.
+    fn adjust_reason(&self, reason: &'static str) -> &'static str {
+        if self.calls_completed > 0 && reason == "stop" {
+            "tool_calls"
+        } else {
+            reason
+        }
+    }
+}
+
+fn new_call_id() -> String {
+    // v7 like the request ids (the uuid feature already enabled); clients
+    // only require uniqueness.
+    format!("call_{}", uuid::Uuid::now_v7().simple())
+}
+
+/// One tool event → one SSE delta (`CallEnd` has no OpenAI representation).
+fn tool_event_delta(event: ToolEvent) -> Option<Delta> {
+    match event {
+        ToolEvent::Content(text) => Some(Delta {
+            content: Some(text),
+            ..Delta::default()
+        }),
+        ToolEvent::CallStart { index, name } => Some(Delta {
+            tool_calls: Some(vec![DeltaToolCall {
+                index,
+                id: Some(new_call_id()),
+                call_type: Some("function"),
+                function: DeltaFunction {
+                    name: Some(name),
+                    arguments: String::new(),
+                },
+            }]),
+            ..Delta::default()
+        }),
+        ToolEvent::CallArgs { index, delta } => Some(Delta {
+            tool_calls: Some(vec![DeltaToolCall {
+                index,
+                id: None,
+                call_type: None,
+                function: DeltaFunction {
+                    name: None,
+                    arguments: delta,
+                },
+            }]),
+            ..Delta::default()
+        }),
+        ToolEvent::CallEnd { .. } => None,
+    }
 }
 
 /// Per-request context shared by the chat and text-completions handlers:
@@ -482,14 +608,29 @@ async fn collect_response(
     ctx: CompletionCtx,
     mut events: Streaming<TokenEvent>,
     mut pipeline: TextPipeline,
+    tool_parser: Option<ToolCallParser>,
 ) -> Result<axum::Json<ChatCompletion>, ApiError> {
+    let mut route = ToolRoute::new(tool_parser);
     let mut content = String::new();
+    // (name, arguments) per call, in emission order.
+    let mut calls: Vec<(String, String)> = Vec::new();
+    let apply = |events: Vec<ToolEvent>, content: &mut String, calls: &mut Vec<_>| {
+        for event in events {
+            match event {
+                ToolEvent::Content(text) => content.push_str(&text),
+                ToolEvent::CallStart { name, .. } => calls.push((name, String::new())),
+                ToolEvent::CallArgs { index, delta } => calls[index].1.push_str(&delta),
+                ToolEvent::CallEnd { .. } => {}
+            }
+        }
+    };
     let end = loop {
         match events.message().await {
             Ok(Some(event)) => match event.event {
                 Some(token_event::Event::Tokens(chunk)) => {
                     let was_matched = pipeline.stop_matched();
-                    content.push_str(&pipeline.push(chunk)?);
+                    let text = pipeline.push(chunk)?;
+                    apply(route.push(text), &mut content, &mut calls);
                     if !was_matched && pipeline.stop_matched() {
                         // Drain until Finished afterwards: prompt_tokens and
                         // timings come from it (completion_tokens is
@@ -498,7 +639,8 @@ async fn collect_response(
                     }
                 }
                 Some(token_event::Event::Finished(mut finished)) => {
-                    content.push_str(&pipeline.finish()?);
+                    let tail = pipeline.finish()?;
+                    apply(route.finish(tail), &mut content, &mut calls);
                     pipeline.apply_usage(&mut finished);
                     break classify_finished(finished, pipeline.stop_matched());
                 }
@@ -521,6 +663,21 @@ async fn collect_response(
             finish_reason,
         } => {
             ctx.record_ok(&finished);
+            let tool_calls = (!calls.is_empty()).then(|| {
+                calls
+                    .into_iter()
+                    .map(|(name, arguments)| ResponseToolCall {
+                        id: new_call_id(),
+                        call_type: "function",
+                        function: ResponseFunction { name, arguments },
+                    })
+                    .collect::<Vec<_>>()
+            });
+            // OpenAI shape: `content` is null on a tool-calls-only turn.
+            let content = match &tool_calls {
+                Some(_) if content.is_empty() => None,
+                _ => Some(content),
+            };
             Ok(axum::Json(ChatCompletion {
                 id: ctx.completion_id.clone(),
                 object: "chat.completion",
@@ -531,9 +688,10 @@ async fn collect_response(
                     message: AssistantMessage {
                         role: "assistant",
                         content,
+                        tool_calls,
                     },
                     logprobs: None,
-                    finish_reason,
+                    finish_reason: route.adjust_reason(finish_reason),
                 }],
                 usage: usage_of(&finished),
             }))
@@ -549,11 +707,13 @@ fn stream_response(
     ctx: CompletionCtx,
     mut events: Streaming<TokenEvent>,
     mut pipeline: TextPipeline,
+    tool_parser: Option<ToolCallParser>,
     include_usage: bool,
 ) -> Response {
     // With include_usage, data chunks carry `"usage": null` and a final
     // chunk carries the usage object (OpenAI semantics).
     let usage_null: Option<Option<Usage>> = if include_usage { Some(None) } else { None };
+    let mut route = ToolRoute::new(tool_parser);
 
     let stream = async_stream::stream! {
         let chunk = |choices: Vec<ChunkChoice>, usage: Option<Option<Usage>>| ChatCompletionChunk {
@@ -564,15 +724,19 @@ fn stream_response(
             choices,
             usage,
         };
-
-        // Role preamble chunk.
-        yield Ok::<SseEvent, Infallible>(sse_json(&chunk(
+        let delta_chunk = |delta: Delta, usage: Option<Option<Usage>>| chunk(
             vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: Some("assistant"), content: Some(String::new()) },
+                delta,
                 logprobs: None,
                 finish_reason: None,
             }],
+            usage,
+        );
+
+        // Role preamble chunk.
+        yield Ok::<SseEvent, Infallible>(sse_json(&delta_chunk(
+            Delta { role: Some("assistant"), content: Some(String::new()), tool_calls: None },
             usage_null,
         )));
 
@@ -594,33 +758,22 @@ fn stream_response(
                         if !was_matched && pipeline.stop_matched() {
                             ctx.cancel_worker().await;
                         }
-                        if !text.is_empty() {
-                            yield Ok(sse_json(&chunk(
-                                vec![ChunkChoice {
-                                    index: 0,
-                                    delta: Delta { role: None, content: Some(text) },
-                                    logprobs: None,
-                                    finish_reason: None,
-                                }],
-                                usage_null,
-                            )));
+                        for event in route.push(text) {
+                            if let Some(delta) = tool_event_delta(event) {
+                                yield Ok(sse_json(&delta_chunk(delta, usage_null)));
+                            }
                         }
                         continue;
                     }
                     Some(token_event::Event::Finished(mut finished)) => {
                         match pipeline.finish() {
-                            Ok(tail) if !tail.is_empty() => {
-                                yield Ok(sse_json(&chunk(
-                                    vec![ChunkChoice {
-                                        index: 0,
-                                        delta: Delta { role: None, content: Some(tail) },
-                                        logprobs: None,
-                                        finish_reason: None,
-                                    }],
-                                    usage_null,
-                                )));
+                            Ok(tail) => {
+                                for event in route.finish(tail) {
+                                    if let Some(delta) = tool_event_delta(event) {
+                                        yield Ok(sse_json(&delta_chunk(delta, usage_null)));
+                                    }
+                                }
                             }
-                            Ok(_) => {}
                             Err(err) => {
                                 ctx.record_err(&err);
                                 yield Ok(sse_json(&err.body()));
@@ -645,7 +798,7 @@ fn stream_response(
                             index: 0,
                             delta: Delta::default(),
                             logprobs: None,
-                            finish_reason: Some(finish_reason),
+                            finish_reason: Some(route.adjust_reason(finish_reason)),
                         }],
                         usage_null,
                     )));

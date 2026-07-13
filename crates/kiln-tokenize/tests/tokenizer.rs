@@ -42,13 +42,7 @@ fn rendered_template_already_carries_bos() {
     let tokenizer = Tokenizer::from_model_dir(&dir).expect("loads");
     let template = ChatTemplate::from_model_dir(&dir).expect("loads");
     let rendered = template
-        .render(
-            &[ChatMessage {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
-            true,
-        )
+        .render(&[ChatMessage::text("user", "hi")], true)
         .expect("renders");
 
     // The template text itself starts with BOS…
@@ -85,10 +79,7 @@ fn render_with_pins_date_string() {
     // supplied — the golden harness depends on this pinning.
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/llama32");
     let template = ChatTemplate::from_model_dir(fixture).expect("loads");
-    let messages = [ChatMessage {
-        role: "user".into(),
-        content: "hi".into(),
-    }];
+    let messages = [ChatMessage::text("user", "hi")];
 
     let pinned = template
         .render_with(

@@ -120,7 +120,7 @@ jobs:
         run: |
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
           export KILN_FIXTURE_PARITY=skip
-          cargo test -p kiln-tokenize --test tokenizer --test detok
+          cargo test -p kiln-tokenize --test tokenizer --test detok --test toolcall_fixtures
           cargo test -p kiln-engine --test grammar
           cargo test -p kiln-models --test batching --test calibration \
             --test leak --test leak_batched --test preemption \

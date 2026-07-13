@@ -1,0 +1,68 @@
+{
+  "family": "llama",
+  "source": {
+    "kind": "generation",
+    "model": "llama-3.2-1b-4bit",
+    "mlx_lm_version": "0.31.2",
+    "template_kwargs": {
+      "date_string": "26 Jul 2024"
+    }
+  },
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the weather in Paris right now?"
+    }
+  ],
+  "prompt_text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nEnvironment: ipython\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nGiven the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.\n\nRespond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n{\n    \"type\": \"function\",\n    \"function\": {\n        \"name\": \"get_weather\",\n        \"description\": \"Get the current weather for a city.\",\n        \"parameters\": {\n            \"type\": \"object\",\n            \"properties\": {\n                \"city\": {\n                    \"type\": \"string\",\n                    \"description\": \"City name\"\n                }\n            },\n            \"required\": [\n                \"city\"\n            ]\n        }\n    }\n}\n\nWhat is the weather in Paris right now?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+  "token_ids": [
+    128010,
+    5018,
+    609,
+    794,
+    330,
+    456,
+    70464,
+    498,
+    330,
+    14105,
+    794,
+    5324,
+    9103,
+    794,
+    330,
+    60704,
+    32075
+  ],
+  "text": "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
+  "expected": {
+    "content": "",
+    "calls": [
+      {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\"}"
+      }
+    ]
+  }
+}

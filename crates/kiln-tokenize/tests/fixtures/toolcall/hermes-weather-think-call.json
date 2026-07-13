@@ -1,0 +1,158 @@
+{
+  "family": "hermes",
+  "source": {
+    "kind": "generation",
+    "model": "qwen3-0.6b-4bit",
+    "mlx_lm_version": "0.31.2",
+    "template_kwargs": {}
+  },
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_time",
+        "description": "Get the current local time for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the weather in Paris right now?"
+    }
+  ],
+  "prompt_text": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Get the current local time for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris right now?<|im_end|>\n<|im_start|>assistant\n",
+  "token_ids": [
+    151667,
+    198,
+    32313,
+    11,
+    279,
+    1196,
+    374,
+    10161,
+    369,
+    279,
+    9104,
+    304,
+    12095,
+    1290,
+    1431,
+    13,
+    6771,
+    752,
+    1779,
+    279,
+    2500,
+    7375,
+    13,
+    2619,
+    594,
+    633,
+    69364,
+    323,
+    633,
+    3009,
+    13,
+    1988,
+    279,
+    1196,
+    11689,
+    4588,
+    911,
+    279,
+    9104,
+    11,
+    537,
+    279,
+    882,
+    13,
+    2055,
+    358,
+    1184,
+    311,
+    990,
+    633,
+    69364,
+    448,
+    279,
+    3283,
+    5733,
+    738,
+    311,
+    12095,
+    13,
+    358,
+    1265,
+    1618,
+    429,
+    729,
+    323,
+    470,
+    279,
+    1102,
+    624,
+    151668,
+    271,
+    151657,
+    198,
+    4913,
+    606,
+    788,
+    330,
+    455,
+    69364,
+    497,
+    330,
+    16370,
+    788,
+    5212,
+    8926,
+    788,
+    330,
+    59604,
+    95642,
+    151658
+  ],
+  "text": "<think>\nOkay, the user is asking for the weather in Paris right now. Let me check the available tools. There's get_weather and get_time. But the user specifically asked about the weather, not the time. So I need to use get_weather with the city parameter set to Paris. I should call that function and return the result.\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+  "expected": {
+    "content": "<think>\nOkay, the user is asking for the weather in Paris right now. Let me check the available tools. There's get_weather and get_time. But the user specifically asked about the weather, not the time. So I need to use get_weather with the city parameter set to Paris. I should call that function and return the result.\n</think>\n\n",
+    "calls": [
+      {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\"}"
+      }
+    ]
+  }
+}
