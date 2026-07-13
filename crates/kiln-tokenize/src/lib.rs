@@ -37,6 +37,7 @@
 pub mod chat_template;
 pub mod detok;
 pub mod stops;
+pub mod think;
 pub mod tokenizer;
 pub mod toolcall;
 
@@ -45,5 +46,6 @@ pub use chat_template::{
 };
 pub use detok::StreamingDecoder;
 pub use stops::StopStringMatcher;
+pub use think::{ThinkEvent, ThinkParser};
 pub use tokenizer::{Tokenizer, TokenizerError};
 pub use toolcall::{ToolCallFormat, ToolCallParser, ToolEvent};

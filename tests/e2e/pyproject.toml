@@ -3,10 +3,12 @@ name = "kiln-e2e"
 version = "0.0.1"
 description = "Black-box HTTP tests against a full Kiln stack (SPEC §11.3)"
 requires-python = ">=3.12"
-# openai: SPEC §11.3 mandates conformance against the real client SDKs.
+# openai + anthropic: SPEC §11.3 mandates conformance against the real
+#        client SDKs (one per API surface).
 # httpx: plain HTTP for /metrics, /readyz, and raw error-shape assertions
 #        (already a transitive dependency of openai).
 dependencies = [
+    "anthropic>=0.55",
     "httpx>=0.27",
     "openai>=1.90",
     "pytest>=8",

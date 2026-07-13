@@ -38,9 +38,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             Arc::clone(&state),
             crate::auth::require_api_key,
         ));
+    // Anthropic surface: same keys, `x-api-key` convention and Anthropic
+    // error envelope (SPEC §8.1).
+    let anthropic_api = Router::new()
+        .route("/v1/messages", post(crate::messages::messages))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::auth::require_api_key_anthropic,
+        ));
 
     Router::new()
         .merge(api)
+        .merge(anthropic_api)
         // Unauthenticated by design: the gateway binds localhost by default
         // (SPEC §8.1); operators exposing it terminate auth upstream.
         .route("/healthz", get(healthz))
