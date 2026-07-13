@@ -60,6 +60,7 @@ fn request(prompt: &[u32], max_tokens: usize, stop: &[u32]) -> (EngineRequest, C
         },
         penalty_window: 0,
         stop_tokens: stop.iter().copied().collect(),
+        grammar: None,
         priority: Priority::Interactive,
         cancel: Arc::new(AtomicBool::new(false)),
         on_event: Box::new(move |event| {

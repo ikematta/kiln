@@ -161,7 +161,7 @@ async fn handle(
 ) -> Result<Response, ApiError> {
     let entry = ready_entry(&state, &request.model)?;
 
-    let validated = request.validate()?;
+    let mut validated = request.validate()?;
     let prompt = render_prompt(&entry, &validated)?;
 
     let mut client = WorkerClient::new(entry.channel.clone());
@@ -173,14 +173,28 @@ async fn handle(
     }
     let prompt_tokens = token_ids.len() as u32;
 
-    let max_context_len = entry
-        .info
-        .read()
-        .await
-        .as_ref()
-        .map(|info| info.max_context_len)
-        .unwrap_or(0);
+    let (max_context_len, worker_grammar_capable) = {
+        let info = entry.info.read().await;
+        (
+            info.as_ref().map(|info| info.max_context_len).unwrap_or(0),
+            info.as_ref().is_some_and(|info| {
+                info.capabilities
+                    .contains(&(kiln_proto::v1::Capability::Grammar as i32))
+            }),
+        )
+    };
     let max_tokens = validated.effective_max_tokens(prompt_tokens, max_context_len)?;
+
+    // SPEC §5 capability gating: structured output requires the worker to
+    // advertise CAPABILITY_GRAMMAR (the python worker lacks it in v1) —
+    // 400 here instead of a worker-side in-band rejection.
+    let grammar = validated.grammar.take();
+    if grammar.is_some() && !worker_grammar_capable {
+        return Err(ApiError::invalid_request(
+            "this model's worker does not support structured output (response_format); \
+             serve the model with the rust worker to enable it",
+        ));
+    }
 
     // Stop strings: matched in the worker when it detokenizes (python), in
     // the gateway when it does (rust — the worker rejects stop_strings).
@@ -200,7 +214,7 @@ async fn handle(
             stop_strings: worker_stop_strings,
             ignore_eos: false,
         }),
-        grammar: None,
+        grammar,
         priority: Priority::Interactive as i32,
         prefix_hint: 0,
         echo_prompt: false,

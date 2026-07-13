@@ -88,9 +88,10 @@ impl Worker for WorkerService {
             max_context_len: info.max_context_len,
             vocab_size: info.vocab_size,
             dtype: info.dtype.clone(),
-            // PREFIX_CACHE/SSD_TIER per the startup flags (Phase 5). No
-            // LOGPROBS/GRAMMAR yet; notably NOT TOKENIZER_OWNED — the
-            // gateway tokenizes for this worker.
+            // PREFIX_CACHE/SSD_TIER per the startup flags (Phase 5);
+            // GRAMMAR once the engine thread builds the llguidance
+            // environment (Phase 7). No LOGPROBS yet; notably NOT
+            // TOKENIZER_OWNED — the gateway tokenizes for this worker.
             capabilities: self.shared.capabilities(),
             worker_kind: "rust".to_owned(),
             worker_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -129,7 +130,7 @@ impl Worker for WorkerService {
         &self,
         request: Request<SubmitRequest>,
     ) -> Result<Response<Self::SubmitStream>, Status> {
-        let request = request.into_inner();
+        let mut request = request.into_inner();
         // Unknown enum values decode as UNSPECIFIED (treated INTERACTIVE);
         // read before fields are moved out of the message below.
         let priority = request.priority();
@@ -156,12 +157,6 @@ impl Worker for WorkerService {
         };
         if request.request_id.is_empty() {
             return invalid("missing request_id");
-        }
-        if request.grammar.is_some() {
-            return Ok(Response::new(error_stream(
-                WorkerErrorCode::WorkerErrorGrammarUnsupported,
-                "rust worker does not support grammars until Phase 7",
-            )));
         }
         if request.echo_prompt {
             return invalid("echo_prompt is not supported by the rust worker");
@@ -215,6 +210,44 @@ impl Worker for WorkerService {
             )));
         }
 
+        // Structured output (SPEC §12 Phase 7): compile the GrammarSpec
+        // here on the handler task, so compile faults reject in-band
+        // (proto GRAMMAR_UNSUPPORTED / GRAMMAR_COMPILE) and the engine
+        // thread only ever sees ready-to-mask grammars.
+        let grammar = match request.grammar.take() {
+            None => None,
+            Some(spec) => {
+                let Some(env) = self.shared.grammar_env() else {
+                    return Ok(Response::new(error_stream(
+                        WorkerErrorCode::WorkerErrorGrammarUnsupported,
+                        "this worker cannot serve grammars (no llguidance environment; \
+                         CAPABILITY_GRAMMAR was not advertised)",
+                    )));
+                };
+                use kiln_proto::v1::grammar_spec::Grammar as Spec;
+                let compiled = match spec.grammar {
+                    Some(Spec::JsonSchema(schema)) => env.compile_json_schema(&schema),
+                    Some(Spec::Regex(regex)) => env.compile_regex(&regex),
+                    Some(Spec::Lark(_)) => {
+                        return Ok(Response::new(error_stream(
+                            WorkerErrorCode::WorkerErrorGrammarUnsupported,
+                            "lark grammars are not supported (json_schema and regex only)",
+                        )));
+                    }
+                    None => return invalid("GrammarSpec without a grammar variant"),
+                };
+                match compiled {
+                    Ok(grammar) => Some(grammar),
+                    Err(err) => {
+                        return Ok(Response::new(error_stream(
+                            WorkerErrorCode::WorkerErrorGrammarCompile,
+                            err.to_string(),
+                        )));
+                    }
+                }
+            }
+        };
+
         // Register (duplicate ids rejected) and enqueue.
         let handle = Arc::new(RequestHandle::default());
         {
@@ -263,6 +296,7 @@ impl Worker for WorkerService {
             prompt_ids,
             sampling: request.sampling.unwrap_or_default(),
             stopping,
+            grammar,
             priority,
             enqueued_at: Instant::now(),
             handle,

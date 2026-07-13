@@ -197,6 +197,7 @@ fn run(engine: &mut Engine<RecordingMock>, prompt: &[u32], max_tokens: usize) ->
         },
         penalty_window: 0,
         stop_tokens: std::collections::HashSet::new(),
+        grammar: None,
         priority: Priority::Interactive,
         cancel: Arc::new(AtomicBool::new(false)),
         on_event: Box::new(move |event| {

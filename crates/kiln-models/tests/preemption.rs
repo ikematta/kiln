@@ -124,6 +124,7 @@ fn request(prompt: &[u32], max_tokens: usize, priority: Priority) -> (EngineRequ
         },
         penalty_window: 0,
         stop_tokens: std::collections::HashSet::new(),
+        grammar: None,
         priority,
         cancel: Arc::clone(&cancel),
         on_event: Box::new(move |event| {

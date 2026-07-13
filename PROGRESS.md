@@ -3956,3 +3956,71 @@
 - Next: Phase 7 — llguidance structured output, tool-call parsers,
   /v1/messages, paged-attention kernel (SPEC §12). Not started in this
   session per instruction.
+
+## [2026-07-13] Phase 7 / Task 1 — llguidance structured output (json_schema + regex) — DONE
+- What: grammar-constrained decoding per SPEC §12 Phase 7 / §6.2 step 3.
+  New `kiln-engine/src/grammar.rs`: `GrammarEnv` (llguidance ParserFactory
+  over a token trie built from the model's tokenizer.json, padded to the
+  model's `vocab_size`, model EOS ids wired in) and `Grammar` (per-request
+  matcher: `allowed_tokens` mask + `commit`). Engine: `EngineRequest.grammar`;
+  mask computed host-side at plan time (per-seq in-band error on fault),
+  applied in `sample_from_row` as `where_cond(mask, logits, -inf)` after
+  penalties and before logprob normalization; `settle_sampled` commits each
+  sampled token and finishes `Stop` on grammar completion; grammar seqs are
+  excluded from the async_eval pipeline (their next mask needs this step's
+  token host-side — same reason as penalties). Worker: engine thread builds
+  `GrammarEnv` after model load (~0.4s, degrades to no-capability on
+  failure), advertises `CAPABILITY_GRAMMAR`; Submit compiles GrammarSpec on
+  the handler task — `json_schema`/`regex` supported, `lark` →
+  GRAMMAR_UNSUPPORTED, uncompilable → GRAMMAR_COMPILE, both in-band.
+  Gateway: `response_format` `json_schema`/`json_object` → GrammarSpec on
+  the frozen proto field; 400 when the worker lacks CAPABILITY_GRAMMAR
+  (SPEC §5 gating). Python worker unchanged (scoped out per SPEC §5: no
+  GRAMMAR capability in v1; its in-band rejection + unit test already
+  existed). Tests: kiln-worker/tests/grammar.rs (100/100 acceptance,
+  CI-blocking — schema validity is device-independent), kiln-engine/tests/
+  grammar.rs (host-level mask/commit/compile-error), gateway response_format
+  unit tests, e2e test_structured_output.py (openai SDK, both stacks).
+  ci.yml model-gated step now runs the two new suites.
+- Decisions: llguidance 1.7.6 + toktrie_hf_tokenizers 1.7.6 added
+  (SPEC §3 names llguidance for structured output; MIT, pure Rust; optional
+  deps behind kiln-engine's `metal` feature so the Linux compile-check
+  stays lean; toktrie_hf_tokenizers internally uses tokenizers 0.21 beside
+  the workspace's 0.23 — no cross-version type sharing, the trie is built
+  straight from tokenizer.json). Mask at plan time (before the forward):
+  state-correct since it depends only on committed tokens, and host cost is
+  ~2µs/step (measured in a probe; first mask ~0.8ms at compile). Grammar
+  completion finishes `Stop` even without an EOS sample (covers ignore_eos).
+  `lark` deliberately not wired despite llguidance supporting it — Phase 7
+  task text scopes json_schema + regex; proto error code semantics used:
+  UNSUPPORTED = grammar kind, COMPILE = bad grammar text. Acceptance
+  schemas set llguidance's `x-guidance: {whitespace_flexible: false}` so
+  compact output gives a hard token-length bound — a Length finish is a
+  real failure, not a sizing artifact (PR #13/#14 deflake lesson applied
+  in advance).
+- Deviations: none. Proto untouched (GrammarSpec/capability/error codes
+  were already defined and are now honored as specified).
+- Acceptance:
+  ```
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-worker --test grammar -- --nocapture
+  100/100 schema-valid generations (per shape: [34, 33, 33])
+  test grammar_constrained_decoding ... ok (19.63s)   [release run: ok, see below]
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-models --test golden -- --nocapture
+  ... exact match for every fixture model (llama/qwen2.5/qwen3 x 4bit/8bit/bf16/gemma) — masking
+  is a verified no-op on unconstrained requests. test result: ok (293s)
+  $ batching/preemption/prefix_cache/prefix_multiturn/leak/leak_batched/calibration/prefill_pad/rpc: all ok
+  $ cargo test --workspace -> 40 targets, 0 failures;  cargo test -p kiln-engine --test grammar -> 4 passed
+  $ cargo clippy --workspace --all-targets -- -D warnings -> clean (metal + --no-default-features)
+  $ cargo fmt --all --check -> clean;  ruff check/format -> clean
+  $ pytest python/kiln_worker_py/tests -> 35 passed (grammar-unsupported test intact)
+  $ uv run --project tests/e2e pytest tests/e2e -> 42 passed, 2 skipped (rust-only structured-output
+    tests skip on the python stack; python stack asserts the 400 capability gate)
+  ```
+  One local red herring during the run: the rpc suite timed out once because a
+  concurrent `cargo build --no-default-features` (Linux-shape check) replaced
+  target/debug/kiln-worker with the metal-less stub while the suite was
+  spawning it — not a code fault; re-run green. CI builds each shape in its
+  own job, so the shapes cannot collide there.
+- Next: Phase 7 continues — tool-call streaming parsers (Hermes/Llama3/Qwen)
+  in kiln-tokenize with unit fixtures (SPEC §12). Stopped before them per
+  instruction.

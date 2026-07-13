@@ -33,3 +33,7 @@ tracing-subscriber.workspace = true
 # are in the workspace dependency tree already (no new external code).
 hyper-util.workspace = true
 tower.workspace = true
+# tests/grammar.rs encodes prompts and decodes constrained output for
+# schema validation — the gateway-side tokenizer the worker itself does
+# not link (workspace crate, no new external code).
+kiln-tokenize.workspace = true

@@ -18,8 +18,8 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use kiln_engine::{
-    Engine, EngineConfig, EngineRequest, ErrorCause, FinishKind, PenaltyOptions, SamplingOptions,
-    SeqEvent, SsdParams,
+    Engine, EngineConfig, EngineRequest, ErrorCause, FinishKind, Grammar, GrammarEnv,
+    PenaltyOptions, SamplingOptions, SeqEvent, SsdParams,
 };
 use kiln_mlx::Stream;
 use kiln_proto::v1::{
@@ -62,6 +62,10 @@ pub struct Submission {
     pub prompt_ids: Vec<u32>,
     pub sampling: SamplingParams,
     pub stopping: StoppingParams,
+    /// Compiled structured-output constraint (SPEC §12 Phase 7); the
+    /// gRPC handler compiles the proto `GrammarSpec` so compile errors
+    /// are rejected in-band before the request ever reaches the engine.
+    pub grammar: Option<Grammar>,
     pub priority: Priority,
     pub enqueued_at: Instant,
     pub handle: Arc<RequestHandle>,
@@ -117,8 +121,14 @@ pub struct Shared {
     pub ssd_fingerprint_rejects_total: AtomicU64,
     /// Capability enum values advertised in `GetInfo` (set at startup
     /// from the cache flags; the engine thread may clear SSD_TIER if the
-    /// store fails to open).
+    /// store fails to open, and adds GRAMMAR once the llguidance
+    /// environment builds).
     pub capabilities: std::sync::Mutex<Vec<i32>>,
+    /// Structured-output compiler (SPEC §12 Phase 7), set by the engine
+    /// thread before it reports Ready; absent = grammars unsupported
+    /// (CAPABILITY_GRAMMAR not advertised, grammar submits rejected
+    /// in-band).
+    grammar: std::sync::OnceLock<GrammarEnv>,
     /// Device-calibrated deterministic decode width (ADR 0002 B'),
     /// published in `WorkerInfo` for diagnostics; set by the engine
     /// thread after model load (0 while loading).
@@ -163,9 +173,30 @@ impl Shared {
             ssd_writes_total: AtomicU64::new(0),
             ssd_fingerprint_rejects_total: AtomicU64::new(0),
             capabilities: std::sync::Mutex::new(capabilities),
+            grammar: std::sync::OnceLock::new(),
             deterministic_decode_width: AtomicU32::new(0),
             started_at: Instant::now(),
         }
+    }
+
+    /// Publishes grammar support: stores the compiler for the submit path
+    /// and advertises `CAPABILITY_GRAMMAR`. Engine thread, once, before
+    /// the worker reports Ready.
+    pub(crate) fn enable_grammar(&self, env: GrammarEnv) {
+        use kiln_proto::v1::Capability;
+        if self.grammar.set(env).is_err() {
+            return;
+        }
+        let mut guard = match self.capabilities.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.push(Capability::Grammar as i32);
+    }
+
+    /// The structured-output compiler, when this worker supports grammars.
+    pub(crate) fn grammar_env(&self) -> Option<&GrammarEnv> {
+        self.grammar.get()
     }
 
     /// Advertised capability values (proto enum ints).
@@ -298,6 +329,22 @@ pub fn engine_main(
     shared
         .deterministic_decode_width
         .store(det_width as u32, Ordering::Release);
+    // Structured output (SPEC §12 Phase 7): build the llguidance
+    // environment from the model's tokenizer.json, sized to the model's
+    // logits vocab, with the model's EOS ids wired in (ordered — the
+    // first becomes the trie's primary EOS). Failure degrades to serving
+    // without CAPABILITY_GRAMMAR — grammar submits then get an in-band
+    // GRAMMAR_UNSUPPORTED — never a load failure.
+    match GrammarEnv::load(
+        &model_dir.join("tokenizer.json"),
+        shared.info.vocab_size,
+        &model.eos_token_ids(),
+    ) {
+        Ok(env) => shared.enable_grammar(env),
+        Err(err) => {
+            tracing::warn!(model = %shared.model_id, error = %err, "grammar support disabled");
+        }
+    }
     // Pool sizing: EngineConfig defaults (512 blocks x 32 tokens) until
     // memory-budget admission lands (SPEC §6.4 / §2.3, Phase 4 part 3+).
     // Prefix cache/SSD per the CLI flags (SPEC §6.3/§6.4): slabs live
@@ -447,6 +494,7 @@ fn submit(
         prompt_ids,
         sampling,
         stopping,
+        grammar,
         priority,
         enqueued_at,
         handle,
@@ -593,6 +641,7 @@ fn submit(
         penalties,
         penalty_window,
         stop_tokens,
+        grammar,
         // Proto: BATCH is preempted first; UNSPECIFIED means INTERACTIVE.
         priority: match priority {
             Priority::Batch => kiln_engine::Priority::Batch,

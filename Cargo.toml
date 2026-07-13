@@ -61,6 +61,15 @@ prometheus = { version = "0.14", default-features = false }
 uuid = { version = "1", features = ["v7"] }
 argon2 = { version = "0.5", features = ["std"] }
 async-stream = "0.3"
+# Structured output (SPEC §3 tech stack, §12 Phase 7): llguidance compiles
+# json_schema/regex grammar specs and computes per-step allowed-token masks,
+# applied as a logit processor in the worker decode step (SPEC §6.2 step 3);
+# toktrie_hf_tokenizers builds its token trie from the model's
+# tokenizer.json (same HF `tokenizers` lineage as kiln-tokenize, so token
+# byte representations agree). Both MIT licensed, pure Rust, from the
+# llguidance project (github.com/guidance-ai/llguidance).
+llguidance = "1.7"
+toktrie_hf_tokenizers = "1.7"
 # Property-based testing (dev-only): model-based invariant suites for the
 # engine's block manager (SPEC §12 Phase 4, "block manager (+proptests)").
 proptest = "1"

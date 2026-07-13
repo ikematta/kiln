@@ -55,6 +55,7 @@ fn cold_ttft(model: &LlamaModel, prompt: &[u32], fine: usize) -> f64 {
         },
         penalty_window: 0,
         stop_tokens: std::collections::HashSet::new(),
+        grammar: None,
         priority: Priority::Interactive,
         cancel: Arc::new(AtomicBool::new(false)),
         on_event: Box::new(move |event| {
