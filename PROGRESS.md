@@ -4140,3 +4140,83 @@
   thinking passthrough as `thinking` content blocks), then the
   paged-attention Metal kernel (SPEC §12). Stopped before them per
   instruction.
+
+## [2026-07-13] Phase 7 / Task 3 — `POST /v1/messages` (Anthropic Messages API) — DONE
+- What: SPEC §8.1 Anthropic adapter over the SHARED chat pipeline — a second
+  API framing, not a new serving path. kiln-tokenize: new `think.rs`
+  streaming `<think>` extractor (`ThinkParser` → Thinking/Text events;
+  chunk-split invariance like the toolcall parsers; partial-tag holdback;
+  tag-boundary whitespace trimmed, interior verbatim; unclosed block =
+  truncated thinking), thinking-model detection from the chat template
+  source (`ChatTemplate::emits_think_tags`, `</think>` marker — same
+  pattern as tool-format detection), and `render_full` (render_with_tools
+  + extra JSON template vars). Gateway: `anthropic.rs` (wire types +
+  validation into the ValidatedChat-equivalent internal shape: system
+  string/blocks, content blocks incl. tool_use/tool_result round trip,
+  Anthropic→OpenAI tool-shape conversion for the templates/parsers,
+  temperature [0,1] + top_k wired to SamplingParams) and `messages.rs`
+  (handler reusing ready_entry/encode_prompt/TextPipeline/ToolRoute/
+  classify_finished/CompletionCtx; non-stream JSON + named-event SSE:
+  message_start, content_block_start/delta/stop with thinking_delta /
+  text_delta / input_json_delta, message_delta, message_stop, mid-stream
+  `event: error`). Auth accepts `x-api-key` (the anthropic SDK's only
+  header) everywhere; /v1/messages gets the Anthropic error envelope
+  (`{"type":"error","error":{type,message}}`, status-keyed types).
+  `kiln_messages_total` metric. `stop_sequence` attribution: TextPipeline
+  now records WHICH stop fired (rust path); python path checks
+  `Finished.matched_stop` membership in the request's stop_sequences
+  (worker reports EOS token text on natural stop — membership filters it).
+  e2e: `test_messages.py` drives the real `anthropic` SDK against BOTH
+  worker kinds (llama stack ×2: non-stream shape, stream-reassembly
+  equality, system-prompt steering, stop_sequence attribution, tool use
+  non-stream + stream + round trip, forced-choice 400, error envelopes)
+  plus the rust-worker qwen3-0.6b stack (thinking blocks correctly shaped
+  AND separated from text: [thinking, text] non-stream, streamed
+  block/delta sequence reassembling byte-equal, [thinking, tool_use] with
+  tools, thinking-disabled → [text] only). qwen stack fixture moved to
+  conftest (session-scoped, shared with test_tool_calls — one model load).
+- Decisions: think extraction is /v1/messages-only per SPEC §8.1 (the
+  OpenAI endpoint keeps `<think>` as plain content — test_tool_calls
+  asserts that); the parser is gated on template detection so a
+  non-thinking model echoing "<think>" is never misclassified.
+  `thinking: {"type":"disabled"}` renders the template with
+  `enable_thinking=false` (real disable on Qwen3; lenient-undefined
+  no-op elsewhere); enabled/adaptive are the models' native behavior and
+  budgets are unenforceable → accepted, ignored. Request-history thinking
+  blocks are dropped (the thinking-trained templates strip prior-turn
+  reasoning themselves); `signature` is always "" (open weights — nothing
+  to sign; SDK requires the field). stop upgrade precedence mirrors the
+  OpenAI adapter: completed calls → `tool_use`, else matched request
+  sequence → `stop_sequence` + value, else `end_turn`. Non-streaming
+  tool_use whose args never became valid JSON (length truncation) is
+  dropped with a debug log — `input` is an object, partial JSON is
+  unrepresentable; streaming shows the partial input_json_delta bytes
+  (same stream/non-stream divergence as the reference API).
+  `tool_choice` any/tool → 400 (forcing needs grammar-coupled decoding,
+  same ruling as task 7.2); `disable_parallel_tool_use: true` → 400
+  (can't bound what a model emits; reject-don't-silently-drop). New
+  test-only dep `anthropic` in tests/e2e (SPEC §11.3 mandates conformance
+  via the real client SDKs).
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-tokenize --lib   -> 43 passed (12 new think:: incl.
+    chunk-split invariance at sizes 1/2/3/5/7/11/whole, multibyte, truncation)
+  $ cargo test -p kiln-gateway --lib    -> 42 passed (7 new: anthropic
+    validation/wire shapes + anthropic error envelope)
+  $ KILN_TEST_MODELS=... cargo test --workspace -> 41 suites, all ok
+    (incl. golden: exact match every fixture — adapter changes touch no
+    model/engine path)
+  $ cargo build --workspace --no-default-features -> clean (linux shape)
+  $ cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ ruff check / format --check python/ tests/e2e -> clean
+  $ pytest python/kiln_worker_py/tests -> 35 passed
+  $ uv run --project tests/e2e pytest tests/e2e -> 77 passed, 2 skipped
+    (24 new in test_messages.py via the anthropic SDK: 10 tests x both
+     worker stacks + 4 thinking tests on the rust qwen3 stack; the SDK's
+     pydantic models validate every response/stream-event shape; 2 skips =
+     pre-existing rust-only structured-output tests on python stack)
+  ```
+- Next: Phase 7 part 4 — custom Metal paged-attention kernel behind a flag
+  + parity test vs the gather path (SPEC §12). Own session; not started
+  here per instruction. This entry closes Phase 7's API surface.

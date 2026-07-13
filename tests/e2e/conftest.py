@@ -33,16 +33,21 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 MODEL_ID = "llama-3.2-1b-4bit"
+QWEN_MODEL_ID = "qwen3-0.6b-4bit"
 API_KEY = "kiln-e2e-key"
 READY_TIMEOUT_S = 600
 
 
-def model_dir() -> pathlib.Path | None:
+def pinned_model_dir(model_id: str) -> pathlib.Path | None:
     root = os.environ.get("KILN_TEST_MODELS") or os.path.expanduser(
         "~/.kiln/test-models"
     )
-    candidate = pathlib.Path(root) / MODEL_ID
+    candidate = pathlib.Path(root) / model_id
     return candidate if (candidate / "config.json").is_file() else None
+
+
+def model_dir() -> pathlib.Path | None:
+    return pinned_model_dir(MODEL_ID)
 
 
 def free_port() -> int:
@@ -252,3 +257,19 @@ def client(stack):
         timeout=120.0,
         max_retries=0,
     )
+
+
+@pytest.fixture(scope="session")
+def qwen_stack():
+    """Rust-worker Qwen3-0.6B stack: the thinking-trained, Hermes-format
+    model (tool-call parsing in test_tool_calls, thinking blocks in
+    test_messages). Session-scoped so both suites share one model load."""
+    path = pinned_model_dir(QWEN_MODEL_ID)
+    if path is None:
+        pytest.skip(
+            f"pinned test model '{QWEN_MODEL_ID}' not found; run "
+            "./scripts/fetch-test-model.sh"
+        )
+    with running_stack([(QWEN_MODEL_ID, "rust", str(path))]) as running:
+        running.wait_ready()
+        yield running

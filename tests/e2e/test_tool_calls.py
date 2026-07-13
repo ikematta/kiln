@@ -21,14 +21,10 @@ determinism argument as the cross-worker parity suite.
 from __future__ import annotations
 
 import json
-import os
-import pathlib
 
 import pytest
 
-from conftest import running_stack
-
-QWEN_MODEL_ID = "qwen3-0.6b-4bit"
+from conftest import QWEN_MODEL_ID
 
 TOOLS = [
     {
@@ -224,24 +220,9 @@ def test_forced_tool_choice_is_400(stack, client):
 
 
 # ---------------------------------------------------------------------------
-# Hermes format: Qwen3-0.6B on the rust worker
+# Hermes format: Qwen3-0.6B on the rust worker (stack fixture in conftest,
+# shared with test_messages.py)
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def qwen_stack():
-    root = os.environ.get("KILN_TEST_MODELS") or os.path.expanduser(
-        "~/.kiln/test-models"
-    )
-    path = pathlib.Path(root) / QWEN_MODEL_ID
-    if not (path / "config.json").is_file():
-        pytest.skip(
-            f"pinned test model '{QWEN_MODEL_ID}' not found; run "
-            "./scripts/fetch-test-model.sh"
-        )
-    with running_stack([(QWEN_MODEL_ID, "rust", str(path))]) as stack:
-        stack.wait_ready()
-        yield stack
 
 
 @pytest.fixture(scope="module")

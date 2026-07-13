@@ -286,6 +286,10 @@ pub(crate) enum TextPipeline {
         /// Frozen at the chunk whose text completed a stop string — the
         /// client-visible completion length (see the module docs on usage).
         tokens_at_match: Option<u32>,
+        /// The stop string that fired (the Anthropic API reports it as
+        /// `stop_sequence`; a tokenizer-owning worker reports its own via
+        /// `Finished.matched_stop`).
+        stop_hit: Option<String>,
     },
 }
 
@@ -297,6 +301,7 @@ impl TextPipeline {
                 matcher: StopStringMatcher::new(stop_strings),
                 tokens_seen: 0,
                 tokens_at_match: None,
+                stop_hit: None,
             },
             None => TextPipeline::Passthrough,
         }
@@ -312,6 +317,7 @@ impl TextPipeline {
                 matcher,
                 tokens_seen,
                 tokens_at_match,
+                stop_hit,
             } => {
                 if tokens_at_match.is_some() {
                     // Post-match chunks are the worker's cancel overshoot;
@@ -325,6 +331,7 @@ impl TextPipeline {
                 let (released, hit) = matcher.push(&text);
                 if hit.is_some() {
                     *tokens_at_match = Some(*tokens_seen);
+                    *stop_hit = hit;
                 }
                 Ok(released)
             }
@@ -341,6 +348,7 @@ impl TextPipeline {
                 matcher,
                 tokens_seen,
                 tokens_at_match,
+                stop_hit,
             } => {
                 if tokens_at_match.is_some() {
                     return Ok(String::new());
@@ -351,6 +359,7 @@ impl TextPipeline {
                 let (mut released, hit) = matcher.push(&tail);
                 if hit.is_some() {
                     *tokens_at_match = Some(*tokens_seen);
+                    *stop_hit = hit;
                 } else {
                     released.push_str(&matcher.flush());
                 }
@@ -367,6 +376,16 @@ impl TextPipeline {
                 ..
             }
         )
+    }
+
+    /// The stop string a gateway-side match fired on, when [`Self::stop_matched`].
+    /// `None` on the passthrough pipeline — there the worker matched, and
+    /// reports the string via `Finished.matched_stop`.
+    pub(crate) fn matched_stop(&self) -> Option<&str> {
+        match self {
+            TextPipeline::Decode { stop_hit, .. } => stop_hit.as_deref(),
+            TextPipeline::Passthrough => None,
+        }
     }
 
     /// On a gateway-side match, overrides the worker-reported completion
@@ -403,7 +422,9 @@ fn render_prompt(entry: &ModelEntry, validated: &ValidatedChat) -> Result<String
 
 /// Routes the text pipeline's output through the tool-call parser when the
 /// request has tools, or passes it through as plain content otherwise.
-struct ToolRoute {
+/// Shared with `/v1/messages` (crate::messages), whose adapter consumes the
+/// same [`ToolEvent`] stream under Anthropic framing.
+pub(crate) struct ToolRoute {
     parser: Option<ToolCallParser>,
     /// Calls whose arguments finished cleanly — drives the
     /// `finish_reason: "tool_calls"` upgrade.
@@ -411,14 +432,14 @@ struct ToolRoute {
 }
 
 impl ToolRoute {
-    fn new(parser: Option<ToolCallParser>) -> Self {
+    pub(crate) fn new(parser: Option<ToolCallParser>) -> Self {
         Self {
             parser,
             calls_completed: 0,
         }
     }
 
-    fn push(&mut self, text: String) -> Vec<ToolEvent> {
+    pub(crate) fn push(&mut self, text: String) -> Vec<ToolEvent> {
         match &mut self.parser {
             None if text.is_empty() => Vec::new(),
             None => vec![ToolEvent::Content(text)],
@@ -431,7 +452,7 @@ impl ToolRoute {
     }
 
     /// End-of-stream: the pipeline's tail plus the parser's flush.
-    fn finish(&mut self, tail: String) -> Vec<ToolEvent> {
+    pub(crate) fn finish(&mut self, tail: String) -> Vec<ToolEvent> {
         match &mut self.parser {
             None if tail.is_empty() => Vec::new(),
             None => vec![ToolEvent::Content(tail)],
@@ -449,6 +470,12 @@ impl ToolRoute {
             .iter()
             .filter(|e| matches!(e, ToolEvent::CallEnd { .. }))
             .count();
+    }
+
+    /// Calls whose arguments finished cleanly (Anthropic's `tool_use`
+    /// stop-reason upgrade keys on this, like OpenAI's `tool_calls`).
+    pub(crate) fn calls_completed(&self) -> usize {
+        self.calls_completed
     }
 
     /// OpenAI reports a completion that ended by emitting tool calls as

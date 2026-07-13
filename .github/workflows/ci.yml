@@ -160,7 +160,7 @@ jobs:
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
           uv run --project python/kiln_worker_py pytest python/kiln_worker_py/tests -v
       - run: uv sync --project tests/e2e
-      - name: E2E suite (gateway + python worker, openai SDK)
+      - name: E2E suite (full stacks; openai + anthropic SDKs)
         run: |
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
           uv run --project tests/e2e pytest tests/e2e -v

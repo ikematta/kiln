@@ -1,7 +1,8 @@
 //! API-key auth (SPEC §8.3): keys live in config as argon2 hashes, presented
-//! as `Authorization: Bearer <key>`. Verified keys are cached (by sha256 of
-//! the raw key — never the raw key itself) so the argon2 cost is paid once
-//! per key, not per request.
+//! as `Authorization: Bearer <key>` (OpenAI convention) or `x-api-key`
+//! (Anthropic convention — the `anthropic` SDK sends only this header).
+//! Verified keys are cached (by sha256 of the raw key — never the raw key
+//! itself) so the argon2 cost is paid once per key, not per request.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,29 +87,63 @@ impl Auth {
     }
 }
 
-/// Route-layer middleware for `/v1/*`.
+/// The presented key: `Authorization: Bearer` or Anthropic's `x-api-key`.
+/// Both are accepted on every authenticated route — the credential set is
+/// one, only the SDK conventions differ.
+fn presented_key(request: &Request) -> Option<&str> {
+    request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+        })
+}
+
+/// Ok(request) when authenticated (or auth is disabled), Err(()) otherwise;
+/// the route-shape-specific middlewares below own the error envelope.
+async fn authenticate(state: &AppState, request: Request) -> Result<Request, ()> {
+    if !state.auth.enabled() {
+        return Ok(request);
+    }
+    let Some(presented) = presented_key(&request) else {
+        return Err(());
+    };
+    match state.auth.verify(presented).await {
+        Some(name) => {
+            tracing::debug!(api_key = %name, "authenticated");
+            Ok(request)
+        }
+        None => Err(()),
+    }
+}
+
+/// Route-layer middleware for the OpenAI-shaped `/v1/*` endpoints.
 pub async fn require_api_key(
     State(state): State<Arc<AppState>>,
     request: Request,
     next: Next,
 ) -> Response {
-    if !state.auth.enabled() {
-        return next.run(request).await;
+    match authenticate(&state, request).await {
+        Ok(request) => next.run(request).await,
+        Err(()) => ApiError::invalid_api_key().into_response(),
     }
-    let presented = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let Some(presented) = presented else {
-        return ApiError::invalid_api_key().into_response();
-    };
-    match state.auth.verify(presented).await {
-        Some(name) => {
-            tracing::debug!(api_key = %name, "authenticated");
-            next.run(request).await
-        }
-        None => ApiError::invalid_api_key().into_response(),
+}
+
+/// Route-layer middleware for `/v1/messages`: same credentials, Anthropic
+/// error envelope (the `anthropic` SDK parses `{"type": "error", ...}`).
+pub async fn require_api_key_anthropic(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match authenticate(&state, request).await {
+        Ok(request) => next.run(request).await,
+        Err(()) => ApiError::invalid_api_key().into_anthropic_response(),
     }
 }
 

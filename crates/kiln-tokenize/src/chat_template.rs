@@ -82,6 +82,7 @@ pub struct ChatTemplate {
     bos_token: String,
     eos_token: String,
     tool_call_format: Option<crate::toolcall::ToolCallFormat>,
+    emits_think_tags: bool,
 }
 
 const TEMPLATE_NAME: &str = "chat";
@@ -138,6 +139,7 @@ impl ChatTemplate {
     ) -> Result<Self, TemplateError> {
         let source_hash = hex_sha256(source.as_bytes());
         let tool_call_format = crate::toolcall::ToolCallFormat::detect(&source);
+        let emits_think_tags = crate::think::template_emits_think_tags(&source);
         let mut env = Environment::new();
         // HF templates probe optional variables (`tools`, `date_string`, ...)
         // with `is defined`; strict undefined would reject them.
@@ -159,6 +161,7 @@ impl ChatTemplate {
             bos_token,
             eos_token,
             tool_call_format,
+            emits_think_tags,
         })
     }
 
@@ -168,6 +171,13 @@ impl ChatTemplate {
     /// must be rejected.
     pub fn tool_call_format(&self) -> Option<crate::toolcall::ToolCallFormat> {
         self.tool_call_format
+    }
+
+    /// Whether this model wraps its reasoning in `<think>` tags (detected
+    /// from the template source, like [`Self::tool_call_format`]); drives
+    /// thinking-block extraction on the Anthropic API surface (SPEC §8.1).
+    pub fn emits_think_tags(&self) -> bool {
+        self.emits_think_tags
     }
 
     /// Renders the conversation into the model's prompt string.
@@ -190,15 +200,31 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         tools: &[serde_json::Value],
     ) -> Result<String, TemplateError> {
-        if tools.is_empty() {
-            self.render(messages, add_generation_prompt)
-        } else {
-            self.render_with(
-                messages,
-                add_generation_prompt,
-                &[("tools", Value::from_serialize(tools))],
-            )
+        self.render_full(messages, add_generation_prompt, tools, &[])
+    }
+
+    /// [`Self::render_with_tools`] plus extra template variables layered on
+    /// top of the standard context — e.g. `enable_thinking=false` to make a
+    /// thinking-trained template (Qwen3) render its non-thinking prompt for
+    /// the Anthropic `thinking: {"type": "disabled"}` request option.
+    /// Templates that don't reference a variable ignore it (lenient
+    /// undefined), so passing extras is safe across model families. Extras
+    /// are plain JSON so callers don't need a minijinja dependency.
+    pub fn render_full(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        tools: &[serde_json::Value],
+        extra: &[(&str, serde_json::Value)],
+    ) -> Result<String, TemplateError> {
+        let mut ctx: Vec<(&str, Value)> = Vec::with_capacity(extra.len() + 1);
+        if !tools.is_empty() {
+            ctx.push(("tools", Value::from_serialize(tools)));
         }
+        for (key, value) in extra {
+            ctx.push((key, Value::from_serialize(value)));
+        }
+        self.render_with(messages, add_generation_prompt, &ctx)
     }
 
     /// [`Self::render`] with extra template variables layered on top of the

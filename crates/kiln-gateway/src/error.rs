@@ -166,6 +166,41 @@ impl ApiError {
             }
         })
     }
+
+    /// The Anthropic error type for this error's status (their taxonomy is
+    /// status-keyed; the `anthropic` SDK maps it to a typed exception).
+    fn anthropic_error_type(&self) -> &'static str {
+        match self.status.as_u16() {
+            400 => "invalid_request_error",
+            401 => "authentication_error",
+            403 => "permission_error",
+            404 => "not_found_error",
+            413 => "request_too_large",
+            429 => "rate_limit_error",
+            // Retriable capacity states (model loading, draining, OOM
+            // admission rejects) — Anthropic's "try again" type.
+            503 | 529 => "overloaded_error",
+            _ => "api_error",
+        }
+    }
+
+    /// The Anthropic `{"type": "error", "error": {...}}` envelope (also the
+    /// payload of a mid-stream `event: error` on `/v1/messages` SSE).
+    pub fn anthropic_body(&self) -> serde_json::Value {
+        json!({
+            "type": "error",
+            "error": {
+                "type": self.anthropic_error_type(),
+                "message": self.message,
+            }
+        })
+    }
+
+    /// [`IntoResponse`] with the Anthropic envelope instead of the OpenAI
+    /// one; same status code.
+    pub fn into_anthropic_response(self) -> Response {
+        (self.status, Json(self.anthropic_body())).into_response()
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -186,6 +221,33 @@ mod tests {
         assert_eq!(body["error"]["code"], "model_not_found");
         assert!(body["error"]["param"].is_null());
         assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn anthropic_body_shape() {
+        // The `anthropic` SDK keys typed exceptions on this envelope.
+        let err = ApiError::invalid_request("bad temperature");
+        let body = err.anthropic_body();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], "bad temperature");
+
+        assert_eq!(
+            ApiError::invalid_api_key().anthropic_body()["error"]["type"],
+            "authentication_error"
+        );
+        assert_eq!(
+            ApiError::model_not_found("m").anthropic_body()["error"]["type"],
+            "not_found_error"
+        );
+        assert_eq!(
+            ApiError::model_loading("m").anthropic_body()["error"]["type"],
+            "overloaded_error"
+        );
+        assert_eq!(
+            ApiError::worker_crashed("x").anthropic_body()["error"]["type"],
+            "api_error"
+        );
     }
 
     #[test]
