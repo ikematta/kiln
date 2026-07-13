@@ -4246,3 +4246,28 @@
   flag + parity test vs the gather path, ≥15% decode throughput at 8k
   context or the flag stays off (SPEC §12). Stopped before it per
   instruction; it is its own session.
+
+## [2026-07-13] Phase 7 — scoping: mlx_compile experiments fold into the kernel session
+- Question (PM): is the §12 Phase 7 `mlx_compile` item still in scope for
+  this phase, or does it fold into/after the paged-attention kernel session?
+- Ruling: in scope for Phase 7, folded INTO the kernel session as its
+  profiling-gated rider — not standalone, not deferred past the phase.
+  Basis: SPEC conditions the item on profiling in both places it appears
+  (§7.2 "where profiling shows wins (Phase 7 optimization task, not
+  before)"; §12 "experiments where profiled") and Phase 7's acceptance
+  criteria attach no bar to it — the phase's only remaining gate is the
+  kernel item (parity-exact + ≥15% decode at 8k, else flag off,
+  documented). The kernel session must produce decode-step profiles at 8k
+  to prove that bar; those same profiles are the "where profiled" evidence
+  for compile experiments. Running them earlier would baseline against a
+  step function the kernel changes; later would re-derive the profiles.
+- Verified at the pin: mlx-c v0.6.0 exposes the compile API
+  (mlx/c/compile.h: mlx_compile, mlx_detail_compile, compile modes) — no
+  submodule bump needed if experiments proceed; no DECISION NEEDED.
+- Exit condition for the item (kernel session records one of): (a) profile
+  shows no fusion/dispatch-bound hotspots → experiments not warranted,
+  item closed with the profile as evidence; (b) hotspots → experiments
+  run, adopted or rejected with numbers. Either way, greedy outputs must
+  stay bit-identical (golden/parity gates apply to any adoption).
+- Next: Phase 7 part 4 — paged-attention Metal kernel session, now
+  including the mlx_compile rider above.
