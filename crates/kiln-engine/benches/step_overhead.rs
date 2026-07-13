@@ -106,6 +106,7 @@ mod imp {
                 },
                 penalty_window: 0,
                 stop_tokens: std::collections::HashSet::new(),
+                grammar: None,
                 priority: Priority::Interactive,
                 cancel: Arc::new(AtomicBool::new(false)),
                 on_event: Box::new(|_| true),

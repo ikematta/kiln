@@ -4,7 +4,7 @@
 //! unsupported *features* are rejected with clear 400s rather than silently
 //! dropped.
 
-use kiln_proto::v1::SamplingParams;
+use kiln_proto::v1::{GrammarSpec, SamplingParams, grammar_spec};
 use kiln_tokenize::ChatMessage;
 use serde::{Deserialize, Serialize};
 
@@ -80,10 +80,19 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
+/// `response_format` (SPEC §8.1): `text`, `json_object`, or `json_schema`
+/// (OpenAI structured outputs). The schema payload becomes the worker's
+/// `GrammarSpec.json_schema` (SPEC §12 Phase 7, llguidance logit masking).
 #[derive(Debug, Deserialize)]
 pub struct ResponseFormat {
     #[serde(rename = "type")]
     pub format_type: String,
+    pub json_schema: Option<JsonSchemaFormat>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JsonSchemaFormat {
+    pub schema: Option<serde_json::Value>,
 }
 
 /// The request after validation: template-ready messages plus the proto
@@ -95,6 +104,9 @@ pub struct ValidatedChat {
     /// None = derive from context length at submit time.
     pub max_tokens: Option<u32>,
     pub stop_strings: Vec<String>,
+    /// Structured-output constraint from `response_format`; requires the
+    /// worker to advertise `CAPABILITY_GRAMMAR` (checked at submit).
+    pub grammar: Option<GrammarSpec>,
     pub stream: bool,
     pub include_usage: bool,
 }
@@ -119,13 +131,33 @@ impl ChatCompletionRequest {
         if self.tools.is_some() || self.tool_choice.is_some() {
             return Err(invalid("tool calling is not supported yet (Kiln Phase 7)"));
         }
-        if let Some(format) = &self.response_format
-            && format.format_type != "text"
-        {
-            return Err(invalid(
-                "'response_format' other than 'text' is not supported yet (Kiln Phase 7)",
-            ));
-        }
+        let grammar = match &self.response_format {
+            None => None,
+            Some(format) => match format.format_type.as_str() {
+                "text" => None,
+                // OpenAI "JSON mode": any JSON object, no fixed schema.
+                "json_object" => Some(json_schema_grammar(r#"{"type": "object"}"#.to_owned())),
+                "json_schema" => {
+                    let schema = format
+                        .json_schema
+                        .as_ref()
+                        .and_then(|f| f.schema.as_ref())
+                        .ok_or_else(|| {
+                            invalid(
+                                "'response_format.json_schema.schema' is required when \
+                                 'response_format.type' is 'json_schema'",
+                            )
+                        })?;
+                    Some(json_schema_grammar(schema.to_string()))
+                }
+                other => {
+                    return Err(ApiError::invalid_request(format!(
+                        "unsupported 'response_format.type' '{other}' \
+                         (expected 'text', 'json_object', or 'json_schema')"
+                    )));
+                }
+            },
+        };
         if self.stream_options.is_some() && !self.stream {
             return Err(invalid("'stream_options' requires 'stream': true"));
         }
@@ -181,12 +213,20 @@ impl ChatCompletionRequest {
             sampling,
             max_tokens,
             stop_strings,
+            grammar,
             stream: self.stream,
             include_usage: self
                 .stream_options
                 .as_ref()
                 .is_some_and(|o| o.include_usage),
         })
+    }
+}
+
+/// Wraps a JSON Schema document string as the proto grammar spec.
+fn json_schema_grammar(schema: String) -> GrammarSpec {
+    GrammarSpec {
+        grammar: Some(grammar_spec::Grammar::JsonSchema(schema)),
     }
 }
 
@@ -517,6 +557,69 @@ mod tests {
 
     fn request(body: serde_json::Value) -> ChatCompletionRequest {
         serde_json::from_value(body).expect("request parses")
+    }
+
+    #[test]
+    fn response_format_maps_to_grammar_spec() {
+        // text (and absent) → unconstrained.
+        let v = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+            "response_format": {"type": "text"},
+        }))
+        .validate()
+        .expect("valid");
+        assert!(v.grammar.is_none());
+
+        // json_object → the any-object schema.
+        let v = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+            "response_format": {"type": "json_object"},
+        }))
+        .validate()
+        .expect("valid");
+        match v.grammar.and_then(|g| g.grammar) {
+            Some(grammar_spec::Grammar::JsonSchema(schema)) => {
+                assert_eq!(schema, r#"{"type": "object"}"#);
+            }
+            other => panic!("expected json_schema grammar, got {other:?}"),
+        }
+
+        // json_schema → the client schema, verbatim (as JSON).
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "required": ["a"],
+        });
+        let v = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "t", "schema": schema}},
+        }))
+        .validate()
+        .expect("valid");
+        match v.grammar.and_then(|g| g.grammar) {
+            Some(grammar_spec::Grammar::JsonSchema(sent)) => {
+                let sent: serde_json::Value = serde_json::from_str(&sent).expect("valid JSON");
+                assert_eq!(sent, schema);
+            }
+            other => panic!("expected json_schema grammar, got {other:?}"),
+        }
+
+        // Unknown format type → 400.
+        let err = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+            "response_format": {"type": "yaml"},
+        }))
+        .validate()
+        .expect_err("must reject");
+        assert!(
+            err.message.contains("response_format.type"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

@@ -121,8 +121,10 @@ impl Sampler {
     }
 }
 
-/// `-inf` in the dtype of `like` (keeps filters from promoting f16 logprobs).
-fn neg_inf_like(like: &Array, s: &Stream) -> Result<Array, MlxError> {
+/// `-inf` in the dtype of `like` (keeps filters from promoting f16
+/// logprobs). Shared with the engine's grammar masking, which bans tokens
+/// the same way the filters here do.
+pub(crate) fn neg_inf_like(like: &Array, s: &Stream) -> Result<Array, MlxError> {
     let dtype = like.dtype().unwrap_or(Dtype::Float32);
     ops::astype(&Array::from_f32(f32::NEG_INFINITY), dtype, s)
 }

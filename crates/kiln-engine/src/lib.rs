@@ -12,6 +12,8 @@ pub mod block;
 #[cfg(feature = "metal")]
 pub mod engine;
 #[cfg(feature = "metal")]
+pub mod grammar;
+#[cfg(feature = "metal")]
 pub mod paged;
 pub mod radix;
 #[cfg(feature = "metal")]
@@ -28,6 +30,8 @@ pub use engine::{
     EngineError, EngineRequest, ErrorCause, EventSink, FinishKind, FinishSummary, KvDims,
     PREFILL_PAD_MIN_ROWS, PrefixCacheStats, Priority, SeqEvent, SsdParams, canonical_prefill_len,
 };
+#[cfg(feature = "metal")]
+pub use grammar::{Grammar, GrammarEnv, GrammarError};
 #[cfg(feature = "metal")]
 pub use paged::{KvSpec, PagedKv, WriteRun};
 pub use radix::{ChainHash, RadixCache};

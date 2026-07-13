@@ -61,6 +61,7 @@ fn submit(engine: &mut Engine<&LlamaModel>, prompt: &[u32], max_tokens: usize) -
         },
         penalty_window: 0,
         stop_tokens: std::collections::HashSet::new(),
+        grammar: None,
         priority: Priority::Interactive,
         cancel: Arc::clone(&cancel),
         on_event: Box::new(move |event| {

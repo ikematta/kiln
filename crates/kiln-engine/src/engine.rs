@@ -64,9 +64,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::block::{BlockError, BlockId, BlockManager, BlockTable};
+use crate::grammar::Grammar;
 use crate::paged::{KvSpec, PagedKv, WriteRun};
 use crate::radix::{ChainHash, ROOT, RadixCache};
-use crate::sampler::{PenaltyOptions, Sampler, SamplingOptions, apply_penalties};
+use crate::sampler::{PenaltyOptions, Sampler, SamplingOptions, apply_penalties, neg_inf_like};
 use crate::ssd::{SlabGeometry, SsdStore};
 use crate::step::{SeqStep, StepBatch, StepInput, StepModel};
 
@@ -322,6 +323,11 @@ pub struct EngineRequest {
     /// Recent-token window for the penalties (ignored when disabled).
     pub penalty_window: usize,
     pub stop_tokens: HashSet<u32>,
+    /// Structured-output constraint (SPEC §12 Phase 7): the compiled
+    /// llguidance grammar whose allowed-token mask is applied to this
+    /// request's logits before sampling. `None` = unconstrained — the
+    /// decode step then adds zero ops (golden parity depends on this).
+    pub grammar: Option<Grammar>,
     /// Preemption class (SPEC §6.1).
     pub priority: Priority,
     pub cancel: Arc<AtomicBool>,
@@ -343,6 +349,16 @@ struct Seq {
     sampler: Sampler,
     penalties: PenaltyOptions,
     penalty_window: usize,
+    /// Structured-output constraint; advances by exactly the sampled
+    /// tokens (committed in `settle_sampled`), so its state survives
+    /// preemption untouched — replay never samples, so it never
+    /// re-commits.
+    grammar: Option<Grammar>,
+    /// Mask computed at plan time for this iteration's sample, consumed
+    /// by `sample_from_row`. Always recomputed at the next plan, so a
+    /// mask left behind by a preempted (plan-dropped) step goes stale
+    /// harmlessly: the grammar state it reflects has not changed.
+    pending_mask: Option<Array>,
     priority: Priority,
     /// Submit-order sequence number; stable across preemption, so a
     /// resumed request keeps its seniority ("most-recently-admitted"
@@ -660,10 +676,15 @@ struct InFlight {
 }
 
 /// Last-position logits row -> sampled token `[1]` u32 (the SPEC §6.2
-/// step-3 tail: penalties over the recent window, logprob-normalize,
-/// sample). Shared by the synchronous and pipelined paths; the pipelined
-/// path only ever calls it with penalties disabled, so both build the
-/// identical op graph.
+/// step-3 tail: penalties over the recent window, grammar mask,
+/// logprob-normalize, sample). Shared by the synchronous and pipelined
+/// paths; the pipelined path only ever calls it with penalties disabled
+/// and no grammar, so both build the identical op graph.
+///
+/// The grammar mask (planned in `run_iteration`, where a grammar fault
+/// can finish the sequence in-band) comes last so no other processor can
+/// resurrect a banned token; disallowed logits go to `-inf` before the
+/// normalization, renormalizing the distribution over the allowed set.
 fn sample_from_row(
     seq: &mut Seq,
     logits: &Array,
@@ -676,6 +697,13 @@ fn sample_from_row(
     if !seq.penalties.is_disabled() {
         let window = seq.history.len().saturating_sub(seq.penalty_window);
         last = apply_penalties(&last, &seq.history[window..], seq.penalties, s)?;
+    }
+    if let Some(mask) = seq.pending_mask.take() {
+        // [1, n_vocab] bool, n_vocab = the worker's configured vocab
+        // (GrammarEnv::load); both sides are sized from config.json's
+        // vocab_size, so the shapes agree by construction.
+        debug_assert_eq!(mask.dim(1), vocab, "grammar mask width != logits vocab");
+        last = ops::where_cond(&mask, &last, &neg_inf_like(&last, s)?, s)?;
     }
     let logprobs = ops::subtract(&last, &ops::logsumexp(&last, true, s)?, s)?;
     Ok(seq.sampler.sample(&logprobs, s)?)
@@ -702,12 +730,42 @@ fn settle_sampled(
     seq.fed += 1;
     if seq.cancel.load(Ordering::Acquire) {
         finish(seq, mgr, cache, FinishKind::Cancelled, None, None);
-    } else if seq.stop_tokens.contains(&token) {
+        return;
+    }
+    if seq.stop_tokens.contains(&token) {
         // Counted in usage but not emitted: stop text is excluded from
-        // the stream by contract.
+        // the stream by contract. The grammar (if any) never sees the
+        // stop token — its state only matters for future masks.
         finish(seq, mgr, cache, FinishKind::Stop, Some(token), None);
-    } else if !(seq.on_event)(SeqEvent::Token(token)) {
+        return;
+    }
+    if !(seq.on_event)(SeqEvent::Token(token)) {
         finish(seq, mgr, cache, FinishKind::Cancelled, None, None);
+        return;
+    }
+    // Advance the grammar by the emitted token; completion is a Stop
+    // (the constrained text is done even if the model never sampled EOS,
+    // e.g. under ignore_eos). The token was sampled under this grammar's
+    // mask, so a rejection here is an engine-internal fault.
+    let mut grammar_done = false;
+    if let Some(grammar) = seq.grammar.as_mut() {
+        match grammar.commit(token) {
+            Ok(done) => grammar_done = done,
+            Err(err) => {
+                finish(
+                    seq,
+                    mgr,
+                    cache,
+                    FinishKind::Error,
+                    None,
+                    Some((ErrorCause::Internal, err.to_string())),
+                );
+                return;
+            }
+        }
+    }
+    if grammar_done {
+        finish(seq, mgr, cache, FinishKind::Stop, None, None);
     } else if seq.generated as usize >= seq.max_tokens {
         finish(seq, mgr, cache, FinishKind::Length, None, None);
     }
@@ -957,6 +1015,7 @@ impl<M: StepModel> Engine<M> {
             penalties,
             penalty_window,
             stop_tokens,
+            grammar,
             priority,
             cancel,
             mut on_event,
@@ -991,6 +1050,8 @@ impl<M: StepModel> Engine<M> {
             sampler,
             penalties,
             penalty_window,
+            grammar,
+            pending_mask: None,
             priority,
             arrival,
             cancel,
@@ -1138,14 +1199,18 @@ impl<M: StepModel> Engine<M> {
 
     /// The async_eval pipeline may only span steady-state decode: every
     /// running sequence sampling, penalties off (their windows need the
-    /// previous token host-side), nothing waiting (admission and prefill
-    /// want fresh pool state), no cancel pending (the sweep runs on the
-    /// synchronous path). Capacity is checked exactly in
-    /// `build_pipelined`.
+    /// previous token host-side) and no grammar (its mask for step N+1
+    /// needs step N's token committed host-side), nothing waiting
+    /// (admission and prefill want fresh pool state), no cancel pending
+    /// (the sweep runs on the synchronous path). Capacity is checked
+    /// exactly in `build_pipelined`.
     fn pipeline_ok(&self) -> bool {
         self.waiting.is_empty()
             && self.running.iter().all(|seq| {
-                seq.decoding() && seq.penalties.is_disabled() && !seq.cancel.load(Ordering::Acquire)
+                seq.decoding()
+                    && seq.penalties.is_disabled()
+                    && seq.grammar.is_none()
+                    && !seq.cancel.load(Ordering::Acquire)
             })
     }
 
@@ -1227,8 +1292,8 @@ impl<M: StepModel> Engine<M> {
             for (row, &(i, _)) in group.iter().enumerate() {
                 let seq = &mut self.running[i];
                 debug_assert!(
-                    seq.penalties.is_disabled(),
-                    "pipeline_ok admitted penalties"
+                    seq.penalties.is_disabled() && seq.grammar.is_none(),
+                    "pipeline_ok admitted penalties or a grammar"
                 );
                 let token = sample_from_row(seq, &logits, row as i32, &self.stream)?;
                 rows.push((seq.arrival, token));
@@ -1524,6 +1589,35 @@ impl<M: StepModel> Engine<M> {
             // Feed history[fed]; sample only at the newest entry — older
             // entries are post-preemption replay, already streamed.
             let sample = seq.fed + 1 == seq.history.len();
+            // Grammar mask for this sample (SPEC §6.2 step 3): computed
+            // host-side while the matcher state is authoritative, stored
+            // on the sequence for `sample_from_row`. A grammar fault
+            // fails only this request, in-band.
+            if sample {
+                let Self {
+                    running,
+                    mgr,
+                    cache,
+                    ..
+                } = self;
+                let seq = &mut running[i];
+                if let Some(grammar) = seq.grammar.as_mut() {
+                    match grammar.mask_array() {
+                        Ok(mask) => seq.pending_mask = Some(mask),
+                        Err(err) => {
+                            finish(
+                                seq,
+                                mgr,
+                                cache.as_mut(),
+                                FinishKind::Error,
+                                None,
+                                Some((ErrorCause::Internal, err.to_string())),
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
             if let Some(step) = self.plan_step(i, 1, sample, &mut decode_plans)? {
                 decode_plans.push(DecodePlan {
                     seq: i,
