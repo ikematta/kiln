@@ -28,7 +28,10 @@ pub mod step;
 
 pub use block::{AppendPlan, BlockError, BlockId, BlockManager, BlockTable, CowCopy, CowOutcome};
 #[cfg(feature = "metal")]
-pub use drafter::{DEFAULT_GAMMA, DEFAULT_SPEC_MAX_BATCH, DraftError, Drafter, DrafterMemory};
+pub use drafter::{
+    DEFAULT_GAMMA, DEFAULT_SPEC_MAX_BATCH, DEFAULT_SPEC_MIN_ACCEPTANCE, DraftError, Drafter,
+    DrafterMemory, SPEC_ACCEPTANCE_WARMUP_PROPOSED, spec_gamma_at_width,
+};
 #[cfg(feature = "metal")]
 pub use engine::{
     DEFAULT_BLOCK_SIZE, DEFAULT_DETERMINISTIC_DECODE_WIDTH, DEFAULT_MAX_BATCH_TOKENS,

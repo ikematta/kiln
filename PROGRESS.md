@@ -5026,3 +5026,196 @@
 - Next: unchanged from the previous entry — remaining Phase 8 parts
   (throughput bar, auto-disable heuristics, gateway speculative config
   wiring, CAPABILITY_SPECULATIVE advertisement).
+
+## [2026-07-14] Phase 8 / Part 3 — auto-disable heuristics + throughput acceptance run — DONE (heuristics); §12 speedup bar MEASURED, NOT MET on pinned pairs
+- What:
+  - kiln-engine: SPEC §6.5's batch-width auto-disable is now a stand-down
+    RAMP, not a cliff (`drafter::spec_gamma_at_width`, pure fn,
+    unit-tested): per-round gamma runs full single-stream and shrinks
+    linearly as the admitted batch approaches `spec_max_batch`
+    (4→3→2→1 at widths 1..4 with the defaults), off strictly ABOVE the
+    threshold — SPEC's "auto-disables when batch size > spec_max_batch"
+    is preserved exactly at the boundary. `spec_would_engage` and
+    `collect_proposal` compute the ramp in lockstep, so pipeline-yield
+    and proposal decisions cannot diverge.
+  - Acceptance auto-disable (the heuristic this ledger has carried as
+    "acceptance-rate auto-disable" since part 1): new
+    `EngineConfig::spec_min_acceptance` (default
+    `DEFAULT_SPEC_MIN_ACCEPTANCE = 0.125`; `0.0` disables). Once a
+    request has had `SPEC_ACCEPTANCE_WARMUP_PROPOSED = 16` proposed
+    tokens verified, a verified acceptance rate below the floor stands
+    it down for the rest of its life: draft-side state is released
+    immediately (blocks back to the draft pool), plain decode continues,
+    and — because speculation no longer demands the synchronous path —
+    the request re-enters the async_eval pipeline (asserted: 43
+    pipelined steps after stand-down in the new check). New
+    `SpecStats::standdowns_total` counter.
+  - ADR 0005 boundaries stay HARD cutoffs applied under the heuristics,
+    per the task directive: per-model envelope gamma (attachment-time
+    `speculative_gamma_bound` clamp), deterministic width, and
+    `VERIFY_MAX_KEY_LEN` bound the ramp's output; heuristics only ever
+    shrink a round, never widen the envelope. Documented in the engine
+    module docs and config docs.
+  - spec_decode.rs grows `check_width_ramp` (a gamma-recording drafter
+    observes the exact per-round gamma at every width 1..spec_max_batch)
+    and `check_acceptance_standdown` (total-rejection adversary stood
+    down right after warmup, output exact, pipeline resumed). The
+    self-draft and cross-quant arms now run the production-default
+    heuristic and assert it never fires on healthy pairs
+    (standdowns_total == 0); the adversarial arms set
+    `spec_min_acceptance = 0.0` explicitly so their full rollback
+    pressure is preserved (the heuristic would correctly stand them
+    down — its own checks cover that behavior).
+  - NEW tests/spec_throughput.rs: the Phase 8 throughput acceptance run
+    (#[ignore]d perf measurement, release-only, throughput.rs
+    conventions — median of 5 after a discarded warm-up, decode-window
+    rate, fresh engine per run, prefix cache off). Structural gates:
+    ON == OFF token equality per lane, SPEC §11.3 >50% same-family
+    acceptance, speculation really engaged, no false stand-down. Ratios
+    are recorded here, deliberately NOT gated (see verdict).
+- Decisions:
+  - Ramp formula `ceil(gamma·(spec_max_batch+1−W)/spec_max_batch)`:
+    full gamma at W=1, ≥1 through W=spec_max_batch (SPEC §6.5 disables
+    strictly above), 0 beyond. Chosen over the previous cliff per the
+    task directive ("stand down as batch size approaches
+    spec_max_batch").
+  - Acceptance floor 0.125: break-even acceptance ≈ draft/target cost
+    ratio (a round spends γ·c_draft + c_verify to commit 1+accepted
+    tokens vs c_target for 1), so 1-in-8 never clips a properly-sized
+    pair (deployment ratio ≈ 0.05) while a noise draft stops costing
+    after one warmup window (16 proposed ≈ 4 rounds at γ4).
+  - Stand-down is permanent per request: content that drafts badly stays
+    that content; requests are bounded; periodic re-probe is future work
+    if metrics ever justify it.
+  - Throughput lanes are measured, not speedup-gated: codifying a floor
+    under a measured net LOSS would be meaningless; the correctness and
+    acceptance gates stay.
+- Deviations: none from SPEC text. SPEC §12 Phase 8's "≥1.6× baseline at
+  acceptance >60%" is NOT MET and, on the evidence below, NOT MEETABLE
+  on the pinned tiny pairs — recorded plainly, not reinterpreted; see
+  DECISION NEEDED.
+- Throughput verdict (M-series dev machine, release, single-stream,
+  256-token decode window, median of 5):
+  - qwen3-0.6b-8bit target / qwen3-0.6b-4bit draft (certified pair,
+    envelope bound 7): OFF 104.9 tok/s; ON γ4 74.1 tok/s = 0.71×
+    (acceptance 83.8%, 196/234 over 59 rounds); ON γ3 71.0 tok/s =
+    0.68× (acceptance 89.9%).
+  - qwen2.5-0.5b-4bit self-pair at the ADR 0005 clamp γ3: OFF 224.6
+    tok/s; ON 140.5 tok/s = 0.63× at 100.0% acceptance (191/191).
+  - Plainly: at this model scale speculation is a NET LOSS single-stream
+    on every pair the pins can form, despite acceptance far above the
+    >60% qualifier and exact outputs. The physics: the draft:target
+    weight ratio is ~0.65 (633,442,994 / 968,893,578 bytes), so γ draft
+    forwards + a verify cost more than the plain steps they replace, and
+    a speculating request additionally forfeits the async_eval pipeline.
+    Speculation's value case rests entirely on the size-gap pair SPEC
+    §12 names (0.6B drafting 8–14B, cost ratio ≈ 0.05–0.1), which no
+    pinned CI model provides.
+  - The γ4→γ3 clamp itself costs ~3 points of ratio on the healthy pair
+    (0.71× → 0.68×): the ADR 0005 clamp is a minor erosion next to the
+    draft-cost economics — clamping is NOT what makes tiny pairs
+    unprofitable, so no model class loses a win it otherwise had.
+  - The acceptance heuristic CANNOT catch this loss (acceptance is high;
+    the loss is cost-ratio-driven and invisible to the engine).
+    Guarding it is a deployment-configuration concern; candidate future
+    work: an attachment-time weights-byte-ratio warning in the worker,
+    which knows both byte counts. Not implemented, recorded here.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-engine --lib drafter
+  3 passed (spec_gamma_at_width ramp: defaults, monotonicity+bounds over
+  gamma/smb grids, edges incl. the qwen2.5 gamma-3 clamp shape)
+
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --test spec_decode -- --nocapture
+  every fixture model exact under speculation, both drafters (self 99-100%,
+  adversarial 0.2-0.6%); envelope-disabled models (gemma-2, smollm2-bf16)
+  exact on the plain path; qwen3-0.6b-8bit/4bit cross-quant 46/66 (69.7%),
+  warm-prefix composition intact
+  spec_max_batch gate: width 6 never consulted; narrowed batch did
+  width ramp: 1 requests -> gamma bound 4 over 14 consultations
+  width ramp: 2 requests -> gamma bound 3 over 28 consultations
+  width ramp: 3 requests -> gamma bound 2 over 42 consultations
+  width ramp: 4 requests -> gamma bound 1 over 56 consultations
+  acceptance stand-down: 4 rounds (0/16 accepted), stood down after warmup,
+    43 pipelined steps afterwards, output exact
+  in-situ rollback: 1191ns/round @ 8-token vs 1262ns/round @ 900-token
+  kv-envelope crossing: 22 rounds, clean stop, output exact
+  test result: ok. 1 passed (128.86s)
+
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --release --test spec_throughput -- --ignored --nocapture
+  == qwen3-0.6b-8bit target / qwen3-0.6b-4bit draft: prompt 39 tokens,
+     decode 256, deterministic width 9, ADR 0005 envelope Some(7)
+     speculation OFF: 104.9 tok/s
+     ON gamma 4 (envelope: unclamped): 74.1 tok/s -> 0.71x OFF,
+       acceptance 196/234 (83.8%) over 59 rounds, 15 rollback rounds
+     ON gamma 3 (the clamp shape, priced on a real pair): 71.0 tok/s
+       -> 0.68x OFF, acceptance 186/207 (89.9%) over 69 rounds
+  == qwen2.5-0.5b-4bit self-pair: ADR 0005 envelope Some(3)
+     speculation OFF: 224.6 tok/s
+     ON gamma 3 (ADR 0005 clamp; self-draft): 140.5 tok/s -> 0.63x OFF,
+       acceptance 191/191 (100.0%) over 64 rounds, 0 rollback rounds
+  test result: ok. 1 passed (77.79s)
+
+  $ KILN_TEST_MODELS=... cargo test -p kiln-worker --test draft -- --nocapture
+  incompatible pair rejected as UNHEALTHY ... out-of-envelope target
+  rejected as UNHEALTHY ... draft/verify over RPC ok: weights 633442994
+  -> 968893578 bytes, 24 identical tokens, 16/27 draft tokens accepted
+  test result: ok. 1 passed (16/27 = 59% >> the 12.5% floor: no stand-down)
+
+  $ KILN_TEST_MODELS=... cargo test --workspace
+  all 50 test binaries ok, exit 0 (golden 641s, spec_decode 128s incl.
+  the new heuristic checks, batching/preemption/prefix/leak/worker/
+  gateway suites green).
+  NOTE for future sessions: a first workspace run failed spuriously
+  ("worker did not settle in 180s" in kiln-worker/tests/draft.rs)
+  because a concurrent `cargo build --workspace --no-default-features`
+  in the same checkout overwrote target/debug/kiln-worker with the
+  Metal-less shape mid-run — CARGO_BIN_EXE spawns resolve to that path.
+  Never share a target dir between a running test suite and another
+  cargo invocation. Serial rerun: green.
+  $ cargo build --workspace --no-default-features          -> clean (linux shape)
+  $ cargo clippy --workspace --all-targets -- -D warnings  -> clean (both shapes)
+  $ cargo fmt --all --check                                -> clean
+  $ ruff check / ruff format --check python/ tests/e2e     -> clean
+  $ pytest python/kiln_worker_py/tests                     -> 35 passed
+  $ uv run --project tests/e2e pytest tests/e2e            -> 77 passed, 2 skipped
+  ```
+- Next: PR opened from `claude/p8-autodisable-throughput`; record CI
+  verification per protocol. Then the remaining Phase 8 parts: gateway
+  `[model.speculative]` → `--draft-model` config wiring, then
+  CAPABILITY_SPECULATIVE advertisement (the measured verdict above
+  should inform whether tiny-ratio draft configs warn at attach).
+- DECISION NEEDED: disposition of the SPEC §12 Phase 8 speedup bar
+  ("≥1.6× at acceptance >60%"). The bar is measured NOT MET on every
+  pinned pair, and the arithmetic says no pinned pair can meet it (at
+  weight-cost ratio ~0.65, even 100% acceptance caps below ~1.4× before
+  overheads; measured reality is 0.63–0.71×). Options:
+  A) Amend the bar via ADR to name the deployment shape (0.6B drafting
+     8–14B on the operator's hardware) as the measurement that gates
+     CAPABILITY_SPECULATIVE advertisement, keeping tiny-pair CI lanes
+     correctness-only. Honest, but the bar is then unverifiable in CI.
+  B) Pin one mid-size model (e.g. a 7–8B 4-bit, ~4.5 GB) solely for a
+     dev-machine/perf-lane measurement of the real pair. Verifiable, but
+     grows the pinned set and the perf lane's runtime materially.
+  Per protocol: picking nothing; the heuristics and measurement stand
+  regardless of the disposition.
+
+## [2026-07-14] Phase 8 / Part 3 — PR #22 CI verification recorded — DONE
+- What: PR #22 (`claude/p8-autodisable-throughput`, commit 67fc8f4) run
+  29321876048: ALL FOUR checks pass on the real runners — lint 44s,
+  compile-linux 55s, test-macos-release 3m20s, test-macos 25m13s.
+- The blocking spec_decode lane (`KILN_FIXTURE_PARITY=skip`, live
+  speculation-off baselines) passed on the foreign GPU with the part 3
+  heuristics live: width ramp, acceptance stand-down, and the
+  production-default no-false-fire assertions all held on a different
+  device class — the heuristics are policy over the device-independent
+  SPEC §6.5 invariant, exactly as designed.
+- Advisory golden lane (ADR 0004, permanently non-blocking): the ONLY
+  divergence is the known gemma-3-1b-it-4bit/chat-basic flip — the same
+  fixture and class recorded in ADR 0004 (4-ULP fp16 race, kernel-class
+  coin toss on the foreign device). No pattern change → no action per
+  the ADR; noted here per its protocol.
+- Next: PM ruling on the DECISION NEEDED above (disposition of the SPEC
+  §12 Phase 8 speedup bar), then the remaining Phase 8 parts — gateway
+  `[model.speculative]` → `--draft-model` config wiring, then
+  CAPABILITY_SPECULATIVE advertisement.
