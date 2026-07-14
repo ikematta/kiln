@@ -69,24 +69,42 @@ for pin in "${PINS[@]}"; do
   wanted "$name" || continue
   echo "==> $name ($repo @ ${rev:0:12})"
   python3 - "$repo" "$rev" "$DEST/$name" <<'PYEOF'
-"""Stdlib-only pinned-revision HF downloader with sha256 verification."""
+"""Stdlib-only pinned-revision HF downloader with sha256 verification.
+
+Every request carries a socket timeout and a bounded retry budget so a dead
+connection fails fast instead of blocking read() forever (CI run 29305594680:
+1h42m hang in this step). Large files stream to a .part file and resume via
+HTTP Range. The stall detector only sees a fully silent socket; a connection
+trickling a few bytes per timeout window is bounded by the CI step
+timeout-minutes, not here.
+"""
 
 import hashlib
+import http.client
 import json
+import os
 import pathlib
 import sys
+import time
+import urllib.error
 import urllib.request
 
 repo, rev, dest = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
 marker = dest / ".kiln-revision"
 
 SKIP_PREFIXES = (".", "README")
+# Standard hub override knob (mirrors; the stall tests point it at a local
+# misbehaving server). Default is the real hub — pins stay frozen either way.
+ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+UA = {"User-Agent": "kiln-fetch-test-model"}
+STALL_TIMEOUT_S = 30  # no bytes on the socket for this long = dead connection
+MAX_ATTEMPTS = 4
+RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
 
 
-def fetch(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "kiln-fetch-test-model"})
-    with urllib.request.urlopen(req) as resp:  # noqa: S310 (https only)
-        return resp.read()
+def backoff(attempt: int) -> None:
+    if attempt > 1:
+        time.sleep(5 * (attempt - 1))
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -97,9 +115,72 @@ def sha256_file(path: pathlib.Path) -> str:
     return h.hexdigest()
 
 
-tree = json.loads(
-    fetch(f"https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=true")
-)
+def fetch_json(url: str):
+    last = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        backoff(attempt)
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=STALL_TIMEOUT_S) as resp:  # noqa: S310
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code not in RETRYABLE_HTTP:
+                sys.exit(f"HTTP {e.code} for {url}")
+            last = e
+        except (OSError, http.client.HTTPException) as e:
+            last = e
+        print(f"    attempt {attempt}/{MAX_ATTEMPTS} failed: {last}", flush=True)
+    sys.exit(f"giving up on {url} after {MAX_ATTEMPTS} attempts: {last}")
+
+
+def download(url: str, out: pathlib.Path, size: int, lfs_sha) -> None:
+    part = out.parent / (out.name + ".part")
+    last = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        backoff(attempt)
+        try:
+            part.touch()  # size-0 files skip the request loop but still rename
+            offset = part.stat().st_size
+            if offset > size:
+                part.unlink()
+                offset = 0
+            if offset < size:
+                headers = dict(UA)
+                if offset:
+                    print(f"    resuming {out.name} at {offset / 1e6:.1f} MB", flush=True)
+                    headers["Range"] = f"bytes={offset}-"
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=STALL_TIMEOUT_S) as resp:  # noqa: S310
+                    if offset and resp.status != 206:
+                        offset = 0  # server ignored the Range; restart
+                    with part.open("ab" if offset else "wb") as f:
+                        # read1, not read: read(n) blocks until n bytes are
+                        # buffered, so a stall mid-chunk would discard the
+                        # partial chunk; read1 banks bytes as they arrive and
+                        # the next attempt resumes from the true offset.
+                        while chunk := resp.read1(1 << 20):
+                            f.write(chunk)
+            got = part.stat().st_size
+            if got != size:
+                raise OSError(f"short body: got {got}, want {size}")
+            if lfs_sha is not None and sha256_file(part) != lfs_sha:
+                part.unlink()  # never retry on top of a corrupt prefix
+                raise OSError("sha256 mismatch, partial discarded")
+            part.replace(out)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 416:  # resume window refused; start over
+                part.unlink(missing_ok=True)
+            elif e.code not in RETRYABLE_HTTP:
+                sys.exit(f"HTTP {e.code} for {url}")
+            last = e
+        except (OSError, http.client.HTTPException) as e:
+            last = e
+        print(f"    attempt {attempt}/{MAX_ATTEMPTS} failed for {out.name}: {last}", flush=True)
+    sys.exit(f"giving up on {out.name} after {MAX_ATTEMPTS} attempts: {last}")
+
+
+tree = fetch_json(f"{ENDPOINT}/api/models/{repo}/tree/{rev}?recursive=true")
 files = [
     e
     for e in tree
@@ -118,15 +199,8 @@ for entry in files:
             print(f"    ok       {path}")
             continue
     out.parent.mkdir(parents=True, exist_ok=True)
-    print(f"    fetching {path} ({size / 1e6:.1f} MB)")
-    data = fetch(f"https://huggingface.co/{repo}/resolve/{rev}/{path}")
-    if len(data) != size:
-        sys.exit(f"size mismatch for {path}: got {len(data)}, want {size}")
-    if lfs_sha is not None:
-        got = hashlib.sha256(data).hexdigest()
-        if got != lfs_sha:
-            sys.exit(f"sha256 mismatch for {path}: got {got}, want {lfs_sha}")
-    out.write_bytes(data)
+    print(f"    fetching {path} ({size / 1e6:.1f} MB)", flush=True)
+    download(f"{ENDPOINT}/{repo}/resolve/{rev}/{path}", out, size, lfs_sha)
 
 marker.write_text(f"{repo}@{rev}\n")
 print(f"    done -> {dest}")

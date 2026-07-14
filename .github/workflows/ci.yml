@@ -100,8 +100,14 @@ jobs:
         with:
           path: ~/.kiln/test-models
           key: test-models-${{ hashFiles('scripts/fetch-test-model.sh') }}
+      # timeout-minutes backstops what the script's own stall detector can't
+      # see (a connection trickling bytes too slowly to ever finish; run
+      # 29305594680 attempt 1 hung here 1h42m). Observed cold-cache fetches
+      # take 4-13 min on this runner; 30 min is >2x the slowest observed and
+      # well under the 6 h job limit.
       - name: Fetch pinned test models
         if: steps.test-models.outputs.cache-hit != 'true'
+        timeout-minutes: 30
         run: ./scripts/fetch-test-model.sh
       - run: cargo build --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings

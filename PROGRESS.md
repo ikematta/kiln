@@ -4961,3 +4961,68 @@
   acceptance-rate auto-disable heuristics, gateway `[model.speculative]`
   → `--draft-model` config wiring, then CAPABILITY_SPECULATIVE
   advertisement.
+
+## [2026-07-14] CI infra — stalled-download hardening for fetch-test-model.sh — DONE
+- What:
+  - Incident: CI run 29305594680 attempt 1, "Fetch pinned test models"
+    ran 04:20:02→06:02:43 (1h42m, manually cancelled) after a cache miss
+    hit a stalled HF connection. Root cause: the embedded stdlib
+    downloader called `urllib.request.urlopen` with NO timeout, so a
+    dead socket blocked `read()` forever.
+  - `scripts/fetch-test-model.sh`: every request now carries a 30 s
+    socket stall timeout and a 4-attempt retry budget with linear
+    backoff (5/10/15 s); non-retryable HTTP codes fail immediately.
+    Large files stream to a `.part` file (no longer read whole into
+    memory) and resume across attempts/invocations via HTTP Range; the
+    pinned lfs sha256 is verified on the `.part` before an atomic
+    rename, and a sha mismatch discards the partial rather than
+    resuming onto a corrupt prefix. Worst-case dead-connection cost is
+    now ~150 s per file, measured, vs unbounded.
+  - `.github/workflows/ci.yml`: `timeout-minutes: 30` on the fetch step
+    as the second line of defense — it bounds what the socket-level
+    detector can't see (a connection trickling a few bytes per timeout
+    window). Sizing: the only two observed real cold-cache fetches on
+    the runner took 3m56s (run 29116444273) and 12m20s (29113687692);
+    30 min is >2x the slowest observed and far below the 6 h job limit.
+  - Pins and sha256s untouched (diff touches zero PINS lines);
+    interface unchanged (`--only`, `--list`, `KILN_TEST_MODELS` layout,
+    `.kiln-revision` marker).
+- Decisions:
+  - Kept the stdlib-Python downloader instead of switching to curl: the
+    semantics map 1:1 (socket timeout ≈ `--speed-time` for a dead
+    connection, Range resume ≈ `-C -`, bounded attempts ≈ `--retry`)
+    and it avoids depending on curl behavior differences across hosts.
+  - Honor `HF_ENDPOINT` (the standard HF hub override env var, default
+    unchanged) so the stall tests can aim the real script at a local
+    misbehaving server. Additive knob, not an interface change.
+  - `resp.read1()` instead of `resp.read(n)` in the stream loop — found
+    by the stall simulation, not by inspection: `read(n)` blocks until
+    the full chunk buffers, so a mid-chunk stall discarded the partial
+    bytes and every retry restarted from byte 0 (the test server logged
+    four Range-less requests). With read1 the bytes bank as they arrive
+    and the retry resumed from the true offset.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ KILN_TEST_MODELS=<tmp> ./scripts/fetch-test-model.sh --only smollm2-135m-bf16
+      fetching model.safetensors (269.1 MB) ... done   (1m43s, real HF, sha256 gate passed)
+  rerun -> all "ok"; flip 1 byte at offset 1000000 (size unchanged), rerun
+      -> "fetching model.safetensors" (sha256 re-check caught it), re-fetch clean
+  SIGKILL mid-download at 30.4 MB, rerun against real HF CDN:
+      "resuming model.safetensors at 30.4 MB" -> 206 resume, full-file sha256 passed
+  stall simulations (local deliberately-misbehaving server via HF_ENDPOINT):
+    A: TCP accepted, server never sends a byte  -> 4x "timed out", exit=1 in 150s
+    B: headers arrive, body never does          -> 4x "timed out", exit=1 in 150s
+    C: 512 KiB then silence; Range honored      -> stall detected in 30s, resumed
+       at 524288, exit=0; downloaded sha256 == server payload sha256 (fbbab289...)
+    D: C plus a size-0 file in the tree         -> empty file created, no request,
+       no .part leftovers, marker written
+  (pre-hardening baseline on scenario A/B shapes: hangs indefinitely — the incident)
+  $ bash -n scripts/fetch-test-model.sh; ./scripts/fetch-test-model.sh --list
+      -> OK, pins print byte-identical
+  $ cargo fmt --all --check && cargo clippy --workspace -- -D warnings  -> clean
+  $ ruff check / ruff format --check python/ tests/e2e                  -> clean
+  ```
+- Next: unchanged from the previous entry — remaining Phase 8 parts
+  (throughput bar, auto-disable heuristics, gateway speculative config
+  wiring, CAPABILITY_SPECULATIVE advertisement).
