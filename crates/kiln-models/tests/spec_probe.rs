@@ -24,8 +24,14 @@
 //!   reads the top-2 gap, and reruns the same state through 2/3/4/5-row
 //!   verify shapes — the bit boundary sits exactly at 5 rows.
 //!
-//! Keep in sync with the DECISION NEEDED entry in PROGRESS.md; delete
-//! once the resolution lands and the evidence is recorded in an ADR.
+//! RESOLVED by ADR 0005 (the dispatch-envelope clamp): production paths
+//! clamp gamma so a verify never leaves the fused 1-pass vector class —
+//! qwen2.5-0.5b lands at gamma 3, gemma2 (manual attention) and dense
+//! trunks are excluded, and verify key length is capped inside the
+//! 1-pass region. These probes construct the UNCLAMPED gamma=4 shape on
+//! purpose: they remain the reproducible evidence for the ADR and will
+//! print divergences at gamma 4 for as long as the pinned MLX dispatches
+//! this way (re-run at every pin bump per ADR 0001's process).
 
 #![cfg(feature = "metal")]
 
@@ -242,7 +248,6 @@ fn load_fixtures(model_name: &str, model_dir: &PathBuf) -> Vec<(String, Fixture,
 /// reports the raw-logit and logprob gap between the fixture's token and
 /// the speculation run's token, and whether a 5-row verify-shaped forward
 /// from this SAME (plain-built) KV state flips row 0.
-#[test]
 fn measure_qwen25_divergence_gap() {
     use kiln_engine::{
         BlockManager, BlockTable, KvSpec, PagedKv, SeqStep, StepBatch, StepInput, StepModel,
@@ -457,7 +462,6 @@ fn measure_qwen25_divergence_gap() {
     }
 }
 
-#[test]
 fn characterize_qwen25_divergence() {
     if !kiln_mlx::memory::metal_is_available() {
         eprintln!("skipping: no Metal");
@@ -586,4 +590,14 @@ fn characterize_qwen25_divergence() {
             );
         }
     }
+}
+
+/// One #[test] because cases in a binary run concurrently and these
+/// probes both drive the GPU (the same single-engine-thread discipline
+/// every other Metal suite follows); the gap measurement runs first
+/// (fast), then the shape matrix.
+#[test]
+fn speculation_kernel_class_probes() {
+    measure_qwen25_divergence_gap();
+    characterize_qwen25_divergence();
 }

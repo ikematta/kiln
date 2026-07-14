@@ -113,9 +113,12 @@ jobs:
       # ruling: suites asserting device-independent invariants (same-device
       # warm-vs-cold, pressured-vs-solo, engine-vs-contiguous, leak
       # counters, RPC semantics) gate the job. KILN_FIXTURE_PARITY=skip
-      # carves the committed-fixture comparisons out of the two mixed
-      # suites (preemption, prefill_pad); dev-machine runs leave it unset
-      # and run everything.
+      # carves the committed-fixture comparisons out of the mixed suites
+      # (preemption, prefill_pad; for spec_decode it swaps the committed-
+      # fixture baselines for a live speculation-off run — the
+      # device-independent SPEC §6.5 on-vs-off invariant, blocking under
+      # the ADR 0005 envelope); dev-machine runs leave it unset and run
+      # everything.
       - name: Model-gated suites (device-independent, blocking)
         run: |
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
@@ -124,7 +127,8 @@ jobs:
           cargo test -p kiln-engine --test grammar
           cargo test -p kiln-models --test batching --test calibration \
             --test draft --test leak --test leak_batched --test preemption \
-            --test prefill_pad --test prefix_cache --test prefix_multiturn
+            --test prefill_pad --test prefix_cache --test prefix_multiturn \
+            --test spec_decode
           cargo test -p kiln-worker --test rpc --test grammar --test draft
       # PERMANENTLY advisory (ADR 0004): golden bit-exactness is a
       # same-device bar bound to the fixture-generating device class;

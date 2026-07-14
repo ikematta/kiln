@@ -52,16 +52,21 @@
 //! speculation on (self-draft and adversarial) and requires
 //! token-identical output.
 //!
-//! KNOWN LIMIT (PROGRESS 2026-07-13, DECISION NEEDED — resolution
-//! pending): the SDPA leg of that argument is falsified for
-//! high-GQA-factor models. The pinned MLX keeps the vector kernel only
-//! while `query_len * gqa_factor <= 32` (and query_len <= 8); qwen2.5-
-//! 0.5b's factor is 7, so a gamma=4 verify (5 rows, 35 > 32) silently
-//! takes the UNFUSED composed-op attention and a measured 1-fp16-ULP
-//! argmax race flips (qwen2.5-0.5b/chat-basic, generated index 33). The
-//! deterministic-width clamp above does NOT cover this dispatch axis;
-//! until the PM-directed resolution lands, the spec_decode gate is the
-//! bar and speculation must not ship for such shapes.
+//! The SDPA leg is held by the ADR 0005 envelope, enforced at drafter
+//! attachment (worker) plus per-round here: the pinned MLX keeps the
+//! fused vector kernel only while `query_len <= 8` and
+//! `query_len * gqa_factor <= 32` (so `gamma` is clamped per model via
+//! `AnyModel::speculative_gamma_bound`), and only while the key length
+//! stays inside the 1-pass region ([`VERIFY_MAX_KEY_LEN`] — the 2-pass
+//! variant's partition geometry varies with query count, key length,
+//! and device class, so it is out of the certified envelope). Within
+//! the 1-pass vector kernel, per-row bits are invariant to query count
+//! and key length by kernel construction (fixed stride-32 key
+//! assignment, index-ordered online softmax, fixed reduction tree,
+//! identical used-key sets under the bottom-right causal mask) — the
+//! source-verified argument recorded in ADR 0005, discovered when a
+//! gamma=4 verify on gqa-factor-7 qwen2.5-0.5b silently left the fused
+//! kernel and flipped a measured 1-fp16-ULP argmax race.
 //!
 //! Decode pipelining (SPEC §6.2, the async_eval pipeline of
 //! `generate.rs` lifted to the batch): a steady-state pure-decode step
@@ -175,6 +180,17 @@ pub const PREFILL_PAD_MIN_ROWS: usize = 32;
 /// machine), so this conservative default only governs engines built
 /// without calibration.
 pub const DEFAULT_DETERMINISTIC_DECODE_WIDTH: usize = 4;
+
+/// Largest key length a speculative verify forward may reach (ADR 0005):
+/// the pinned MLX routes fused-vector SDPA to its 2-pass variant at key
+/// length >= 1024 on 'd'/'s'-class GPUs (>= 4096 with GQA elsewhere), and
+/// the 2-pass partition geometry varies with query count and key length —
+/// outside the certified kernel class. 1023 keeps every verify in the
+/// 1-pass region on EVERY device class; requests simply stop speculating
+/// (plain decode continues) once their context outgrows it. Refinable to
+/// the per-device boundary via `mlx_device_info` (architecture string) —
+/// recorded in ADR 0005, not implemented.
+pub const VERIFY_MAX_KEY_LEN: usize = 1023;
 
 /// Cache maintenance cadence in decode iterations (mirrors the Phase-3
 /// loop's `clear_cache` every 256 steps).
@@ -1030,10 +1046,15 @@ impl<M: StepModel> Engine<M> {
 
     /// Attaches the speculative-decoding proposer (SPEC §6.5): eligible
     /// greedy requests now decode through draft/verify rounds inside the
-    /// batch step. Precondition (enforced by the worker, not here): the
-    /// drafter proposes token ids in the target's tokenizer — attach only
-    /// after `kiln_models::check_draft_compat` (or equivalent) has passed;
-    /// a mismatched pair must be rejected loudly at load, never attached.
+    /// batch step. Preconditions (enforced by the worker, not here):
+    /// - the drafter proposes token ids in the target's tokenizer —
+    ///   attach only after `kiln_models::check_draft_compat` (or
+    ///   equivalent) has passed; a mismatched pair must be rejected
+    ///   loudly at load, never attached;
+    /// - `config.gamma` has been clamped to the target's ADR 0005
+    ///   envelope (`AnyModel::speculative_gamma_bound`); a target with no
+    ///   envelope (`None`) must be rejected loudly, never attached with
+    ///   speculation silently inert.
     pub fn set_drafter(&mut self, drafter: Box<dyn Drafter>) {
         self.drafter = Some(drafter);
     }
@@ -1392,7 +1413,12 @@ impl<M: StepModel> Engine<M> {
             && self.config.deterministic_decode_width > 1
             && self.running.len() <= self.config.spec_max_batch
             && self.running.iter().any(|seq| {
-                seq.spec_eligible() && seq.max_tokens.saturating_sub(seq.generated as usize) >= 2
+                seq.spec_eligible()
+                    && seq.max_tokens.saturating_sub(seq.generated as usize) >= 2
+                    // A gamma=1 verify (2 rows) must still fit the ADR 0005
+                    // key-length envelope; past it the request decodes
+                    // plainly and may pipeline again.
+                    && seq.processed + seq.fed + 2 <= VERIFY_MAX_KEY_LEN
             })
     }
 
@@ -1417,15 +1443,22 @@ impl<M: StepModel> Engine<M> {
         }
         // Clamp gamma so the verify segment's gamma+1 rows stay within the
         // ADR 0002 deterministic width (speculating requests are greedy —
-        // their verify forward must reproduce M=1 bits) and within the
-        // request's remaining budget (proposing past max_tokens is waste).
+        // their verify forward must reproduce M=1 bits), within the
+        // request's remaining budget (proposing past max_tokens is waste),
+        // and within the ADR 0005 1-pass key-length envelope (the verify's
+        // key length is offset + gamma + 1; past [`VERIFY_MAX_KEY_LEN`]
+        // the request stops speculating and decodes plainly). The
+        // per-model fused-vector clamp (gamma+1 <= min(8, 32/gqa)) is
+        // baked into `config.gamma` by the worker at drafter attachment.
         let seq = &self.running[i];
         let remaining = seq.max_tokens.saturating_sub(seq.generated as usize);
+        let offset = seq.processed + seq.fed;
         let gamma = self
             .config
             .gamma
             .min(self.config.deterministic_decode_width.saturating_sub(1))
-            .min(remaining.saturating_sub(1));
+            .min(remaining.saturating_sub(1))
+            .min(VERIFY_MAX_KEY_LEN.saturating_sub(offset + 1));
         if gamma == 0 {
             return None;
         }

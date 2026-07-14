@@ -120,6 +120,109 @@ impl AnyModel {
         }
     }
 
+    /// The certified speculative-decoding envelope for THIS checkpoint
+    /// (ADR 0005): the largest `gamma` whose gamma+1-row verify forward
+    /// provably runs the same attention kernel class as plain (1-row)
+    /// decode at the pinned MLX — `None` means speculation is
+    /// unsupported for this model and a configured drafter must be
+    /// rejected loudly at attach.
+    ///
+    /// Derived from the checkpoint's config, never hardcoded per model:
+    /// - the architecture module must take the fused-SDPA decode path
+    ///   (gemma2's manual softcapped attention has no kernel-class
+    ///   certificate: its score/probs matmuls change gemv/gemm class
+    ///   with the query row count);
+    /// - the trunk must be quantized (dense trunks carry no fine-shape
+    ///   bit guarantee — the ADR 0002 addendum precedent);
+    /// - `head_dim` must be in the pinned fused-vector kernel's set
+    ///   {64, 96, 128, 256} with equal Q/V head dims (outside it even
+    ///   plain decode runs the unfused fallback, so no class equality
+    ///   exists to preserve);
+    /// - `gamma + 1 <= min(8, 32 / gqa_factor)` — the pinned
+    ///   `supports_sdpa_vector` predicate (verified from
+    ///   mlx/backend/metal/scaled_dot_product_attention.cpp, uniform
+    ///   across devices and dtypes at the pin).
+    ///
+    /// The engine-side pieces of the envelope — the ADR 0002
+    /// deterministic-width clamp and the 1-pass kv-length bound — live
+    /// in kiln-engine; the worker combines all of them at drafter
+    /// attachment. PRECONDITION FOR NEW ARCHITECTURES (ADR 0005): a new
+    /// model family must be reviewed against this envelope AND pass the
+    /// full spec_decode gate on the generating device before speculation
+    /// is enabled for it; this method returning `Some` for an unreviewed
+    /// geometry is not by itself permission.
+    pub fn speculative_gamma_bound(&self) -> Option<usize> {
+        // (n_heads, n_kv_heads, head_dim, quantized, fused-SDPA path)
+        let (heads, kv_heads, head_dim, quantized, fused) = match self {
+            Self::Llama(m) => {
+                let c = m.config();
+                (
+                    c.num_attention_heads,
+                    c.num_kv_heads(),
+                    c.head_dim(),
+                    c.quantization.is_some(),
+                    true,
+                )
+            }
+            Self::Qwen2(m) => {
+                let c = m.config();
+                (
+                    c.num_attention_heads,
+                    c.num_key_value_heads,
+                    c.head_dim(),
+                    c.quantization.is_some(),
+                    true,
+                )
+            }
+            Self::Qwen3(m) => {
+                let c = m.config();
+                (
+                    c.num_attention_heads,
+                    c.num_key_value_heads,
+                    c.head_dim,
+                    c.quantization.is_some(),
+                    true,
+                )
+            }
+            // gemma2 always runs the reference's manual softcapped
+            // attention (see gemma2.rs) — never fused SDPA.
+            Self::Gemma2(m) => {
+                let c = m.config();
+                (
+                    c.num_attention_heads,
+                    c.num_key_value_heads,
+                    c.head_dim,
+                    c.quantization.is_some(),
+                    false,
+                )
+            }
+            Self::Gemma3(m) => {
+                let c = m.config();
+                (
+                    c.num_attention_heads,
+                    c.num_key_value_heads,
+                    c.head_dim,
+                    c.quantization.is_some(),
+                    true,
+                )
+            }
+        };
+        if !quantized || !fused || kv_heads == 0 {
+            return None;
+        }
+        if !matches!(head_dim, 64 | 96 | 128 | 256) {
+            return None;
+        }
+        // MLX computes gqa_factor by integer division of head counts.
+        let gqa_factor = heads / kv_heads;
+        if gqa_factor == 0 {
+            return None;
+        }
+        let max_query_rows = (32 / gqa_factor).min(8);
+        // gamma >= 1 needs at least two query rows in the vector class.
+        (max_query_rows >= 2).then(|| max_query_rows - 1)
+    }
+
     /// ADR 0002 B' startup calibration: the widest per-forward row count
     /// whose rows stay bit-identical to M=1 on this device, across every
     /// projection shape in the loaded model. Feeds

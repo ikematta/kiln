@@ -46,6 +46,9 @@ use tonic::transport::{Channel, Endpoint, Uri};
 const TARGET_NAME: &str = "qwen3-0.6b-8bit";
 const DRAFT_NAME: &str = "qwen3-0.6b-4bit";
 const INCOMPATIBLE_TARGET_NAME: &str = "llama-3.2-1b-4bit";
+/// Tokenizer-compatible with itself, but its manual softcapped attention
+/// puts it outside the ADR 0005 speculation envelope.
+const OUT_OF_ENVELOPE_NAME: &str = "gemma-2-2b-it-4bit";
 /// Generous cap: model load on a cold CI runner dominates.
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Cap on any single stream read; real events arrive per decode step.
@@ -230,6 +233,28 @@ async fn draft_verify_over_rpc_with_compat_gate() {
             "the rejection must name its cause in the health detail: {detail}"
         );
         eprintln!("incompatible pair rejected as UNHEALTHY: {detail}");
+    }
+
+    // --- Loud rejection #2 (ADR 0005): a tokenizer-COMPATIBLE pair whose
+    // target has no certified verify kernel class (gemma2's manual
+    // softcapped attention) must also fail the load — never serve with
+    // the requested speculation silently inert.
+    if let Some(gemma2) = named_model_dir(OUT_OF_ENVELOPE_NAME) {
+        let self_draft = gemma2.display().to_string();
+        let worker = Worker::spawn(&gemma2, "envelope", &["--draft-model", &self_draft]);
+        let (_, state, detail) = worker.settled_state().await;
+        assert_eq!(
+            state,
+            WorkerState::Unhealthy,
+            "an out-of-envelope target with a configured draft must fail the load: {detail}"
+        );
+        assert!(
+            detail.contains("envelope"),
+            "the rejection must name the ADR 0005 envelope: {detail}"
+        );
+        eprintln!("out-of-envelope target rejected as UNHEALTHY: {detail}");
+    } else {
+        eprintln!("skipping envelope-rejection case: {OUT_OF_ENVELOPE_NAME} missing");
     }
 
     // --- Baseline: compatible target, no draft.

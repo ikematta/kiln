@@ -238,10 +238,18 @@ fn engine_config(model: &AnyModel, det_width: usize) -> EngineConfig {
     // Production posture, golden.rs pool sizing; prefix cache stays ON so
     // speculation and the radix cache are proven composing (SPEC §12
     // Phase 8 acceptance), incl. donation of verify-round partial tails.
+    // Gamma is clamped to the ADR 0005 envelope exactly as the worker
+    // clamps it at drafter attachment; a model with no envelope gets
+    // gamma 0 (speculation structurally off — the worker would refuse
+    // the attach outright, but the suite still proves the plain path).
     let mut config = EngineConfig {
         num_blocks: 256,
         deterministic_decode_width: det_width,
         ..EngineConfig::default()
+    };
+    config.gamma = match model.speculative_gamma_bound() {
+        Some(bound) => config.gamma.min(bound),
+        None => 0,
     };
     if model.monolithic_prefill_required() {
         config.prefill_fine_chunk = config.prefill_chunk;
@@ -316,12 +324,14 @@ fn run_model_with_speculation(
             (name, fixture, prompt_ids)
         })
         .collect();
-    let gamma_effective = EngineConfig::default()
-        .gamma
+    let envelope = model.speculative_gamma_bound();
+    let gamma_effective = envelope
+        .unwrap_or(0)
+        .min(EngineConfig::default().gamma)
         .min(det_width.saturating_sub(1));
     eprintln!(
         "== {model_name}: {} fixture(s), deterministic width {det_width}, \
-         gamma effective {gamma_effective}",
+         ADR 0005 envelope {envelope:?}, gamma effective {gamma_effective}",
         fixtures.len(),
     );
 
@@ -398,18 +408,19 @@ fn run_model_with_speculation(
         }
         let stats = engine.spec_stats();
         if gamma_effective == 0 {
-            // Dense-trunk protection (ADR 0002 B' width 1): the engine's
-            // gamma clamp keeps speculation entirely off — the invariance
-            // above held on the plain path, and that is the designed
-            // behavior, not vacuity.
+            // Speculation structurally off for this model — outside the
+            // ADR 0005 envelope (manual softcapped attention, dense
+            // trunk) or clamped to zero by the ADR 0002 width. The
+            // invariance above held on the plain path, and that is the
+            // designed protection, not vacuity.
             assert_eq!(
                 stats,
                 SpecStats::default(),
-                "width-1 model must never speculate: {stats:?}"
+                "an out-of-envelope model must never speculate: {stats:?}"
             );
             eprintln!(
-                "{model_name} {drafter_kind}: speculation disabled by the deterministic-width \
-                 clamp (width {det_width}); plain-path outputs verified"
+                "{model_name} {drafter_kind}: speculation disabled (ADR 0005 envelope \
+                 {envelope:?}, deterministic width {det_width}); plain-path outputs verified"
             );
             continue;
         }
@@ -530,8 +541,11 @@ fn check_spec_max_batch_gate(model: &AnyModel, det_width: usize) {
 /// In-situ O(1) rollback: mean rollback nanos per verify round, measured
 /// inside real engine steps under total rejection, must not grow with the
 /// context the sequence carries. Companion to kiln-engine's rollback_cost
-/// unit measurement, this one exercises the real code path (settle →
-/// truncate → release) with live pools.
+/// unit measurement (which spans 512x of table size), this one exercises
+/// the real code path (settle → truncate → release) with live pools —
+/// across the ADR 0005 envelope's actual operating range (speculation
+/// stops at [`kiln_engine::VERIFY_MAX_KEY_LEN`], so ~900 tokens is the
+/// deep end a verify round can really carry).
 fn check_rollback_is_flat_in_situ(model: &AnyModel, det_width: usize) {
     let mut config = engine_config(model, det_width);
     config.prefix_cache = false; // keep both runs shape-identical and lean
@@ -549,15 +563,59 @@ fn check_rollback_is_flat_in_situ(model: &AnyModel, det_width: usize) {
         stats.rollback_nanos_total / stats.rollback_rounds_total
     };
     let short = mean_rollback_nanos(8);
-    let long = mean_rollback_nanos(6000);
+    let long = mean_rollback_nanos(900);
     eprintln!(
         "in-situ rollback: {short}ns/round at 8-token context, {long}ns/round at \
-         6000-token context"
+         900-token context"
     );
     assert!(
         long <= short.saturating_mul(25).max(20_000),
         "in-situ rollback cost grew with context length ({short}ns -> {long}ns) — \
          the O(1) claim fails in practice"
+    );
+}
+
+/// The ADR 0005 key-length envelope in action: a request whose context
+/// outgrows [`kiln_engine::VERIFY_MAX_KEY_LEN`] mid-generation stops
+/// speculating (plain decode continues) and its output stays exactly the
+/// plain path's. The drafter is really consulted before the boundary and
+/// really not after it.
+fn check_kv_envelope_crossing(model: &AnyModel, det_width: usize) {
+    let mut config = engine_config(model, det_width);
+    config.prefix_cache = false;
+    let prompt: Vec<u32> = (0..1000).map(|i| 100 + (i % 900) as u32).collect();
+    let max_tokens = 64; // crosses key length 1024 mid-run
+
+    let baseline = {
+        let mut engine = Engine::new(model, model.kv_dims(), config.clone(), Stream::gpu())
+            .expect("engine builds");
+        engine_generate(&mut engine, &prompt, max_tokens).0
+    };
+    let mut engine =
+        Engine::new(model, model.kv_dims(), config, Stream::gpu()).expect("engine builds");
+    engine.set_drafter(Box::new(AdversarialDrafter::new()));
+    let (speculated, _) = engine_generate(&mut engine, &prompt, max_tokens);
+    assert_eq!(
+        speculated, baseline,
+        "output moved while crossing the ADR 0005 key-length envelope"
+    );
+    let stats = engine.spec_stats();
+    assert!(
+        stats.rounds_total > 0,
+        "speculation should run below the key-length cap: {stats:?}"
+    );
+    // Verify key length = offset + gamma + 1 <= 1023: from offset 1000,
+    // gamma shrinks 4,4,...,then 3,2,1 and stops — strictly fewer rounds
+    // and proposals than an uncapped run of 64 tokens would produce.
+    let uncapped_round_bound = max_tokens as u64; // 1 committed/round floor
+    assert!(
+        stats.rounds_total < uncapped_round_bound,
+        "speculation did not stop at the key-length cap: {stats:?}"
+    );
+    eprintln!(
+        "kv-envelope crossing: {} rounds, {}/{} accepted, output exact across the \
+         1-pass boundary",
+        stats.rounds_total, stats.accepted_total, stats.proposed_total,
     );
 }
 
@@ -732,6 +790,7 @@ fn speculation_preserves_greedy_output_and_measures_its_costs() {
                 .expect("calibrates");
             check_spec_max_batch_gate(&model, det_width);
             check_rollback_is_flat_in_situ(&model, det_width);
+            check_kv_envelope_crossing(&model, det_width);
         }
 
         // The invariance verdict, last so one run yields the complete

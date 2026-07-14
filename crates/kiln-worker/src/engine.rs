@@ -430,6 +430,36 @@ pub fn engine_main(
                 );
                 return;
             }
+            // ADR 0005 envelope: clamp gamma to the largest verify width
+            // whose kernel classes provably match plain decode for THIS
+            // target. A target outside the envelope (manual softcapped
+            // attention, dense trunk, unsupported head_dim, extreme GQA)
+            // cannot speculate at all — a configured draft there is a
+            // misconfiguration, rejected as loudly as an incompatible
+            // tokenizer; silently serving without the requested
+            // speculation would hide it.
+            match model.speculative_gamma_bound() {
+                Some(bound) => {
+                    config.gamma = config.gamma.min(bound);
+                    tracing::info!(
+                        model = %shared.model_id,
+                        gamma = config.gamma,
+                        envelope_bound = bound,
+                        "speculation envelope applied (ADR 0005)"
+                    );
+                }
+                None => {
+                    tracing::error!(target = %model_dir.display(), draft = %dir.display(),
+                        "draft model rejected: target outside the ADR 0005 speculation envelope");
+                    shared.set_state(
+                        WorkerState::Unhealthy,
+                        "draft model rejected: target architecture is outside the ADR 0005 \
+                         speculation envelope (no certified verify kernel class)"
+                            .to_owned(),
+                    );
+                    return;
+                }
+            }
             let pool = kiln_models::DraftPoolSpec {
                 block_size: config.block_size,
                 num_blocks: config.num_blocks,

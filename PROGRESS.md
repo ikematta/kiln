@@ -4798,3 +4798,143 @@
   A is recommended: it is measurement-grounded, keeps the invariant
   absolute, and costs only gamma 4→3 on high-GQA models. Picking nothing,
   stopping here per protocol.
+
+## [2026-07-13] Phase 8 / Part 2 (resolution) — DONE: ADR 0005 dispatch-envelope clamp; gate green everywhere
+- What: the PM-directed resolution of this morning's DECISION NEEDED
+  (option A), with the clamp formula verified against the pinned MLX
+  SOURCE before implementation, per the ADR 0002/0003 standard:
+  - Predicate verified from `mlx/backend/metal/scaled_dot_product_
+    attention.cpp` (`use_fallback`): the fused vector kernel requires
+    `qL <= 8 && qL <= kL && head_dim in {64,96,128,256} (Q==V) &&
+    qL * gqa_factor <= 32`. UNIFORM at the pin — no device or dtype
+    branching (dtype only selects the kernel template), so dtype does
+    NOT enter the clamp; head_dim DOES, as a set-membership
+    precondition. Two further source facts shaped the envelope:
+    (a) inside the 1-pass vector kernel, per-row bits are invariant to
+    query count AND key length by kernel construction (fixed stride-32
+    key->simdgroup assignment, index-ordered online softmax, fixed
+    32x32 reduction tree, bottom-right causal key sets identical to
+    plain decode's) — the source-level proof behind the measured
+    2/3/4-row bit-identity; (b) the 2-pass variant is OUT of any
+    certificate: its partition count depends on `n_simds = gqa * qL`
+    and on N, with device-class thresholds (kL >= 1024 on 'd'/'s'
+    GPUs, >= 4096 with GQA elsewhere) — so the envelope also needs a
+    key-length bound, not just the gamma formula.
+  - Implementation: `AnyModel::speculative_gamma_bound()` (config-
+    derived per checkpoint, never hardcoded per model: fused-SDPA path
+    required — gemma2's manual softcapped attention excluded; quantized
+    trunk required — dense excluded per the ADR 0002 addendum
+    precedent; head_dim set; `gamma+1 <= min(8, 32/gqa)`); the worker
+    clamps `EngineConfig::gamma` at drafter attachment and REJECTS
+    (UNHEALTHY, "outside the ADR 0005 speculation envelope") a target
+    with no envelope — as loud as an incompatible tokenizer; the
+    engine adds the per-round key-length bound
+    (`VERIFY_MAX_KEY_LEN = 1023`: verify kL = offset+gamma+1 stays in
+    the 1-pass region on EVERY device class; gamma shrinks at the
+    boundary, then speculation stops and plain decode continues —
+    the pipeline re-engages past it via `spec_would_engage`).
+  - ADR 0005 written (docs/decisions/): the fourth instance of the
+    0002/0003/0004 kernel-dispatch pattern; records the formula, its
+    source derivation, the key-length bound (device-aware refinement to
+    4096 via `mlx_device_info` noted, not implemented), and — as an
+    explicit documented precondition, not an implicit consequence —
+    that any NEW architecture/geometry needs an envelope review plus a
+    green full spec_decode gate on the generating device before
+    speculation is enabled for it.
+  - Tests: spec_decode applies the same envelope the worker applies
+    (gemma2 joins smollm2 in the structurally-disabled branch: stats
+    must be zero, outputs exact); new kv-envelope crossing case (1000-
+    token prompt, 64 generated: speculation runs below the cap, stops
+    at it, output exact vs a live plain baseline); in-situ rollback
+    scaling re-scoped to the envelope's real operating range (8 vs 900
+    tokens); worker test gains the envelope loud-rejection case
+    (gemma-2-2b with itself as draft: tokenizer-compatible, envelope
+    None -> UNHEALTHY naming ADR 0005). spec_probe stays in-tree as the
+    pinned evidence: it deliberately builds the UNCLAMPED gamma=4 shape
+    on qwen2.5 and keeps printing the divergence for as long as the pin
+    dispatches this way (re-run at pin bumps per ADR 0001).
+  - CI: spec_decode joins the BLOCKING model-gated step (previously
+    deferred). Under the step's `KILN_FIXTURE_PARITY=skip` it compares
+    speculation-ON against a live speculation-OFF run — the
+    device-independent SPEC §6.5 invariant, now certifiable on any
+    device because the envelope keeps every verify inside the
+    source-proven 1-pass class.
+- Answering the session's explicit questions:
+  - The predicate is uniform across the pinned MLX for all attention
+    head configurations; the only additional dispatch factors are
+    head_dim (envelope precondition) and the 1-pass/2-pass key-length
+    thresholds (envelope kv bound). dtype does not affect dispatch.
+  - The qwen3-0.6b pair (gqa_factor 16/8 = 2, head_dim 128): a gamma=4
+    verify is 5x2 = 10 <= 32 — ALREADY inside the envelope, not
+    coincidentally exempt; its acceptance bar re-verified unchanged.
+- Decisions:
+  - Universal `VERIFY_MAX_KEY_LEN = 1023` rather than device-aware
+    thresholds: mlx-c does expose the architecture string
+    (`mlx_device_info`), but the deployment bench class (M4 Pro/Max,
+    likely 'd') has the 1024 boundary anyway, and avoiding new FFI in a
+    correctness change is worth the conservatism. Recorded in ADR 0005
+    as the refinement path.
+  - A configured draft on an out-of-envelope target is UNHEALTHY, not
+    silently-inert speculation (same policy as the tokenizer gate).
+- Deviations: none. SPEC §6.5's default gamma=4 is qualified per model
+  by the ADR 0005 envelope (qwen2.5-0.5b runs gamma 3; gemma2/dense do
+  not speculate) — recorded in the ADR, SPEC text untouched.
+- Acceptance:
+  ```
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --test spec_decode -- --nocapture
+  == gemma-2-2b-it-4bit:  envelope None    -> speculation disabled; plain-path exact
+  == gemma-3-1b-it-4bit:  envelope Some(7) -> gamma 4; self 356/356 (100.0%);
+       adversarial 0/1728, 441 rollbacks               - all fixtures exact
+  == llama-3.2-1b-4bit:   envelope Some(7) -> gamma 4; self 356/357 (99.7%);
+       adversarial 7/1706                              - exact
+  == qwen2.5-0.5b-4bit:   envelope Some(3) -> gamma 3 (THE clamp); self
+       286/289 (99.0%); adversarial 3/1113, 375 rollbacks - ALL FIXTURES
+       EXACT, including chat-basic which diverged at gamma 4
+  == qwen3-0.6b-4bit:     envelope Some(7) -> gamma 4; self 303/313 (96.8%) - exact
+  == qwen3-0.6b-8bit:     envelope Some(7) -> gamma 4; self 356/358 (99.4%) - exact
+  == smollm2-135m-bf16:   envelope None (dense) -> disabled; plain-path exact
+  qwen3-0.6b-8bit target / qwen3-0.6b-4bit draft: 46/66 accepted (69.7%)
+    over 17 rounds on prose (SPEC 11.3 >50% bar, unchanged by the clamp —
+    the pair was already inside the envelope at gqa_factor 2);
+    warm-prefix rerun reused 24 prompt tokens WITH speculation active
+  spec_max_batch gate: width 6 never consulted; narrowed batch did;
+    outputs bit-identical
+  in-situ rollback: 1621ns/round @ 8-token vs 1013ns/round @ 900-token
+    context (flat across the envelope's operating range)
+  kv-envelope crossing (1000-token prompt): 22 rounds below the cap,
+    clean stop at VERIFY_MAX_KEY_LEN, output exact vs live plain baseline
+  test result: ok. 1 passed  (116.93s — the gate is GREEN on every model)
+
+  $ KILN_TEST_MODELS=... cargo test -p kiln-worker --test draft -- --nocapture
+  incompatible pair rejected as UNHEALTHY: ... tokenizers are incompatible ...
+  out-of-envelope target rejected as UNHEALTHY: draft model rejected:
+    target architecture is outside the ADR 0005 speculation envelope
+    (no certified verify kernel class)                 [gemma-2 self-pair]
+  draft/verify over RPC ok: weights 633442994 -> 968893578 bytes,
+    24 identical tokens, 16/27 draft tokens accepted
+  test result: ok. 1 passed
+
+  $ KILN_TEST_MODELS=... cargo test --workspace
+  every suite green: golden 587s (all fixture models, both attention
+  paths, single-stream AND width-16 — speculation never engages above
+  spec_max_batch, so width-16 shapes are the plain B' path by design),
+  batching, preemption, prefix suites, leak gates, spec_decode 119s,
+  spec_probe (merged to one #[test] after the first workspace pass
+  caught its two GPU cases running CONCURRENTLY and segfaulting — the
+  same single-engine-thread discipline every Metal suite follows; the
+  probes themselves are unchanged and still print the gamma-4
+  divergence), worker rpc/grammar/draft, gateway units.
+  $ cargo build --workspace --no-default-features           -> clean (linux shape)
+  $ cargo clippy --workspace --all-targets -- -D warnings   -> clean (both shapes)
+  $ cargo fmt --all --check                                 -> clean
+  $ ruff check / ruff format --check python/ tests/e2e      -> clean
+  $ pytest python/kiln_worker_py/tests                      -> 35 passed
+  $ uv run --project tests/e2e pytest tests/e2e             -> 77 passed, 2 skipped
+  ```
+- Next: PR opened from `claude/p8-verify-loop`; record CI verification
+  (all four checks on the real runners) per the established protocol
+  once the run completes. Then the remaining Phase 8 parts: throughput
+  measurement against the SPEC §12 Phase 8 bar (>= 1.6x at acceptance
+  > 60% — NOT claimed here), acceptance-rate auto-disable heuristics,
+  gateway `[model.speculative]` config wiring, and only then
+  CAPABILITY_SPECULATIVE advertisement.

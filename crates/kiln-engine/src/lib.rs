@@ -35,7 +35,7 @@ pub use engine::{
     DEFAULT_NUM_BLOCKS, DEFAULT_PREFILL_CHUNK, DEFAULT_PREFILL_FINE_CHUNK, Engine, EngineConfig,
     EngineError, EngineRequest, ErrorCause, EventSink, FinishKind, FinishSummary, KvDims,
     PREFILL_PAD_MIN_ROWS, PrefixCacheStats, Priority, SeqEvent, SpecStats, SsdParams,
-    canonical_prefill_len,
+    VERIFY_MAX_KEY_LEN, canonical_prefill_len,
 };
 #[cfg(feature = "metal")]
 pub use grammar::{Grammar, GrammarEnv, GrammarError};
