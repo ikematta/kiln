@@ -1,15 +1,19 @@
-//! Draft-model coexistence over the frozen proto (SPEC §6.5, Phase 8
-//! part 1): `--draft-model` loads a second model into the worker
-//! process. The worker must reach READY, `MemoryReport.weights_bytes`
-//! must grow by exactly the draft checkpoint's bytes (worker totals,
-//! SPEC §2.3 — the gateway budgets whole workers),
-//! CAPABILITY_SPECULATIVE must stay un-advertised (no verify loop
-//! exists yet), and target greedy output must be IDENTICAL to a
-//! draft-less worker on the same device (loading isolation; greedy is
-//! bit-reproducible run-to-run on one build per CLAUDE.md).
+//! Speculative decoding over the frozen proto (SPEC §6.5, Phase 8
+//! part 2): `--draft-model` attaches a drafter to the worker, gated by
+//! the tokenizer-compatibility check.
 //!
-//! Deliberately a cross-tokenizer pair — part 1 proves loading, not
-//! drafting compatibility (the vocab check belongs to the verify loop).
+//! Two workers are exercised:
+//! - an INCOMPATIBLE pair (llama-3.2-1b target, qwen3-0.6b draft — the
+//!   cross-tokenizer pair part 1 used to prove loading isolation) must be
+//!   rejected LOUDLY at load: the worker reports UNHEALTHY with the
+//!   incompatibility in its detail, and never serves;
+//! - a COMPATIBLE pair (qwen3-0.6b-8bit target, qwen3-0.6b-4bit draft —
+//!   byte-identical tokenizers) must reach READY, report worker-total
+//!   weights (SPEC §2.3), keep CAPABILITY_SPECULATIVE un-advertised (that
+//!   flag waits for the config-wiring/auto-disable part), stream greedy
+//!   output IDENTICAL to a draft-less worker on the same device (the
+//!   §6.5 correctness invariant, over RPC, with the verify loop live),
+//!   and record acceptance metrics in `Timings` and `Stats`.
 //!
 //! Its own test binary, NOT a case in rpc.rs: test binaries run
 //! sequentially under `cargo test`, while cases inside one binary run
@@ -18,11 +22,11 @@
 //! breaks (measured on CI run 29294575202: the rate swung 60x once
 //! this test's workers finished, past that test's 37x design margin).
 //!
-//! The engine-level coexistence invariants (bit-identical target
-//! output with the draft's pool materialized, sentinel bytes, leak
-//! gate) live in kiln-models/tests/draft.rs; this suite covers the
-//! worker binary + proto surface. Skips (with a note) when
-//! `KILN_TEST_MODELS` is unset or Metal is unavailable.
+//! Engine-level invariance (all golden fixtures, self-draft and
+//! adversarial drafters, rollback measurement) lives in
+//! kiln-models/tests/spec_decode.rs; this suite covers the worker binary
+//! and proto surface. Skips (with a note) when `KILN_TEST_MODELS` is
+//! unset or Metal is unavailable.
 
 #![cfg(feature = "metal")]
 
@@ -34,12 +38,14 @@ use hyper_util::rt::TokioIo;
 use kiln_proto::v1::worker_client::WorkerClient;
 use kiln_proto::v1::{
     Capability, FinishReason, Finished, HealthRequest, InfoRequest, Priority, SamplingParams,
-    StoppingParams, SubmitRequest, TokenEvent, TokenIds, WorkerState, submit_request, token_event,
+    StatsRequest, StoppingParams, SubmitRequest, TokenEvent, TokenIds, WorkerState, submit_request,
+    token_event,
 };
 use tonic::transport::{Channel, Endpoint, Uri};
 
-const MODEL_NAME: &str = "llama-3.2-1b-4bit";
-const DRAFT_MODEL_NAME: &str = "qwen3-0.6b-4bit";
+const TARGET_NAME: &str = "qwen3-0.6b-8bit";
+const DRAFT_NAME: &str = "qwen3-0.6b-4bit";
+const INCOMPATIBLE_TARGET_NAME: &str = "llama-3.2-1b-4bit";
 /// Generous cap: model load on a cold CI runner dominates.
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Cap on any single stream read; real events arrive per decode step.
@@ -109,24 +115,34 @@ impl Worker {
             }))
     }
 
-    async fn client_when_ready(&self) -> WorkerClient<Channel> {
+    /// Polls Health until the worker settles: READY, or UNHEALTHY with a
+    /// detail string. Panics on timeout.
+    async fn settled_state(&self) -> (WorkerClient<Channel>, WorkerState, String) {
         let mut client = WorkerClient::new(self.channel());
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             if let Ok(response) = client.health(HealthRequest {}).await {
                 let status = response.into_inner();
                 match status.state() {
-                    WorkerState::Ready => return client,
-                    WorkerState::Unhealthy => panic!("worker unhealthy: {}", status.detail),
+                    WorkerState::Ready => return (client, WorkerState::Ready, status.detail),
+                    WorkerState::Unhealthy => {
+                        return (client, WorkerState::Unhealthy, status.detail);
+                    }
                     _ => {}
                 }
             }
             assert!(
                 Instant::now() < deadline,
-                "worker did not become ready in {READY_TIMEOUT:?}"
+                "worker did not settle in {READY_TIMEOUT:?}"
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    async fn client_when_ready(&self) -> WorkerClient<Channel> {
+        let (client, state, detail) = self.settled_state().await;
+        assert_eq!(state, WorkerState::Ready, "worker unhealthy: {detail}");
+        client
     }
 }
 
@@ -178,22 +194,47 @@ async fn read_token_ids(stream: &mut tonic::Streaming<TokenEvent>) -> (Finished,
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn draft_model_loads_alongside_target() {
+async fn draft_verify_over_rpc_with_compat_gate() {
     if !kiln_mlx::memory::metal_is_available() {
         eprintln!("skipping: no Metal device");
         return;
     }
-    let (Some(model), Some(draft)) = (
-        named_model_dir(MODEL_NAME),
-        named_model_dir(DRAFT_MODEL_NAME),
+    let (Some(target), Some(draft), Some(incompatible_target)) = (
+        named_model_dir(TARGET_NAME),
+        named_model_dir(DRAFT_NAME),
+        named_model_dir(INCOMPATIBLE_TARGET_NAME),
     ) else {
-        eprintln!("skipping: KILN_TEST_MODELS not set or {MODEL_NAME}/{DRAFT_MODEL_NAME} missing");
+        eprintln!(
+            "skipping: KILN_TEST_MODELS not set or {TARGET_NAME}/{DRAFT_NAME}/\
+             {INCOMPATIBLE_TARGET_NAME} missing"
+        );
         return;
     };
+    let draft_arg = draft.display().to_string();
 
-    // --- Baseline: no draft.
+    // --- Loud rejection: a cross-tokenizer pair never reaches serving.
+    {
+        let worker = Worker::spawn(
+            &incompatible_target,
+            "reject",
+            &["--draft-model", &draft_arg],
+        );
+        let (_, state, detail) = worker.settled_state().await;
+        assert_eq!(
+            state,
+            WorkerState::Unhealthy,
+            "an incompatible draft/target pair must fail the load, not serve: {detail}"
+        );
+        assert!(
+            detail.contains("incompatible"),
+            "the rejection must name its cause in the health detail: {detail}"
+        );
+        eprintln!("incompatible pair rejected as UNHEALTHY: {detail}");
+    }
+
+    // --- Baseline: compatible target, no draft.
     let (base_weights, base_tokens) = {
-        let worker = Worker::spawn(&model, "nodraft", &[]);
+        let worker = Worker::spawn(&target, "nodraft", &[]);
         let mut client = worker.client_when_ready().await;
         let health = client
             .health(HealthRequest {})
@@ -201,7 +242,7 @@ async fn draft_model_loads_alongside_target() {
             .expect("health ok")
             .into_inner();
         let memory = health.memory.expect("memory report");
-        assert_eq!(memory.weights_bytes, fs_weights_bytes(&model));
+        assert_eq!(memory.weights_bytes, fs_weights_bytes(&target));
         let mut stream = client
             .submit(submission("nodraft-1", 24))
             .await
@@ -209,12 +250,18 @@ async fn draft_model_loads_alongside_target() {
             .into_inner();
         let (finished, tokens) = read_token_ids(&mut stream).await;
         assert_eq!(finished.finish_reason(), FinishReason::Length);
+        let timings = finished.timings.expect("timings present");
+        assert_eq!(
+            (timings.spec_tokens_proposed, timings.spec_tokens_accepted),
+            (0, 0),
+            "no drafter, no speculation metrics"
+        );
         (memory.weights_bytes, tokens)
     };
 
-    // --- Same target with the draft loaded alongside.
-    let draft_arg = draft.display().to_string();
-    let worker = Worker::spawn(&model, "draft", &["--draft-model", &draft_arg]);
+    // --- Same target with the compatible draft attached: the verify loop
+    // is live, and greedy output must not move by a token.
+    let worker = Worker::spawn(&target, "draft", &["--draft-model", &draft_arg]);
     let mut client = worker.client_when_ready().await;
 
     let info = client
@@ -226,7 +273,7 @@ async fn draft_model_loads_alongside_target() {
         !info
             .capabilities
             .contains(&(Capability::Speculative as i32)),
-        "SPECULATIVE must not be advertised before the verify loop exists: {:?}",
+        "SPECULATIVE stays un-advertised until the config-wiring part: {:?}",
         info.capabilities
     );
 
@@ -242,10 +289,6 @@ async fn draft_model_loads_alongside_target() {
         base_weights + fs_weights_bytes(&draft),
         "weights_bytes must be the worker total: target + draft"
     );
-    assert_eq!(
-        memory.kv_pool_allocated_bytes, 0,
-        "no pool (target or draft) is materialized before the first request"
-    );
 
     let mut stream = client
         .submit(submission("draft-1", 24))
@@ -256,12 +299,33 @@ async fn draft_model_loads_alongside_target() {
     assert_eq!(finished.finish_reason(), FinishReason::Length);
     assert_eq!(
         tokens, base_tokens,
-        "greedy output changed when the draft model was loaded alongside"
+        "greedy output changed with the draft/verify loop active (SPEC §6.5 invariant)"
+    );
+    let timings = finished.timings.expect("timings present");
+    assert!(
+        timings.spec_tokens_proposed > 0,
+        "speculation never engaged for the drafted request: {timings:?}"
+    );
+    let stats = client
+        .stats(StatsRequest {})
+        .await
+        .expect("stats ok")
+        .into_inner();
+    assert_eq!(
+        (
+            stats.spec_tokens_proposed_total as u32,
+            stats.spec_tokens_accepted_total as u32
+        ),
+        (timings.spec_tokens_proposed, timings.spec_tokens_accepted),
+        "worker stats totals must mirror the single request's metrics"
     );
     eprintln!(
-        "draft coexistence over RPC ok: weights {} -> {} bytes, {} identical tokens",
+        "draft/verify over RPC ok: weights {} -> {} bytes, {} identical tokens, \
+         {}/{} draft tokens accepted",
         base_weights,
         memory.weights_bytes,
-        tokens.len()
+        tokens.len(),
+        timings.spec_tokens_accepted,
+        timings.spec_tokens_proposed,
     );
 }

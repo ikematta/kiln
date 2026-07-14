@@ -38,7 +38,7 @@ pub use config::{
     Qwen3Config, RopeScaling, SUPPORTED_ARCHITECTURES,
 };
 #[cfg(feature = "metal")]
-pub use draft::{DraftLoadError, DraftModel, DraftPoolSpec};
+pub use draft::{DraftLoadError, DraftModel, DraftPoolSpec, check_draft_compat};
 #[cfg(feature = "metal")]
 pub use gemma2::Gemma2Model;
 #[cfg(feature = "metal")]

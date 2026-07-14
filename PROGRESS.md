@@ -4577,3 +4577,224 @@
   ```
 - Next: PR #19 CI re-run on the new head; record verification once the
   four checks complete, then Phase 8 part 2 (draft/verify decode loop).
+
+## [2026-07-13] Phase 8 / Part 2 — PARTIAL: verify loop built and measured; greedy-invariance gate red on qwen2.5 — DECISION NEEDED
+- What: the batched draft/verify decode loop per SPEC §6.5, end to end:
+  - `DraftModel::propose` really drafts now (kiln-models/src/draft.rs):
+    reconcile committed context (speculated-tail truncation = O(1) block
+    release), catch-up prefill in 2048 chunks, gamma greedy tokens with
+    lazily chained argmax feeds, one eval per round. Draft numerics stay
+    deliberately uncalibrated — the target verifies everything.
+  - Engine verify rounds (kiln-engine/src/engine.rs): an eligible request
+    (greedy, penalties off, no grammar, batch ≤ `spec_max_batch`, gamma
+    clamped under the ADR 0002 deterministic width and the remaining
+    token budget) swaps its 1-token decode segment for a gamma+1-slot
+    verify segment run as its OWN forward group; every position sampled
+    (`SeqStep.sample` → `sample_rows`); longest agreeing prefix + the
+    target's own next token commit through the normal settle path
+    (stops/cancel/max_tokens honored per token); rejected slots roll back
+    via new `BlockTable::truncate` — block release only, no data motion.
+    Drafter faults disable speculation for that request only, in-band.
+    The async_eval pipeline yields to speculation (`spec_would_engage`).
+  - Vocab/tokenizer compat gate deferred from part 1
+    (`kiln_models::check_draft_compat`): tokenizer.json `model.vocab` +
+    `added_tokens` must agree and draft logits width must fit the
+    target's; the worker runs it before attach and an incompatible pair
+    is UNHEALTHY at load ("draft model rejected: ... incompatible ...").
+    The part-1 pair (qwen3-0.6b draft under llama-1b target) is REJECTED
+    by construction — see Deviations for the acceptance-metrics fallout.
+  - Metrics: engine `SpecStats` (rounds/proposed/accepted/rollback
+    tokens+nanos/draft errors), per-request `FinishSummary.spec_tokens_*`
+    → proto `Timings` fields 6/7, worker totals → `WorkerStats` 14/15
+    (fields existed; no proto change). CAPABILITY_SPECULATIVE stays
+    un-advertised per the part-1 plan (config wiring + auto-disable are
+    later parts).
+  - Tests: kiln-engine/tests/rollback_cost.rs (O(1) measured, no Metal);
+    kiln-models/tests/spec_decode.rs (the invariance gate: every golden
+    fixture × {self-draft, adversarial scripted drafter}, plus compat
+    matrix, spec_max_batch gating, prefix-cache composition, acceptance
+    metrics, in-situ rollback scaling; `KILN_FIXTURE_PARITY=skip`
+    switches baselines from committed fixtures to a live speculation-off
+    run for foreign devices per ADR 0004); kiln-models/tests/spec_probe.rs
+    (characterization instrument for the finding below);
+    kiln-worker/tests/draft.rs rewritten (incompatible pair → UNHEALTHY
+    over RPC; compatible qwen3-0.6b-8bit + qwen3-0.6b-4bit pair → READY,
+    verify loop live, stream identical to draft-less worker, Timings and
+    Stats metrics populated); kiln-models/tests/draft.rs lifecycle updated
+    for real proposals (its final case is now a live adversarial-drafter
+    invariance check on the cross-tokenizer pair, engine-level).
+- FINDING (the reason this is PARTIAL): greedy output under speculation
+  diverges from speculation-off for qwen2.5-0.5b-4bit at gamma=4, and the
+  full standard was applied — characterized, not weakened, not patched:
+  - Which fixture/token: qwen2.5-0.5b-4bit/chat-basic, generated index 33
+    (engine 2585 vs fixture 9645), right after a hallucinated
+    `<|im_end|>\n<|endoftext|>Human:` turn — and
+    qwen2.5-0.5b-4bit/raw-long-prefill index 10 under the adversarial
+    drafter. Every other fixture model × {self-draft, adversarial} is
+    token-exact (gemma2's manual-softcap path included).
+  - Which op, measured: the divergence position is a 1-fp16-ULP argmax
+    race on the plain path (raw logits 16.765625 vs 16.75; ULP at
+    [16,32) = 2^-6). A 5-row verify-shaped forward from the IDENTICAL
+    plain-built KV state shifts both lanes ~2-3 ULPs and flips the
+    argmax; 2-, 3-, and 4-row shapes are BIT-IDENTICAL to plain on those
+    lanes. Root cause in the pinned MLX (v0.31.1) fused-SDPA dispatch
+    (mlx/backend/metal/scaled_dot_product_attention.cpp):
+    `supports_sdpa_vector` requires `qL <= 8 && qL * gqa_factor <= 32`,
+    and `supports_sdpa_full` requires `qL > 8` — qwen2.5-0.5b has
+    gqa_factor 7 (14 Q heads / 2 KV heads), so a gamma=4 verify (qL 5,
+    5×7=35) satisfies NEITHER and silently takes the UNFUSED composed-op
+    attention: a different kernel class than the qL=1 vector kernel of
+    plain decode (ADR 0002's phenomenon, on a new dispatch axis). All
+    passing models have gqa_factor ≤ 4 (5 rows ≤ 32 lanes). The trunk is
+    exonerated: matmuls at M=5 ≤ W=9 are the same shapes the B' width-16
+    goldens already prove bit-stable for qwen2.5.
+  - Stability: deterministic per process layout (4/4 identical fresh-
+    process probe runs) but NOT across allocation histories — the same
+    binary produced the flip in one suite layout and none in another
+    (suite runs 1 vs 2). There is no stable fixture bar for these shapes;
+    "rerun until green" must not be applied to this gate.
+  - Second boundary of the same family (not fixture-exercised): the
+    vector 1-pass/2-pass split keys on `k.shape(2) >= 1024` (device class
+    'd'/'s') or `>= 4096` (GQA); a verify segment reaches those kv
+    lengths up to gamma tokens earlier than plain decode does.
+  - The engine's deterministic-width clamp does not cover this dispatch
+    axis (it calibrates linear projections only); the limit is documented
+    in the engine module docs pending resolution.
+- Decisions:
+  - Speculation eligibility is greedy-only (plus penalties-off,
+    grammar-free): argmax consumes no PRNG draws, so variable commits per
+    round cannot desync seeded key chains; penalties/grammar need
+    host-visible per-position state a batched verify does not have.
+    Seeded-sampling speculation (true rejection sampling) is future work.
+  - Verify segments never evict or preempt: if the pool cannot cover
+    gamma+1 slots the request falls back to a plain 1-token step.
+  - Draft pool geometry mirrors the target pool (part-1 decision stands).
+  - Rejected-row KV hygiene rides the existing discarded-row invariant
+    (gathers trim to table length; donation stops at settled rows; the
+    sequence's own next append rewrites stale rows) — no new mechanism.
+  - Compat check compares tokenizer id→token MEANING (model.vocab +
+    added_tokens) and logits-width embeddability, not byte equality —
+    merges/normalizers may differ without changing what an id means.
+  - spec_decode is NOT wired into CI yet: the gate is red/layout-unstable
+    for qwen2.5 pending the decision below, and a flaky blocking lane is
+    worse than none. rollback_cost runs everywhere in the plain workspace
+    suites automatically.
+- Deviations:
+  - The session prompt asked for "acceptance-rate metrics recorded for
+    the qwen3-0.6b/llama-1b pair" AND for the compat check that rejects
+    exactly that cross-tokenizer pair. The check wins (part 1 recorded
+    that the pair is cross-family by construction and deferred the check
+    to this session). Recorded outcomes: the qwen3/llama pair → loud
+    rejection (worker UNHEALTHY; engine-level it is the adversarial
+    invariance case); acceptance-rate metrics → the compatible same-
+    family pair qwen3-0.6b-8bit (target) / qwen3-0.6b-4bit (draft),
+    per SPEC §11.3's "same-family draft" bar.
+  - No other deviations from SPEC §6.5; the invariance bar itself is
+    exactly SPEC's and stays unweakened (the gate is red on one model).
+- Acceptance:
+  ```
+  $ cargo test -p kiln-engine --test rollback_cost --release -- --nocapture
+  rollback of 5 slots against a 128-token table:   22 ns/cycle (mean of 20000)
+  rollback of 5 slots against a 1024-token table:  31 ns/cycle
+  rollback of 5 slots against a 8192-token table:  24 ns/cycle
+  rollback of 5 slots against a 65536-token table: 23 ns/cycle
+  rollback of 1 block: 23 ns/cycle; of 16 blocks: 40 ns/cycle (64k table)
+  test result: ok. 2 passed     (O(1) MEASURED: flat across a 512x span)
+
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --test spec_decode -- --nocapture
+  compat gate rejects qwen3-draft/llama-target: "draft logits width 151936
+    exceeds the target's 128256" (loud, structured)
+  gemma-2-2b-it-4bit:  self-draft 356/356 accepted (100.0%);
+    adversarial 0/1728, 441 rollback rounds        - all fixtures exact
+  gemma-3-1b-it-4bit:  self-draft 356/356 (100.0%); adversarial 0/1728 - exact
+  llama-3.2-1b-4bit:   self-draft 356/357 (99.7%);  adversarial 7/1706 - exact
+  qwen3-0.6b-4bit:     self-draft 303/313 (96.8%);  adversarial 8/1450 - exact
+  qwen3-0.6b-8bit:     self-draft 356/358 (99.4%);  adversarial 4/1712 - exact
+  smollm2-135m-bf16:   speculation disabled by the width-1 clamp (dense
+    trunk protection) - plain-path outputs verified exact
+  qwen3-0.6b-8bit target / qwen3-0.6b-4bit draft: 46/66 accepted (69.7%)
+    over 17 rounds on English prose (SPEC 11.3 >50% bar MET); warm-prefix
+    rerun reused 24 prompt tokens WITH speculation active - both exact;
+    per-request Timings mirror engine totals
+  spec_max_batch gate: width 6 never consulted the drafter; narrowed
+    batch did (90 consultations); outputs bit-identical
+  in-situ rollback: 1174 ns/round at 8-token context vs 1359 ns/round at
+    6000-token context (flat - O(1) in the live engine)
+  FAILED - greedy output moved under speculation on 2 case(s):
+    qwen2.5-0.5b-4bit/chat-basic [self-draft]:   index 33: 2585 vs 9645
+    qwen2.5-0.5b-4bit/chat-basic [adversarial]:  index 33: 2585 vs 9645
+  (THE finding - bar deliberately unweakened; see DECISION NEEDED)
+
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --test spec_probe -- --nocapture
+  qwen2.5-0.5b-4bit/chat-basic:       adversarial g4 div=Some(33);
+    oracle g4 div=Some(33); oracle g2 div=None; oracle g1 div=None
+  qwen2.5-0.5b-4bit/raw-long-prefill: adversarial g4 div=Some(10) (this
+    layout; div=None in the suite layout - allocation-history dependent)
+  qwen3-0.6b-4bit / qwen3-0.6b-8bit / smollm2: div=None everywhere
+  (identical across 4 fresh-process runs)
+  plain path at position 33: fixture 9645 logit 16.765625, spec 2585
+    logit 16.75 - raw delta 0.015625 = EXACTLY 1 fp16 ULP at [16,32);
+  5-row verify-shaped forward from the IDENTICAL KV state: row-0 argmax
+    flips to 2585 (lanes shift ~2-3 ULPs);
+  2-, 3-, 4-row shapes: row-0 bits MATCH plain exactly.
+
+  $ KILN_TEST_MODELS=... cargo test -p kiln-worker --test draft -- --nocapture
+  incompatible pair rejected as UNHEALTHY: "draft model rejected:
+    draft/target tokenizers are incompatible: ..."
+  draft/verify over RPC ok: weights 633442994 -> 968893578 bytes (exact
+    worker total), 24 identical tokens vs the draft-less worker,
+    16/27 draft tokens accepted; Stats totals mirror Timings
+  test result: ok. 1 passed
+
+  $ KILN_TEST_MODELS=... cargo test --workspace
+  every suite green - golden 585s (all fixture models, gather + kernel
+  paths, single-stream AND width-16, leak gate to baseline), batching,
+  calibration, draft coexistence (now with a LIVE adversarial cross-
+  tokenizer drafter attached: bit-identical), preemption, prefill_pad,
+  prefix_cache, prefix_multiturn, leak, leak_batched, engine suites incl.
+  deterministic_partition/pipeline_discard on the renamed sample_rows
+  contract, gateway 42 unit tests - EXCEPT kiln-models/spec_decode:
+  FAILED (the qwen2.5 finding above). Binaries alphabetically after the
+  failing one (cargo fail-fast) re-run explicitly:
+  kiln-models spec_probe (2 ok) + throughput (perf, ignored),
+  kiln-proto (43 ok), kiln-tokenize (14 ok across binaries),
+  kiln-worker rpc + grammar (3 ok, original calibration untouched).
+  $ cargo build --workspace --no-default-features           -> clean (linux shape)
+  $ cargo clippy --workspace --all-targets -- -D warnings   -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean
+  $ cargo fmt --all --check                                 -> clean
+  $ ruff check / ruff format --check python/ tests/e2e      -> clean (23 files)
+  $ pytest python/kiln_worker_py/tests                      -> 35 passed
+  $ uv run --project tests/e2e pytest tests/e2e             -> 77 passed, 2 skipped
+    (identical to the pre-change baseline)
+  ```
+- Next: PM ruling on the DECISION below; then (per ruling) the speculation
+  envelope ADR + gate re-run to green, then the remaining Phase 8 parts
+  (acceptance-rate auto-disable heuristics, gateway `[model.speculative]`
+  config wiring, CAPABILITY_SPECULATIVE advertisement). Branch
+  `claude/p8-verify-loop` holds this work; NO PR opened — the invariance
+  gate must be green (or its bar PM-redefined) before merge per the
+  standing protocol.
+- DECISION NEEDED: where may speculation run at this MLX pin, given the
+  fused-SDPA dispatch envelope? Options:
+  - A) Dispatch-envelope gamma clamp (recommended): clamp verify rows to
+    `gamma+1 <= min(deterministic_width, 8, floor(32 / gqa_factor))`,
+    derived from the pinned dispatch predicate — qwen2.5-0.5b lands at
+    gamma=3 (its fixtures pass there, deterministically across
+    processes; the 4-row shape measured bit-identical to plain), every
+    other pinned model keeps gamma=4. Plus a surgical guard for the
+    1-pass/2-pass kv-length boundaries (disable speculation for a
+    request while its kv length is within gamma of 1024/4096), OR accept
+    those as a documented residual à la ADR 0002. Needs an ADR naming
+    the envelope + the revisit-at-pin-bump trigger; the spec_decode gate
+    (then green) becomes its enforcement.
+  - B) Fixture-evidence allowlist: speculation ON per architecture only
+    where the full gate is green at gamma=4 (qwen2 family OFF entirely).
+    Blunter than A, ignores the found predicate, still needs the
+    kv-boundary story.
+  - C) Hold speculation at this pin (feature stays dark until an MLX bump
+    makes SDPA dispatch query-length-invariant; quarterly ADR 0001
+    process). Forfeits Phase 8 at this pin.
+  A is recommended: it is measurement-grounded, keeps the invariant
+  absolute, and costs only gamma 4→3 on high-GQA models. Picking nothing,
+  stopping here per protocol.

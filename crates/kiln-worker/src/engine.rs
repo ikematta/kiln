@@ -134,6 +134,10 @@ pub struct Shared {
     pub draft_weights_bytes: AtomicU64,
     pub draft_kv_allocated_bytes: AtomicU64,
     pub draft_kv_used_bytes: AtomicU64,
+    /// Speculation acceptance metrics (SPEC §6.5; proto `WorkerStats`
+    /// `spec_tokens_*_total`), 0 when no draft is configured.
+    pub spec_tokens_proposed_total: AtomicU64,
+    pub spec_tokens_accepted_total: AtomicU64,
     pub engine_steps_total: AtomicU64,
     pub prefix_tokens_reused_total: AtomicU64,
     pub ssd_blocks_stored: AtomicU64,
@@ -190,6 +194,8 @@ impl Shared {
             draft_weights_bytes: AtomicU64::new(0),
             draft_kv_allocated_bytes: AtomicU64::new(0),
             draft_kv_used_bytes: AtomicU64::new(0),
+            spec_tokens_proposed_total: AtomicU64::new(0),
+            spec_tokens_accepted_total: AtomicU64::new(0),
             engine_steps_total: AtomicU64::new(0),
             prefix_tokens_reused_total: AtomicU64::new(0),
             ssd_blocks_stored: AtomicU64::new(0),
@@ -409,9 +415,21 @@ pub fn engine_main(
     // deterministic-width calibration: proposals are verified by the
     // target, so draft numerics never bind greedy correctness. Load
     // failure is UNHEALTHY, exactly like the target — a configured
-    // drafter is part of the worker's contract.
+    // drafter is part of the worker's contract — and an INCOMPATIBLE
+    // draft/target pair (mismatched tokenizers) is a load failure by
+    // design: rejected loudly here, never allowed to reach the verify
+    // loop with ids that mean different text on each side.
     let drafter = match &opts.draft_model {
         Some(dir) => {
+            if let Err(err) = kiln_models::check_draft_compat(&model_dir, dir) {
+                tracing::error!(error = %err, target = %model_dir.display(),
+                    draft = %dir.display(), "draft model rejected");
+                shared.set_state(
+                    WorkerState::Unhealthy,
+                    format!("draft model rejected: {err}"),
+                );
+                return;
+            }
             let pool = kiln_models::DraftPoolSpec {
                 block_size: config.block_size,
                 num_blocks: config.num_blocks,
@@ -544,6 +562,13 @@ fn publish_stats(engine: &Engine<kiln_models::AnyModel>, shared: &Shared) {
         shared
             .draft_kv_used_bytes
             .store(draft.kv_used_bytes, Ordering::Release);
+        let spec = engine.spec_stats();
+        shared
+            .spec_tokens_proposed_total
+            .store(spec.proposed_total, Ordering::Release);
+        shared
+            .spec_tokens_accepted_total
+            .store(spec.accepted_total, Ordering::Release);
     }
     shared
         .engine_steps_total
@@ -702,6 +727,8 @@ fn submit(
                     queued_ms,
                     prefill_ms: (summary.prefill_seconds * 1000.0) as u64,
                     decode_ms: (summary.decode_seconds * 1000.0) as u64,
+                    spec_tokens_proposed: summary.spec_tokens_proposed,
+                    spec_tokens_accepted: summary.spec_tokens_accepted,
                     ..Timings::default()
                 };
                 if summary.prefill_seconds > 0.0 {

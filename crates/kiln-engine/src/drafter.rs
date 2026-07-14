@@ -6,10 +6,11 @@
 //! verifies them with a single target-model forward inside the normal
 //! batch step and commits the longest agreeing prefix.
 //!
-//! Phase 8 part 1 defines this shape and the draft-model loading behind
-//! it; the draft/verify decode loop, rollback integration, and
-//! acceptance-rate accounting are later parts. Nothing in the engine
-//! calls [`Drafter::propose`] yet.
+//! The engine drives this interface from inside `run_iteration` (Phase 8
+//! part 2): eligible greedy requests get a proposal per step, the target
+//! scores the proposed tokens in one gamma+1-row verify forward, the
+//! longest agreeing prefix plus the target's own next token commits, and
+//! rejected positions roll back by block release (O(1) — no data moves).
 //!
 //! Threading: a drafter lives on the engine thread with everything else
 //! that touches MLX (its methods take the engine's `Stream`, and

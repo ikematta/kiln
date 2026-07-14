@@ -51,7 +51,7 @@ impl StepModel for RecordingMock {
         let n = batch.num_tokens() as i32;
         self.observations.borrow_mut().push(Obs {
             rows: n,
-            all_sampled: batch.seqs.iter().all(|seq| seq.sample),
+            all_sampled: batch.seqs.iter().all(|seq| seq.sample_rows > 0),
             lazy: matches!(batch.input, StepInput::Lazy(_)),
         });
         let ids = match &batch.input {
@@ -90,7 +90,7 @@ impl StepModel for RecordingMock {
                 s,
             )?;
             consumed += seq.len;
-            if !seq.sample {
+            if seq.sample_rows == 0 {
                 continue;
             }
             let total = seq.offset + seq.len;

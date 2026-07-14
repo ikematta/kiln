@@ -18,9 +18,12 @@ pub struct SeqStep {
     /// Tokens already in this sequence's KV before the step — its RoPE
     /// offset.
     pub offset: i32,
-    /// Whether the segment's last position is sampled (its logits are
-    /// returned).
-    pub sample: bool,
+    /// How many of the segment's trailing positions are sampled (their
+    /// logits are returned): 0 for prefill chunks and post-preemption
+    /// replay, 1 for plain decode, `len` for a speculative verify segment
+    /// (SPEC §6.5 — the target scores the fed token AND every draft token
+    /// in one forward). Never negative, never more than `len`.
+    pub sample_rows: i32,
     /// All blocks backing the sequence through this step, in token order.
     pub blocks: Vec<BlockId>,
     /// Where this step's K/V rows land in the pools.
