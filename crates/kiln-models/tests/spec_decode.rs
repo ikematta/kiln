@@ -26,6 +26,15 @@
 //!   same-family draft);
 //! - spec_max_batch gating: with more requests admitted the drafter is
 //!   never consulted (SPEC §6.5 auto-disable-by-width);
+//! - the Phase 8 part 3 auto-disable heuristics: the per-round gamma
+//!   ramps down with the admitted width (`spec_gamma_at_width`), and a
+//!   sustained-low-acceptance request is stood down after its warmup
+//!   window (`spec_min_acceptance`), rejoins the async_eval pipeline,
+//!   and still produces the plain path's exact output. The adversarial
+//!   arms elsewhere in this suite run with the acceptance heuristic OFF
+//!   so they keep their full rollback pressure; the self-draft and
+//!   cross-quant arms run the production default and prove it never
+//!   fires on a healthy pair;
 //! - the in-situ O(1) rollback measurement: rollback nanos per round,
 //!   measured inside real verify rounds, must not grow with context
 //!   length (the unit-level scaling companion is kiln-engine's
@@ -390,13 +399,19 @@ fn run_model_with_speculation(
                 as Box<dyn Fn() -> Box<dyn Drafter>>,
         ),
     ] {
-        let mut engine = Engine::new(
-            &model,
-            model.kv_dims(),
-            engine_config(&model, det_width),
-            Stream::gpu(),
-        )
-        .expect("engine builds");
+        let mut config = engine_config(&model, det_width);
+        if drafter_kind == "adversarial" {
+            // The adversarial arm exists to hammer the correction +
+            // rollback path on EVERY round of every fixture; the Phase 8
+            // part 3 acceptance heuristic would (correctly) stand such a
+            // drafter down after its warmup window, so it is switched off
+            // here. The heuristic has its own dedicated checks below;
+            // the self-draft arm keeps the production default and proves
+            // it never fires on a healthy pair.
+            config.spec_min_acceptance = 0.0;
+        }
+        let mut engine =
+            Engine::new(&model, model.kv_dims(), config, Stream::gpu()).expect("engine builds");
         engine.set_drafter(mk_drafter());
         for ((name, fixture, prompt_ids), baseline) in fixtures.iter().zip(&baselines) {
             let (output, _) = engine_generate(&mut engine, prompt_ids, fixture.max_tokens);
@@ -434,6 +449,11 @@ fn run_model_with_speculation(
                 stats.accepted_total * 2 > stats.proposed_total,
                 "self-draft acceptance below 50% on {model_name}: {stats:?} — the SPEC \
                  §11.3 same-family sanity bar fails even for the identity pair"
+            );
+            assert_eq!(
+                stats.standdowns_total, 0,
+                "the acceptance heuristic (production default) fired on a healthy \
+                 self-draft pair for {model_name}: {stats:?}"
             );
         } else {
             assert!(
@@ -549,6 +569,9 @@ fn check_spec_max_batch_gate(model: &AnyModel, det_width: usize) {
 fn check_rollback_is_flat_in_situ(model: &AnyModel, det_width: usize) {
     let mut config = engine_config(model, det_width);
     config.prefix_cache = false; // keep both runs shape-identical and lean
+    // Sustained total rejection is the point of this measurement; the
+    // acceptance heuristic would stand the adversary down after warmup.
+    config.spec_min_acceptance = 0.0;
     let mean_rollback_nanos = |prompt_len: usize| -> u64 {
         let prompt: Vec<u32> = (0..prompt_len).map(|i| 100 + (i % 1000) as u32).collect();
         let mut engine = Engine::new(model, model.kv_dims(), config.clone(), Stream::gpu())
@@ -583,6 +606,10 @@ fn check_rollback_is_flat_in_situ(model: &AnyModel, det_width: usize) {
 fn check_kv_envelope_crossing(model: &AnyModel, det_width: usize) {
     let mut config = engine_config(model, det_width);
     config.prefix_cache = false;
+    // The adversary must still be speculating when the context crosses
+    // the key-length boundary; the acceptance heuristic would have stood
+    // it down long before (its own checks live elsewhere).
+    config.spec_min_acceptance = 0.0;
     let prompt: Vec<u32> = (0..1000).map(|i| 100 + (i % 900) as u32).collect();
     let max_tokens = 64; // crosses key length 1024 mid-run
 
@@ -616,6 +643,147 @@ fn check_kv_envelope_crossing(model: &AnyModel, det_width: usize) {
         "kv-envelope crossing: {} rounds, {}/{} accepted, output exact across the \
          1-pass boundary",
         stats.rounds_total, stats.accepted_total, stats.proposed_total,
+    );
+}
+
+/// A drafter that records the `gamma` it is asked for and proposes
+/// nothing — observes the Phase 8 part 3 width ramp without perturbing
+/// decoding (empty proposals keep every step on the plain path).
+struct GammaRecordingDrafter {
+    seqs: HashSet<u64>,
+    gammas: Rc<RefCell<Vec<usize>>>,
+}
+
+impl Drafter for GammaRecordingDrafter {
+    fn memory(&self) -> DrafterMemory {
+        DrafterMemory::default()
+    }
+
+    fn begin(&mut self, seq: u64, _prompt: &[u32], _s: &Stream) -> Result<(), DraftError> {
+        self.seqs.insert(seq);
+        Ok(())
+    }
+
+    fn propose(
+        &mut self,
+        seq: u64,
+        _committed: &[u32],
+        gamma: usize,
+        _s: &Stream,
+    ) -> Result<Vec<u32>, DraftError> {
+        if !self.seqs.contains(&seq) {
+            return Err(DraftError::UnknownSeq(seq));
+        }
+        self.gammas.borrow_mut().push(gamma);
+        Ok(Vec::new())
+    }
+
+    fn release(&mut self, seq: u64) {
+        self.seqs.remove(&seq);
+    }
+}
+
+/// The SPEC §6.5 batch-width stand-down as a ramp, not a cliff (Phase 8
+/// part 3): at admitted width W the per-round gamma the engine asks the
+/// drafter for is bounded by `spec_gamma_at_width` — full gamma
+/// single-stream, standing down toward 1 at `spec_max_batch` (the
+/// off-above-the-threshold half is `check_spec_max_batch_gate`).
+fn check_width_ramp(model: &AnyModel, det_width: usize) {
+    let config = engine_config(model, det_width);
+    let spec_max_batch = config.spec_max_batch;
+    for width in 1..=spec_max_batch {
+        let gammas = Rc::new(RefCell::new(Vec::new()));
+        let mut engine = Engine::new(model, model.kv_dims(), config.clone(), Stream::gpu())
+            .expect("engine builds");
+        engine.set_drafter(Box::new(GammaRecordingDrafter {
+            seqs: HashSet::new(),
+            gammas: Rc::clone(&gammas),
+        }));
+        // 1-token prompts admit together, so the batch holds `width`
+        // decoding requests from the first step to the last (identical
+        // max_tokens finish together).
+        let _handles: Vec<Collected> = (0..width)
+            .map(|i| submit_collected(&mut engine, &[100 + i as u32], 16))
+            .collect();
+        while !engine.is_idle() {
+            engine.step().expect("engine step");
+        }
+        let gammas = gammas.borrow();
+        let expected = kiln_engine::spec_gamma_at_width(config.gamma, spec_max_batch, width);
+        assert!(
+            !gammas.is_empty(),
+            "the drafter was never consulted at width {width}"
+        );
+        assert_eq!(
+            gammas.iter().copied().max(),
+            Some(expected),
+            "width {width}: per-round gamma should reach the ramp bound {expected} \
+             (got {gammas:?})"
+        );
+        assert!(
+            gammas.iter().all(|&g| (1..=expected).contains(&g)),
+            "width {width}: a consulted round left the (0, {expected}] ramp range \
+             ({gammas:?} — values below the bound are the remaining-budget tail clamp)"
+        );
+        eprintln!(
+            "width ramp: {} requests -> gamma bound {expected} over {} consultations",
+            width,
+            gammas.len()
+        );
+    }
+}
+
+/// The acceptance auto-disable (Phase 8 part 3) at its production
+/// default: a total-rejection adversary is stood down right after the
+/// warmup window, its remaining decode is plain (and free to pipeline
+/// again), and the output is exactly the plain path's.
+fn check_acceptance_standdown(model: &AnyModel, det_width: usize) {
+    let config = engine_config(model, det_width);
+    assert!(
+        config.spec_min_acceptance > 0.0,
+        "this check exercises the production default, which must be on"
+    );
+    let prompt: Vec<u32> = (100..108).collect();
+    let max_tokens = 48;
+    let baseline = {
+        let mut engine = Engine::new(model, model.kv_dims(), config.clone(), Stream::gpu())
+            .expect("engine builds");
+        engine_generate(&mut engine, &prompt, max_tokens).0
+    };
+    let mut engine =
+        Engine::new(model, model.kv_dims(), config, Stream::gpu()).expect("engine builds");
+    engine.set_drafter(Box::new(AdversarialDrafter::new()));
+    let (output, _) = engine_generate(&mut engine, &prompt, max_tokens);
+    assert_eq!(
+        output, baseline,
+        "greedy output moved under an acceptance stand-down"
+    );
+    let stats = engine.spec_stats();
+    assert_eq!(
+        stats.standdowns_total, 1,
+        "a total-rejection adversary must be stood down exactly once: {stats:?}"
+    );
+    assert!(
+        stats.proposed_total >= u64::from(kiln_engine::SPEC_ACCEPTANCE_WARMUP_PROPOSED),
+        "stand-down fired before the warmup window: {stats:?}"
+    );
+    // Warmup at gamma 4 is 4 rounds; a couple of grace rounds cover
+    // lucky accepted tokens shifting the schedule.
+    assert!(
+        (4..=6).contains(&stats.rounds_total),
+        "consultations should stop at the warmup boundary: {stats:?}"
+    );
+    assert!(
+        engine.pipelined_steps() > 0,
+        "after standing down, the request should re-enter the async_eval pipeline"
+    );
+    eprintln!(
+        "acceptance stand-down: {} rounds ({}/{} accepted), stood down after warmup, \
+         {} pipelined steps afterwards, output exact",
+        stats.rounds_total,
+        stats.accepted_total,
+        stats.proposed_total,
+        engine.pipelined_steps(),
     );
 }
 
@@ -746,6 +914,11 @@ fn speculation_preserves_greedy_output_and_measures_its_costs() {
                  prose) failed: {stats:?}"
             );
             assert_eq!(
+                stats.standdowns_total, 0,
+                "the acceptance heuristic (production default) fired on the certified \
+                 cross-quant pair: {stats:?}"
+            );
+            assert_eq!(
                 (
                     summary.spec_tokens_proposed as u64,
                     summary.spec_tokens_accepted as u64
@@ -789,6 +962,8 @@ fn speculation_preserves_greedy_output_and_measures_its_costs() {
                 .calibrate_deterministic_width(&stream)
                 .expect("calibrates");
             check_spec_max_batch_gate(&model, det_width);
+            check_width_ramp(&model, det_width);
+            check_acceptance_standdown(&model, det_width);
             check_rollback_is_flat_in_situ(&model, det_width);
             check_kv_envelope_crossing(&model, det_width);
         }

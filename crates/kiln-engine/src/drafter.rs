@@ -31,6 +31,44 @@ pub const DEFAULT_GAMMA: usize = 4;
 /// saturates the GPU there.
 pub const DEFAULT_SPEC_MAX_BATCH: usize = 4;
 
+/// Default `EngineConfig::spec_min_acceptance` (Phase 8 auto-disable
+/// heuristics): the verified acceptance rate (accepted / proposed) below
+/// which a warmed-up request stands down from speculation. 1-in-8 is the
+/// break-even acceptance for a draft costing ~1/8th of the target per
+/// forward — speculation pays iff the acceptance fraction exceeds the
+/// draft/target cost ratio: a round spends `gamma·c_draft + c_verify` to
+/// commit `1 + accepted` tokens where a plain step spends `c_target` for
+/// one. Permissive enough that a properly-sized deployment pair (SPEC
+/// §12 Phase 8 names 0.6B drafting for 14B, cost ratio ≈ 0.05) never
+/// trips it on honest content, while a mis-paired draft proposing noise
+/// stops burning draft forwards after the warmup window.
+pub const DEFAULT_SPEC_MIN_ACCEPTANCE: f64 = 0.125;
+
+/// Proposed tokens a request must accumulate before
+/// `spec_min_acceptance` may judge it — acceptance over fewer tokens is
+/// mostly noise (a single rejected round would condemn a healthy pair).
+pub const SPEC_ACCEPTANCE_WARMUP_PROPOSED: u32 = 16;
+
+/// The SPEC §6.5 batch-width stand-down, as a per-round gamma bound:
+/// full `gamma` single-stream, ramping down linearly as the admitted
+/// batch approaches `spec_max_batch` (batching alone is saturating the
+/// GPU there, so speculation's extra verify rows pay less and less), at
+/// least 1 while `width <= spec_max_batch` (SPEC §6.5 disables strictly
+/// ABOVE the threshold), and 0 — speculation off — beyond it.
+///
+/// This is a heuristic bound, applied UNDER the hard ADR 0005 cutoffs
+/// (per-model envelope gamma, deterministic width, verify key length):
+/// it only ever shrinks the round, never widens the envelope.
+pub fn spec_gamma_at_width(gamma: usize, spec_max_batch: usize, width: usize) -> usize {
+    let width = width.max(1);
+    if gamma == 0 || width > spec_max_batch {
+        return 0;
+    }
+    // Ceil division keeps the ramp ≥ 1 across the whole admitted range
+    // and exactly `gamma` at width 1.
+    (gamma * (spec_max_batch + 1 - width)).div_ceil(spec_max_batch)
+}
+
 /// Draft-side failure. Never fatal to the request: the engine treats any
 /// drafter error as "no proposal this round" at worst, or surfaces it as
 /// an in-band request error — a drafter must not be able to take down a
@@ -106,4 +144,55 @@ pub trait Drafter {
     /// Drops all draft-side state for `seq`. Unknown sequences are a
     /// no-op (finish paths may race a never-begun sequence).
     fn release(&mut self, seq: u64);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spec_gamma_at_width;
+
+    #[test]
+    fn width_ramp_defaults() {
+        // gamma 4, spec_max_batch 4 (the SPEC §6.5 defaults).
+        assert_eq!(spec_gamma_at_width(4, 4, 1), 4, "full gamma single-stream");
+        assert_eq!(spec_gamma_at_width(4, 4, 2), 3);
+        assert_eq!(spec_gamma_at_width(4, 4, 3), 2);
+        assert_eq!(spec_gamma_at_width(4, 4, 4), 1, "stood down, still on");
+        assert_eq!(spec_gamma_at_width(4, 4, 5), 0, "off strictly above");
+        assert_eq!(spec_gamma_at_width(4, 4, 100), 0);
+    }
+
+    #[test]
+    fn width_ramp_stays_on_through_spec_max_batch() {
+        // SPEC §6.5 disables strictly ABOVE spec_max_batch: for any
+        // nonzero gamma the ramp keeps at least 1 through the admitted
+        // range, and is monotone in width.
+        for gamma in 1..=8 {
+            for smb in 1..=8 {
+                let mut prev = usize::MAX;
+                for width in 1..=smb {
+                    let g = spec_gamma_at_width(gamma, smb, width);
+                    assert!(
+                        (1..=gamma).contains(&g),
+                        "gamma {gamma} smb {smb} width {width} -> {g}"
+                    );
+                    assert!(g <= prev, "ramp must not grow with width");
+                    prev = g;
+                }
+                assert_eq!(spec_gamma_at_width(gamma, smb, smb + 1), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn width_ramp_edges() {
+        assert_eq!(spec_gamma_at_width(0, 4, 1), 0, "gamma 0 is off");
+        assert_eq!(spec_gamma_at_width(4, 0, 1), 0, "spec_max_batch 0 is off");
+        // Width 0 (no admitted requests — not reachable from the per-seq
+        // path) behaves as single-stream rather than dividing by zero.
+        assert_eq!(spec_gamma_at_width(4, 4, 0), 4);
+        // The clamped-envelope shape (qwen2.5-0.5b, ADR 0005 gamma 3).
+        assert_eq!(spec_gamma_at_width(3, 4, 1), 3);
+        assert_eq!(spec_gamma_at_width(3, 4, 4), 1);
+        assert_eq!(spec_gamma_at_width(3, 4, 5), 0);
+    }
 }

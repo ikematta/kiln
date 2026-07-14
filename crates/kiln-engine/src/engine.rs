@@ -68,6 +68,23 @@
 //! gamma=4 verify on gqa-factor-7 qwen2.5-0.5b silently left the fused
 //! kernel and flipped a measured 1-fp16-ULP argmax race.
 //!
+//! Auto-disable heuristics (SPEC §6.5 / SPEC §12 Phase 8, part 3) sit
+//! UNDER those hard cutoffs and only ever shrink a round — they are
+//! throughput policy, never a correctness lever (turning speculation off
+//! is output-neutral by the invariance above):
+//! - **batch width** ([`crate::drafter::spec_gamma_at_width`]): full
+//!   `gamma` single-stream, standing down linearly as the admitted batch
+//!   approaches `spec_max_batch` (batching alone is saturating the GPU
+//!   there, so speculation's extra verify rows and draft forwards pay
+//!   progressively less), and off strictly above it — SPEC §6.5's
+//!   auto-disable, with a ramp instead of a cliff.
+//! - **acceptance rate** (`EngineConfig::spec_min_acceptance`): a
+//!   request whose verified acceptance sits below the floor after
+//!   [`crate::drafter::SPEC_ACCEPTANCE_WARMUP_PROPOSED`] judged tokens
+//!   stands down permanently — its draft-side state is released and the
+//!   request may re-enter the async_eval pipeline below, so a mis-paired
+//!   draft costs a bounded warmup, not the whole generation.
+//!
 //! Decode pipelining (SPEC §6.2, the async_eval pipeline of
 //! `generate.rs` lifted to the batch): a steady-state pure-decode step
 //! defers its token readback — the next step's forward is built feeding
@@ -100,7 +117,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::block::{BlockError, BlockId, BlockManager, BlockTable};
-use crate::drafter::{DEFAULT_GAMMA, DEFAULT_SPEC_MAX_BATCH, Drafter, DrafterMemory};
+use crate::drafter::{
+    DEFAULT_GAMMA, DEFAULT_SPEC_MAX_BATCH, DEFAULT_SPEC_MIN_ACCEPTANCE, Drafter, DrafterMemory,
+    SPEC_ACCEPTANCE_WARMUP_PROPOSED, spec_gamma_at_width,
+};
 use crate::grammar::Grammar;
 use crate::paged::{KvSpec, PagedKv, WriteRun};
 use crate::paged_attn::PagedAttnInputs;
@@ -248,8 +268,22 @@ pub struct EngineConfig {
     pub gamma: usize,
     /// Speculation auto-disables when more than this many requests are
     /// admitted (SPEC §6.5 `spec_max_batch`): batching already saturates
-    /// the GPU there.
+    /// the GPU there. Below the threshold the per-round gamma already
+    /// stands down linearly with the admitted width
+    /// ([`crate::drafter::spec_gamma_at_width`]).
     pub spec_max_batch: usize,
+    /// Auto-disable by acceptance (SPEC §12 Phase 8): the minimum
+    /// verified acceptance rate (accepted / proposed) a request must
+    /// hold, once
+    /// [`crate::drafter::SPEC_ACCEPTANCE_WARMUP_PROPOSED`] proposed
+    /// tokens have been judged, to keep speculating. Below it the
+    /// request stands down for the rest of its life — plain decode
+    /// continues, its draft-side state is released, and it may pipeline
+    /// again. 0.0 disables the heuristic (tests that need sustained
+    /// adversarial pressure use this). Advisory only: the ADR 0005
+    /// envelope and [`VERIFY_MAX_KEY_LEN`] are hard cutoffs that bind
+    /// whether or not any heuristic fires.
+    pub spec_min_acceptance: f64,
 }
 
 impl Default for EngineConfig {
@@ -266,6 +300,7 @@ impl Default for EngineConfig {
             paged_attention_kernel: false,
             gamma: DEFAULT_GAMMA,
             spec_max_batch: DEFAULT_SPEC_MAX_BATCH,
+            spec_min_acceptance: DEFAULT_SPEC_MIN_ACCEPTANCE,
         }
     }
 }
@@ -477,6 +512,12 @@ struct Seq {
     /// The drafter errored for this sequence — speculation permanently off
     /// for it (a draft fault must never fail a generation, SPEC §6.5).
     draft_dead: bool,
+    /// Stood down by the acceptance heuristic
+    /// (`EngineConfig::spec_min_acceptance`): the measured acceptance
+    /// says the draft is costing more than it saves for this request, so
+    /// speculation is off for the rest of its life. Survives preemption
+    /// (the content that drafted badly is still the content).
+    draft_standdown: bool,
     /// Per-request speculation counters (proto `Timings`).
     spec_proposed: u32,
     spec_accepted: u32,
@@ -506,6 +547,7 @@ impl Seq {
     /// between positions, which a batched verify does not have.
     fn spec_eligible(&self) -> bool {
         !self.draft_dead
+            && !self.draft_standdown
             && self.sampler.is_greedy()
             && self.penalties.is_disabled()
             && self.grammar.is_none()
@@ -767,6 +809,10 @@ pub struct SpecStats {
     pub rollback_nanos_total: u64,
     /// Drafter faults (speculation disabled for the affected request).
     pub draft_errors_total: u64,
+    /// Requests stood down by the acceptance heuristic
+    /// (`EngineConfig::spec_min_acceptance`) — sustained low verified
+    /// acceptance, speculation off for the rest of the request.
+    pub standdowns_total: u64,
 }
 
 /// Splits decode entries into the ADR 0002 B' forward groups:
@@ -1248,6 +1294,7 @@ impl<M: StepModel> Engine<M> {
             draft_begun: false,
             draft_committed: 0,
             draft_dead: false,
+            draft_standdown: false,
             spec_proposed: 0,
             spec_accepted: 0,
             submitted_at: Instant::now(),
@@ -1409,9 +1456,14 @@ impl<M: StepModel> Engine<M> {
     /// an alternate engine).
     fn spec_would_engage(&self) -> bool {
         self.drafter.is_some()
-            && self.config.gamma > 0
             && self.config.deterministic_decode_width > 1
-            && self.running.len() <= self.config.spec_max_batch
+            // The width ramp (SPEC §6.5 stand-down) in lockstep with
+            // `collect_proposal`: 0 = no round at this admitted width.
+            && spec_gamma_at_width(
+                self.config.gamma,
+                self.config.spec_max_batch,
+                self.running.len(),
+            ) > 0
             && self.running.iter().any(|seq| {
                 seq.spec_eligible()
                     && seq.max_tokens.saturating_sub(seq.generated as usize) >= 2
@@ -1432,7 +1484,15 @@ impl<M: StepModel> Engine<M> {
         let Some(vocab) = self.logits_vocab else {
             return None; // first sampled forward not seen yet
         };
-        if self.config.gamma == 0 || self.running.len() > self.config.spec_max_batch {
+        // SPEC §6.5 batch-width stand-down: full gamma single-stream,
+        // ramping down as the admitted batch approaches spec_max_batch,
+        // 0 (off) strictly above it.
+        let width_gamma = spec_gamma_at_width(
+            self.config.gamma,
+            self.config.spec_max_batch,
+            self.running.len(),
+        );
+        if width_gamma == 0 {
             return None;
         }
         {
@@ -1441,21 +1501,22 @@ impl<M: StepModel> Engine<M> {
                 return None;
             }
         }
-        // Clamp gamma so the verify segment's gamma+1 rows stay within the
-        // ADR 0002 deterministic width (speculating requests are greedy —
-        // their verify forward must reproduce M=1 bits), within the
-        // request's remaining budget (proposing past max_tokens is waste),
-        // and within the ADR 0005 1-pass key-length envelope (the verify's
-        // key length is offset + gamma + 1; past [`VERIFY_MAX_KEY_LEN`]
-        // the request stops speculating and decodes plainly). The
-        // per-model fused-vector clamp (gamma+1 <= min(8, 32/gqa)) is
-        // baked into `config.gamma` by the worker at drafter attachment.
+        // Hard cutoffs UNDER which the heuristic ramp operates: the verify
+        // segment's gamma+1 rows stay within the ADR 0002 deterministic
+        // width (speculating requests are greedy — their verify forward
+        // must reproduce M=1 bits), within the request's remaining budget
+        // (proposing past max_tokens is waste), and within the ADR 0005
+        // 1-pass key-length envelope (the verify's key length is
+        // offset + gamma + 1; past [`VERIFY_MAX_KEY_LEN`] the request
+        // stops speculating and decodes plainly). The per-model
+        // fused-vector clamp (gamma+1 <= min(8, 32/gqa)) is baked into
+        // `config.gamma` by the worker at drafter attachment. These bind
+        // regardless of what any heuristic decides — heuristics shrink
+        // rounds, never widen the envelope.
         let seq = &self.running[i];
         let remaining = seq.max_tokens.saturating_sub(seq.generated as usize);
         let offset = seq.processed + seq.fed;
-        let gamma = self
-            .config
-            .gamma
+        let gamma = width_gamma
             .min(self.config.deterministic_decode_width.saturating_sub(1))
             .min(remaining.saturating_sub(1))
             .min(VERIFY_MAX_KEY_LEN.saturating_sub(offset + 1));
@@ -1506,6 +1567,44 @@ impl<M: StepModel> Engine<M> {
                 }
                 None
             }
+        }
+    }
+
+    /// The acceptance auto-disable (SPEC §12 Phase 8, part 3), judged at
+    /// round settle where acceptance is a token-value fact: once
+    /// [`SPEC_ACCEPTANCE_WARMUP_PROPOSED`] proposed tokens have been
+    /// verified for `running[i]`, a verified acceptance rate below
+    /// `config.spec_min_acceptance` stands the request down for good —
+    /// the draft is costing more than it saves. Its draft-side state is
+    /// released immediately (KV blocks back to the draft pool), and with
+    /// speculation no longer asking for the synchronous path the request
+    /// may re-enter the async_eval pipeline.
+    fn maybe_stand_down(&mut self, i: usize) {
+        let Self {
+            drafter,
+            running,
+            spec,
+            config,
+            ..
+        } = self;
+        let seq = &mut running[i];
+        if config.spec_min_acceptance <= 0.0
+            || seq.finished
+            || seq.draft_standdown
+            || seq.draft_dead
+            || seq.spec_proposed < SPEC_ACCEPTANCE_WARMUP_PROPOSED
+            || f64::from(seq.spec_accepted)
+                >= config.spec_min_acceptance * f64::from(seq.spec_proposed)
+        {
+            return;
+        }
+        seq.draft_standdown = true;
+        spec.standdowns_total += 1;
+        if seq.draft_begun
+            && let Some(drafter) = drafter.as_mut()
+        {
+            drafter.release(seq.arrival);
+            seq.draft_begun = false;
         }
     }
 
@@ -2231,6 +2330,7 @@ impl<M: StepModel> Engine<M> {
                     self.spec.rollback_nanos_total += rollback_started.elapsed().as_nanos() as u64;
                 }
             }
+            self.maybe_stand_down(i);
         }
 
         // --- Advance prefill progress; a fully prefilled sequence starts
