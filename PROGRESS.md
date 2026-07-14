@@ -5199,3 +5199,23 @@
      grows the pinned set and the perf lane's runtime materially.
   Per protocol: picking nothing; the heuristics and measurement stand
   regardless of the disposition.
+
+## [2026-07-14] Phase 8 / Part 3 — PR #22 CI verification recorded — DONE
+- What: PR #22 (`claude/p8-autodisable-throughput`, commit 67fc8f4) run
+  29321876048: ALL FOUR checks pass on the real runners — lint 44s,
+  compile-linux 55s, test-macos-release 3m20s, test-macos 25m13s.
+- The blocking spec_decode lane (`KILN_FIXTURE_PARITY=skip`, live
+  speculation-off baselines) passed on the foreign GPU with the part 3
+  heuristics live: width ramp, acceptance stand-down, and the
+  production-default no-false-fire assertions all held on a different
+  device class — the heuristics are policy over the device-independent
+  SPEC §6.5 invariant, exactly as designed.
+- Advisory golden lane (ADR 0004, permanently non-blocking): the ONLY
+  divergence is the known gemma-3-1b-it-4bit/chat-basic flip — the same
+  fixture and class recorded in ADR 0004 (4-ULP fp16 race, kernel-class
+  coin toss on the foreign device). No pattern change → no action per
+  the ADR; noted here per its protocol.
+- Next: PM ruling on the DECISION NEEDED above (disposition of the SPEC
+  §12 Phase 8 speedup bar), then the remaining Phase 8 parts — gateway
+  `[model.speculative]` → `--draft-model` config wiring, then
+  CAPABILITY_SPECULATIVE advertisement.
