@@ -32,6 +32,42 @@
 //! streamed before the preemption; `tests/preemption.rs` in kiln-models
 //! asserts a preempted request resumes onto the identical token stream.
 //!
+//! Speculative decoding (SPEC §6.5, scheduler-native): an eligible
+//! request — greedy, penalties off, no grammar, batch within
+//! `spec_max_batch` — swaps its 1-token decode segment for a
+//! gamma+1-token verify segment: the drafter's proposed tokens ride the
+//! same forward as the request's fed token, every position is sampled,
+//! and the longest draft-agreeing prefix plus the target's own next
+//! token commits. Rejected positions roll back by releasing their
+//! blocks — bookkeeping only. Greedy invariance rests on the verify
+//! forward staying in the M=1 kernel classes (ADR 0002): gamma+1 is
+//! clamped under the calibrated deterministic width for the trunk
+//! matmuls, each verify segment runs as its own forward group, and the
+//! SDPA query length gamma+1 must stay inside the pinned MLX's
+//! short-query (vector) kernel class. Row 0 then reproduces the plain
+//! decode's bits, and each later row's input token equals the token the
+//! plain path would have fed — so committed tokens are the plain path's
+//! tokens by induction. That argument is held to measurement, not
+//! trusted: the spec_decode suite reruns every golden fixture with
+//! speculation on (self-draft and adversarial) and requires
+//! token-identical output.
+//!
+//! The SDPA leg is held by the ADR 0005 envelope, enforced at drafter
+//! attachment (worker) plus per-round here: the pinned MLX keeps the
+//! fused vector kernel only while `query_len <= 8` and
+//! `query_len * gqa_factor <= 32` (so `gamma` is clamped per model via
+//! `AnyModel::speculative_gamma_bound`), and only while the key length
+//! stays inside the 1-pass region ([`VERIFY_MAX_KEY_LEN`] — the 2-pass
+//! variant's partition geometry varies with query count, key length,
+//! and device class, so it is out of the certified envelope). Within
+//! the 1-pass vector kernel, per-row bits are invariant to query count
+//! and key length by kernel construction (fixed stride-32 key
+//! assignment, index-ordered online softmax, fixed reduction tree,
+//! identical used-key sets under the bottom-right causal mask) — the
+//! source-verified argument recorded in ADR 0005, discovered when a
+//! gamma=4 verify on gqa-factor-7 qwen2.5-0.5b silently left the fused
+//! kernel and flipped a measured 1-fp16-ULP argmax race.
+//!
 //! Decode pipelining (SPEC §6.2, the async_eval pipeline of
 //! `generate.rs` lifted to the batch): a steady-state pure-decode step
 //! defers its token readback — the next step's forward is built feeding
@@ -64,7 +100,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::block::{BlockError, BlockId, BlockManager, BlockTable};
-use crate::drafter::{Drafter, DrafterMemory};
+use crate::drafter::{DEFAULT_GAMMA, DEFAULT_SPEC_MAX_BATCH, Drafter, DrafterMemory};
 use crate::grammar::Grammar;
 use crate::paged::{KvSpec, PagedKv, WriteRun};
 use crate::paged_attn::PagedAttnInputs;
@@ -145,6 +181,17 @@ pub const PREFILL_PAD_MIN_ROWS: usize = 32;
 /// without calibration.
 pub const DEFAULT_DETERMINISTIC_DECODE_WIDTH: usize = 4;
 
+/// Largest key length a speculative verify forward may reach (ADR 0005):
+/// the pinned MLX routes fused-vector SDPA to its 2-pass variant at key
+/// length >= 1024 on 'd'/'s'-class GPUs (>= 4096 with GQA elsewhere), and
+/// the 2-pass partition geometry varies with query count and key length —
+/// outside the certified kernel class. 1023 keeps every verify in the
+/// 1-pass region on EVERY device class; requests simply stop speculating
+/// (plain decode continues) once their context outgrows it. Refinable to
+/// the per-device boundary via `mlx_device_info` (architecture string) —
+/// recorded in ADR 0005, not implemented.
+pub const VERIFY_MAX_KEY_LEN: usize = 1023;
+
 /// Cache maintenance cadence in decode iterations (mirrors the Phase-3
 /// loop's `clear_cache` every 256 steps).
 const MAINTENANCE_INTERVAL: u64 = 256;
@@ -191,6 +238,18 @@ pub struct EngineConfig {
     /// correctness reference; this flag stays opt-in until the kernel's
     /// parity and throughput bars are proven on the serving device.
     pub paged_attention_kernel: bool,
+    /// Tokens proposed per speculation round (SPEC §6.5 `gamma`); only
+    /// consulted when a drafter is attached. The effective per-round value
+    /// is additionally clamped so a verify segment's `gamma + 1` rows stay
+    /// within `deterministic_decode_width` (every speculating request is
+    /// greedy, so its verify forward must keep the M=1 kernel classes —
+    /// ADR 0002) and within the request's remaining token budget. 0
+    /// disables speculation.
+    pub gamma: usize,
+    /// Speculation auto-disables when more than this many requests are
+    /// admitted (SPEC §6.5 `spec_max_batch`): batching already saturates
+    /// the GPU there.
+    pub spec_max_batch: usize,
 }
 
 impl Default for EngineConfig {
@@ -205,6 +264,8 @@ impl Default for EngineConfig {
             ssd: None,
             deterministic_decode_width: DEFAULT_DETERMINISTIC_DECODE_WIDTH,
             paged_attention_kernel: false,
+            gamma: DEFAULT_GAMMA,
+            spec_max_batch: DEFAULT_SPEC_MAX_BATCH,
         }
     }
 }
@@ -295,6 +356,12 @@ pub struct FinishSummary {
     /// Prompt tokens served from the prefix cache instead of prefilled
     /// (proto `Finished.cached_prompt_tokens`).
     pub cached_prompt_tokens: u32,
+    /// Draft tokens proposed for this request across its verify rounds
+    /// (proto `Timings.spec_tokens_proposed`; 0 when speculation off).
+    pub spec_tokens_proposed: u32,
+    /// Proposed tokens the target accepted (longest agreeing prefix sums;
+    /// bonus tokens are not counted — they are ordinary target samples).
+    pub spec_tokens_accepted: u32,
     /// Submit → first sampled token readable.
     pub prefill_seconds: f64,
     /// First sampled token → finish.
@@ -400,6 +467,19 @@ struct Seq {
     cache_checked: bool,
     /// Prompt tokens served from the prefix cache (max across resumes).
     cached_tokens: u32,
+    /// The drafter holds state for this sequence (`begin` was called);
+    /// finish/teardown must `release` it.
+    draft_begun: bool,
+    /// `history[1..]` tokens already fed through `Drafter::propose`'s
+    /// `committed` argument (history[0] rides in the prompt). Never
+    /// rewound: history only grows, even across preemption.
+    draft_committed: usize,
+    /// The drafter errored for this sequence — speculation permanently off
+    /// for it (a draft fault must never fail a generation, SPEC §6.5).
+    draft_dead: bool,
+    /// Per-request speculation counters (proto `Timings`).
+    spec_proposed: u32,
+    spec_accepted: u32,
     submitted_at: Instant,
     first_token_at: Option<Instant>,
     finished: bool,
@@ -415,6 +495,20 @@ impl Seq {
     /// first victim: lowest priority first, then most recently admitted.
     fn deservingness(&self) -> (Priority, Reverse<u64>) {
         (self.priority, Reverse(self.arrival))
+    }
+
+    /// Whether this request may ride a speculative verify round at all
+    /// (SPEC §6.5), independent of per-step conditions. Greedy only:
+    /// argmax consumes no PRNG draws, so committing a variable number of
+    /// tokens per round cannot desync a seeded key chain, and the ADR 0002
+    /// deterministic-width clamp keeps the verify forward bit-identical to
+    /// single-stream. Penalties and grammars need host-visible commits
+    /// between positions, which a batched verify does not have.
+    fn spec_eligible(&self) -> bool {
+        !self.draft_dead
+            && self.sampler.is_greedy()
+            && self.penalties.is_disabled()
+            && self.grammar.is_none()
     }
 
     /// Pool blocks this request needs to reach its next sampled token:
@@ -623,6 +717,8 @@ fn finish(
         error_cause,
         preemptions: seq.preemptions,
         cached_prompt_tokens: seq.cached_tokens,
+        spec_tokens_proposed: seq.spec_proposed,
+        spec_tokens_accepted: seq.spec_accepted,
         prefill_seconds: first.duration_since(seq.submitted_at).as_secs_f64(),
         decode_seconds: now.duration_since(first).as_secs_f64(),
     };
@@ -644,6 +740,33 @@ struct DecodePlan {
     seq: usize,
     sample: bool,
     step: SeqStep,
+    /// `Some(proposal)` marks a speculative verify segment (SPEC §6.5):
+    /// the step feeds `history[fed]` followed by the proposed tokens and
+    /// samples every position. Always runs as its own forward group.
+    draft: Option<Vec<u32>>,
+}
+
+/// Speculative-decoding observability (SPEC §6.5; proto `WorkerStats`
+/// `spec_tokens_*_total`). Rollback cost is recorded, not assumed: the
+/// nanos counter times exactly the block-release/table-truncate work a
+/// rejection triggers, so tests can assert it stays flat as sequences
+/// grow (the O(1) claim of the paged design).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SpecStats {
+    /// Verify rounds run (each = one draft proposal scored by the target).
+    pub rounds_total: u64,
+    /// Draft tokens proposed across all rounds.
+    pub proposed_total: u64,
+    /// Proposed tokens accepted (longest agreeing prefix sums).
+    pub accepted_total: u64,
+    /// Rounds that rejected at least one proposed token.
+    pub rollback_rounds_total: u64,
+    /// Rejected (rolled-back) draft positions.
+    pub rollback_tokens_total: u64,
+    /// Wall-clock nanoseconds spent inside rollback bookkeeping.
+    pub rollback_nanos_total: u64,
+    /// Drafter faults (speculation disabled for the affected request).
+    pub draft_errors_total: u64,
 }
 
 /// Splits decode entries into the ADR 0002 B' forward groups:
@@ -799,10 +922,18 @@ pub struct Engine<M> {
     cache: Option<CacheState>,
     /// Speculative-decoding proposer (SPEC §6.5), when configured. Owned
     /// here because spec decode is scheduler-native — the draft/verify
-    /// loop (Phase 8 part 2) runs inside the batch step. Until that
-    /// lands, only its memory report is read: the drafter's weights and
-    /// KV pool are part of this worker's budget envelope (SPEC §2.3).
+    /// loop runs inside the batch step — and its memory report feeds the
+    /// worker heartbeat: the drafter's weights and KV pool are part of
+    /// this worker's budget envelope (SPEC §2.3).
     drafter: Option<Box<dyn Drafter>>,
+    /// Speculation counters (SPEC §6.5 acceptance-rate metrics).
+    spec: SpecStats,
+    /// The target's logits width, learned from the first sampled forward.
+    /// Proposed draft ids are validated against it before they are ever
+    /// embedded — a defensive bound; the worker's tokenizer-compatibility
+    /// check at drafter attachment is the real gate. Speculation waits
+    /// until this is known (the second decode step at the earliest).
+    logits_vocab: Option<i32>,
     /// Why the SSD tier is off despite being configured, if it failed to
     /// open (silent-skip policy; the worker logs it once).
     ssd_error: Option<String>,
@@ -899,6 +1030,8 @@ impl<M: StepModel> Engine<M> {
             inflight: None,
             cache,
             drafter: None,
+            spec: SpecStats::default(),
+            logits_vocab: None,
             ssd_error,
             next_arrival: 0,
             preemptions_total: 0,
@@ -911,12 +1044,25 @@ impl<M: StepModel> Engine<M> {
         &self.config
     }
 
-    /// Attaches the speculative-decoding proposer (SPEC §6.5). Loading and
-    /// ownership only in Phase 8 part 1 — the step loop does not consult
-    /// it yet; its memory report flows into the worker heartbeat via
-    /// [`Self::drafter_memory`].
+    /// Attaches the speculative-decoding proposer (SPEC §6.5): eligible
+    /// greedy requests now decode through draft/verify rounds inside the
+    /// batch step. Preconditions (enforced by the worker, not here):
+    /// - the drafter proposes token ids in the target's tokenizer —
+    ///   attach only after `kiln_models::check_draft_compat` (or
+    ///   equivalent) has passed; a mismatched pair must be rejected
+    ///   loudly at load, never attached;
+    /// - `config.gamma` has been clamped to the target's ADR 0005
+    ///   envelope (`AnyModel::speculative_gamma_bound`); a target with no
+    ///   envelope (`None`) must be rejected loudly, never attached with
+    ///   speculation silently inert.
     pub fn set_drafter(&mut self, drafter: Box<dyn Drafter>) {
         self.drafter = Some(drafter);
+    }
+
+    /// Speculation counters (SPEC §6.5 acceptance-rate metrics); zeros
+    /// when no drafter is attached.
+    pub fn spec_stats(&self) -> SpecStats {
+        self.spec
     }
 
     /// The attached drafter's memory footprint (SPEC §2.3 accounting),
@@ -1066,6 +1212,8 @@ impl<M: StepModel> Engine<M> {
                     error_cause: Some(ErrorCause::Internal),
                     preemptions: 0,
                     cached_prompt_tokens: 0,
+                    spec_tokens_proposed: 0,
+                    spec_tokens_accepted: 0,
                     prefill_seconds: 0.0,
                     decode_seconds: 0.0,
                 }));
@@ -1097,6 +1245,11 @@ impl<M: StepModel> Engine<M> {
             preempted: false,
             cache_checked: false,
             cached_tokens: 0,
+            draft_begun: false,
+            draft_committed: 0,
+            draft_dead: false,
+            spec_proposed: 0,
+            spec_accepted: 0,
             submitted_at: Instant::now(),
             first_token_at: None,
             finished: false,
@@ -1234,16 +1387,141 @@ impl<M: StepModel> Engine<M> {
     /// previous token host-side) and no grammar (its mask for step N+1
     /// needs step N's token committed host-side), nothing waiting
     /// (admission and prefill want fresh pool state), no cancel pending
-    /// (the sweep runs on the synchronous path). Capacity is checked
-    /// exactly in `build_pipelined`.
+    /// (the sweep runs on the synchronous path), and no request that
+    /// speculation should be serving — a verify round needs its tokens
+    /// host-side every step, so it lives on the synchronous path and the
+    /// pipeline must yield to it. Capacity is checked exactly in
+    /// `build_pipelined`.
     fn pipeline_ok(&self) -> bool {
-        self.waiting.is_empty()
+        !self.spec_would_engage()
+            && self.waiting.is_empty()
             && self.running.iter().all(|seq| {
                 seq.decoding()
                     && seq.penalties.is_disabled()
                     && seq.grammar.is_none()
                     && !seq.cancel.load(Ordering::Acquire)
             })
+    }
+
+    /// Whether the next synchronous step would (or could, once the logits
+    /// width is known) run a verify round for some running request — the
+    /// pipeline yields to speculation (SPEC §6.5 is scheduler-native, not
+    /// an alternate engine).
+    fn spec_would_engage(&self) -> bool {
+        self.drafter.is_some()
+            && self.config.gamma > 0
+            && self.config.deterministic_decode_width > 1
+            && self.running.len() <= self.config.spec_max_batch
+            && self.running.iter().any(|seq| {
+                seq.spec_eligible()
+                    && seq.max_tokens.saturating_sub(seq.generated as usize) >= 2
+                    // A gamma=1 verify (2 rows) must still fit the ADR 0005
+                    // key-length envelope; past it the request decodes
+                    // plainly and may pipeline again.
+                    && seq.processed + seq.fed + 2 <= VERIFY_MAX_KEY_LEN
+            })
+    }
+
+    /// Runs one drafter round for `running[i]` (SPEC §6.5): lazily `begin`s
+    /// the sequence, feeds the tokens committed since the last round, and
+    /// returns the validated proposal. `None` = no speculation this step —
+    /// per-step conditions failed, the drafter declined, or it faulted (a
+    /// draft fault disables speculation for the request and is otherwise
+    /// invisible: the step decodes normally).
+    fn collect_proposal(&mut self, i: usize) -> Option<Vec<u32>> {
+        let Some(vocab) = self.logits_vocab else {
+            return None; // first sampled forward not seen yet
+        };
+        if self.config.gamma == 0 || self.running.len() > self.config.spec_max_batch {
+            return None;
+        }
+        {
+            let seq = &self.running[i];
+            if !seq.spec_eligible() {
+                return None;
+            }
+        }
+        // Clamp gamma so the verify segment's gamma+1 rows stay within the
+        // ADR 0002 deterministic width (speculating requests are greedy —
+        // their verify forward must reproduce M=1 bits), within the
+        // request's remaining budget (proposing past max_tokens is waste),
+        // and within the ADR 0005 1-pass key-length envelope (the verify's
+        // key length is offset + gamma + 1; past [`VERIFY_MAX_KEY_LEN`]
+        // the request stops speculating and decodes plainly). The
+        // per-model fused-vector clamp (gamma+1 <= min(8, 32/gqa)) is
+        // baked into `config.gamma` by the worker at drafter attachment.
+        let seq = &self.running[i];
+        let remaining = seq.max_tokens.saturating_sub(seq.generated as usize);
+        let offset = seq.processed + seq.fed;
+        let gamma = self
+            .config
+            .gamma
+            .min(self.config.deterministic_decode_width.saturating_sub(1))
+            .min(remaining.saturating_sub(1))
+            .min(VERIFY_MAX_KEY_LEN.saturating_sub(offset + 1));
+        if gamma == 0 {
+            return None;
+        }
+        let Self {
+            drafter,
+            running,
+            stream,
+            spec,
+            ..
+        } = self;
+        let drafter = drafter.as_mut()?;
+        let seq = &mut running[i];
+        let mut round = || -> Result<Vec<u32>, crate::drafter::DraftError> {
+            if !seq.draft_begun {
+                drafter.begin(seq.arrival, &seq.prompt, stream)?;
+                seq.draft_begun = true;
+                seq.draft_committed = 0;
+            }
+            // history[0] is the last prompt token (already in the prompt);
+            // everything after it that the drafter has not seen is newly
+            // committed. history never shrinks, so this is monotonic even
+            // across preemption.
+            let committed = &seq.history[1 + seq.draft_committed..];
+            let proposal = drafter.propose(seq.arrival, committed, gamma, stream)?;
+            seq.draft_committed = seq.history.len() - 1;
+            Ok(proposal)
+        };
+        match round() {
+            Ok(mut proposal) => {
+                // Defensive bounds: ids past the target's logits width can
+                // never verify and must never reach the embedding gather;
+                // over-long proposals lose their tail.
+                if let Some(bad) = proposal.iter().position(|&t| (t as i64) >= vocab as i64) {
+                    proposal.truncate(bad);
+                }
+                proposal.truncate(gamma);
+                (!proposal.is_empty()).then_some(proposal)
+            }
+            Err(_) => {
+                spec.draft_errors_total += 1;
+                seq.draft_dead = true;
+                if seq.draft_begun {
+                    drafter.release(seq.arrival);
+                    seq.draft_begun = false;
+                }
+                None
+            }
+        }
+    }
+
+    /// Releases drafter state for finished sequences (safe on unknown
+    /// sequences — `Drafter::release` is a no-op there). Runs before every
+    /// `retain(!finished)` sweep so no draft-side state outlives its
+    /// sequence.
+    fn release_finished_drafts(&mut self) {
+        let Some(drafter) = &mut self.drafter else {
+            return;
+        };
+        for seq in self.waiting.iter().chain(self.running.iter()) {
+            if seq.finished && seq.draft_begun {
+                drafter.release(seq.arrival);
+            }
+        }
     }
 
     /// Builds and schedules the next decode step feeding `prev`'s
@@ -1357,6 +1635,7 @@ impl<M: StepModel> Engine<M> {
                 token,
             );
         }
+        self.release_finished_drafts();
         self.running.retain(|seq| !seq.finished);
         if self.iterations.is_multiple_of(MAINTENANCE_INTERVAL) {
             memory::clear_cache()?;
@@ -1380,8 +1659,9 @@ impl<M: StepModel> Engine<M> {
                 finish(seq, mgr, cache.as_mut(), FinishKind::Cancelled, None, None);
             }
         }
-        waiting.retain(|seq| !seq.finished);
-        running.retain(|seq| !seq.finished);
+        self.release_finished_drafts();
+        self.waiting.retain(|seq| !seq.finished);
+        self.running.retain(|seq| !seq.finished);
     }
 
     /// SPEC §6.2 step 1: admit while the token budget allows. One request
@@ -1650,11 +1930,36 @@ impl<M: StepModel> Engine<M> {
                     }
                 }
             }
+            // Speculation (SPEC §6.5): an eligible sampling sequence asks
+            // the drafter for a proposal and plans a gamma+1-slot verify
+            // segment instead of a 1-slot decode. Speculation never causes
+            // eviction or preemption — if the pool cannot cover the wider
+            // segment the request falls back to the plain planner below.
+            if sample && let Some(proposal) = self.collect_proposal(i) {
+                let step = build_seq_step(
+                    &mut self.running[i],
+                    &mut self.mgr,
+                    &mut self.kv,
+                    1 + proposal.len(),
+                    true,
+                    &self.stream,
+                )?;
+                if let Some(step) = step {
+                    decode_plans.push(DecodePlan {
+                        seq: i,
+                        sample: true,
+                        step,
+                        draft: Some(proposal),
+                    });
+                    continue;
+                }
+            }
             if let Some(step) = self.plan_step(i, 1, sample, &mut decode_plans)? {
                 decode_plans.push(DecodePlan {
                     seq: i,
                     sample,
                     step,
+                    draft: None,
                 });
             }
         }
@@ -1664,10 +1969,12 @@ impl<M: StepModel> Engine<M> {
             .iter()
             .position(|seq| !seq.finished && !seq.preempted && !seq.decoding())
         {
+            // Speculative segments contribute their gamma+1 positions to
+            // the step budget (SPEC §6.5).
             let budget = self
                 .config
                 .max_batch_tokens
-                .saturating_sub(decode_plans.len());
+                .saturating_sub(decode_plans.iter().map(|plan| plan.step.len as usize).sum());
             let seq = &self.running[i];
             // Phase-3/mlx-lm chunk rule: prefill covers prompt[..n-1]; the
             // last prompt token is fed by the first sampled (decode) step.
@@ -1705,6 +2012,16 @@ impl<M: StepModel> Engine<M> {
                 ));
             }
         }
+
+        // --- Split off verify segments (SPEC §6.5): each runs as its own
+        // forward — a speculating request is greedy, and its gamma+1 rows
+        // (clamped under `deterministic_decode_width` at proposal time)
+        // must stay in the M=1 kernel classes on their own, not share a
+        // trunk with other rows. The split happens after prefill planning
+        // so a preemption there dropped victims from the one plans vec.
+        let (verify_plans, decode_plans): (Vec<DecodePlan>, Vec<DecodePlan>) = decode_plans
+            .into_iter()
+            .partition(|plan| plan.draft.is_some());
 
         // --- Partition (ADR 0002 B'): deterministic rows (greedy or
         // client-seeded) decode in sub-batches of at most
@@ -1757,11 +2074,52 @@ impl<M: StepModel> Engine<M> {
             let logits = logits.ok_or_else(|| MlxError {
                 message: "model returned no logits for a decode step".to_owned(),
             })?;
+            // Speculation waits for the logits width (proposal-id bounds).
+            self.logits_vocab.get_or_insert(logits.dim(2));
             for (row, &i) in sampled_ids.iter().enumerate() {
                 let token =
                     sample_from_row(&mut self.running[i], &logits, row as i32, &self.stream)?;
                 sampled.push((i, token));
             }
+        }
+
+        // --- Verify forwards (SPEC §6.5): one target forward per
+        // speculating sequence scores the fed token AND every proposed
+        // token (gamma+1 rows, all sampled). Rows are sampled lazily like
+        // everything else; acceptance is decided host-side after the step
+        // eval. The segment's K/V writes cover the proposed positions too
+        // — rejected rows are rolled back after settling.
+        let mut verifies: Vec<(usize, Vec<u32>, Vec<Array>)> = Vec::new();
+        for plan in verify_plans {
+            let i = plan.seq;
+            let draft = plan.draft.unwrap_or_default();
+            let mut tokens: Vec<u32> = Vec::with_capacity(1 + draft.len());
+            {
+                let seq = &self.running[i];
+                tokens.push(seq.history[seq.fed]);
+            }
+            tokens.extend_from_slice(&draft);
+            let batch = StepBatch {
+                input: StepInput::Ids(tokens),
+                seqs: vec![plan.step],
+                pad_rows: 0,
+            };
+            let logits = self
+                .model
+                .forward_step(&batch, &mut self.kv, &self.stream)?
+                .ok_or_else(|| MlxError {
+                    message: "model returned no logits for a verify step".to_owned(),
+                })?;
+            let mut rows: Vec<Array> = Vec::with_capacity(1 + draft.len());
+            for row in 0..=draft.len() {
+                rows.push(sample_from_row(
+                    &mut self.running[i],
+                    &logits,
+                    row as i32,
+                    &self.stream,
+                )?);
+            }
+            verifies.push((i, draft, rows));
         }
 
         // --- Pipeline entry (module docs): a steady-state pure-decode
@@ -1771,6 +2129,7 @@ impl<M: StepModel> Engine<M> {
         // Every row samples, so each sequence's KV write is an ancestor
         // of its token — no pool-state eval needed.
         if prefill.is_none()
+            && verifies.is_empty()
             && replay_ids.is_empty()
             && sampled.len() == self.running.len()
             && self.pipeline_ok()
@@ -1789,11 +2148,14 @@ impl<M: StepModel> Engine<M> {
             return Ok(());
         }
 
-        // --- Evaluate the step: sampled tokens + pool state together
-        // (prefill/replay-only steps still materialize their KV writes
-        // here).
+        // --- Evaluate the step: sampled tokens (plain and verify rows) +
+        // pool state together (prefill/replay-only steps still materialize
+        // their KV writes here).
         {
             let mut outputs: Vec<&Array> = sampled.iter().map(|(_, token)| token).collect();
+            for (_, _, rows) in &verifies {
+                outputs.extend(rows.iter());
+            }
             let state = self.kv.state();
             outputs.extend(state);
             eval(&outputs)?;
@@ -1813,6 +2175,62 @@ impl<M: StepModel> Engine<M> {
         // before the preemption.
         for &i in &replay_ids {
             self.running[i].fed += 1;
+        }
+
+        // --- Settle verify rounds (SPEC §6.5): commit the longest
+        // agreeing prefix plus the target's own token (bonus on full
+        // agreement, correction on the first mismatch), then roll back the
+        // rejected positions by releasing their blocks — bookkeeping only,
+        // timed into the spec counters so tests can hold the O(1) claim to
+        // measurement. Row j's logits are valid only when rows 0..j all
+        // agreed (its input was draft[j-1]), which is exactly where the
+        // walk stops.
+        for (i, draft, rows) in verifies {
+            self.spec.rounds_total += 1;
+            self.spec.proposed_total += draft.len() as u64;
+            self.running[i].spec_proposed += draft.len() as u32;
+            let mut accepted = 0usize;
+            let mut committed = 0usize;
+            for (j, row) in rows.iter().enumerate() {
+                if self.running[i].finished {
+                    break;
+                }
+                let token = row.item_u32()?;
+                // Acceptance is a token-value fact, so count it BEFORE
+                // settling: settle_sampled may finish the request
+                // (stop/length) and emit its summary, which must already
+                // carry this round's acceptances.
+                let agrees = j < draft.len() && token == draft[j];
+                if agrees {
+                    accepted += 1;
+                    self.running[i].spec_accepted += 1;
+                }
+                settle_sampled(
+                    &mut self.running[i],
+                    &mut self.mgr,
+                    self.cache.as_mut(),
+                    token,
+                );
+                committed += 1;
+                if !agrees {
+                    break;
+                }
+            }
+            self.spec.accepted_total += accepted as u64;
+            let stale = (1 + draft.len()).saturating_sub(committed);
+            if stale > 0 {
+                self.spec.rollback_rounds_total += 1;
+                self.spec.rollback_tokens_total += stale as u64;
+                let seq = &mut self.running[i];
+                if !seq.finished {
+                    // A finished sequence's table was already disposed by
+                    // `finish` (donation stops at the settled rows, extra
+                    // blocks are released there).
+                    let rollback_started = Instant::now();
+                    seq.table.truncate(&mut self.mgr, seq.processed + seq.fed)?;
+                    self.spec.rollback_nanos_total += rollback_started.elapsed().as_nanos() as u64;
+                }
+            }
         }
 
         // --- Advance prefill progress; a fully prefilled sequence starts
@@ -1843,6 +2261,7 @@ impl<M: StepModel> Engine<M> {
                 i += 1;
             }
         }
+        self.release_finished_drafts();
         self.running.retain(|seq| !seq.finished);
 
         // --- SPEC §6.2 step 5: cache maintenance (Phase-3 cadence: after
@@ -1967,6 +2386,7 @@ impl<M: StepModel> Engine<M> {
                 Some((ErrorCause::Internal, format!("engine step failed: {error}"))),
             );
         }
+        self.release_finished_drafts();
         self.running.clear();
         self.waiting.clear();
         // The prefix cache dies with the pools: its nodes name blocks of
@@ -2221,7 +2641,10 @@ fn build_seq_step(
     Ok(Some(SeqStep {
         len: len as i32,
         offset: offset as i32,
-        sample,
+        // Sampling segments return logits for every fed position: exactly
+        // 1 for plain decode (len 1), the whole segment for a speculative
+        // verify (SPEC §6.5). Replay and prefill sample nothing.
+        sample_rows: if sample { len as i32 } else { 0 },
         blocks: seq.table.blocks().to_vec(),
         writes,
         paged_attn,

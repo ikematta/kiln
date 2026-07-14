@@ -67,7 +67,7 @@ mod imp {
             _kv: &mut PagedKv,
             _s: &Stream,
         ) -> Result<Option<Array>, MlxError> {
-            let sampled = batch.seqs.iter().filter(|seq| seq.sample).count();
+            let sampled = batch.seqs.iter().filter(|seq| seq.sample_rows > 0).count();
             if sampled == 0 {
                 return Ok(None);
             }

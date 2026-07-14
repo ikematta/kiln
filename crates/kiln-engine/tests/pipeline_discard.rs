@@ -84,7 +84,7 @@ impl StepModel for MockModel {
                 s,
             )?;
             consumed += seq.len;
-            if !seq.sample {
+            if seq.sample_rows == 0 {
                 continue;
             }
             let total = seq.offset + seq.len;

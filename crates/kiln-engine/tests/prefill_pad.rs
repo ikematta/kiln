@@ -66,7 +66,7 @@ impl StepModel for RecordingMock {
             seqs: batch
                 .seqs
                 .iter()
-                .map(|seq| (seq.len, seq.offset, seq.sample))
+                .map(|seq| (seq.len, seq.offset, seq.sample_rows > 0))
                 .collect(),
             input_tokens: batch.num_tokens(),
             write_rows: batch
@@ -117,7 +117,7 @@ impl StepModel for RecordingMock {
                 s,
             )?;
             consumed += seq.len;
-            if !seq.sample {
+            if seq.sample_rows == 0 {
                 continue;
             }
             let total = seq.offset + seq.len;

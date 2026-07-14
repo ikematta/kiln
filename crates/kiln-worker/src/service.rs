@@ -380,12 +380,11 @@ impl Worker for WorkerService {
             ssd_reads_total: load(&shared.ssd_reads_total),
             ssd_writes_total: load(&shared.ssd_writes_total),
             ssd_fingerprint_rejects_total: load(&shared.ssd_fingerprint_rejects_total),
-            // Speculative decoding is Phase 8; the step-overhead
-            // percentiles need an in-engine reservoir (criterion covers
-            // the gate today) — all zero until they exist.
-            spec_tokens_proposed_total: 0,
-            spec_tokens_accepted_total: 0,
+            spec_tokens_proposed_total: load(&shared.spec_tokens_proposed_total),
+            spec_tokens_accepted_total: load(&shared.spec_tokens_accepted_total),
             engine_steps_total: load(&shared.engine_steps_total),
+            // The step-overhead percentiles need an in-engine reservoir
+            // (criterion covers the gate today) — zero until they exist.
             engine_step_overhead_us_p50: 0.0,
             engine_step_overhead_us_p99: 0.0,
         }))

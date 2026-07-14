@@ -361,6 +361,40 @@ impl BlockTable {
         self.blocks
     }
 
+    /// Shrinks the table to `keep_tokens`, releasing every block past the
+    /// new tail — the speculative-decoding rollback (SPEC §6.5): rejected
+    /// draft positions vanish by dropping ownership of their blocks, no
+    /// data moves. Cost is bookkeeping only, proportional to the (few)
+    /// blocks released and independent of the sequence length — the O(1)
+    /// composition win paging buys, measured by `tests/rollback_cost.rs`.
+    ///
+    /// Rows past `keep_tokens` inside the kept tail block go stale in
+    /// place; that is the established discarded-row invariant (see the
+    /// engine module docs): the sequence's own next append rewrites those
+    /// exact rows before anything can gather them (gathers trim to
+    /// `num_tokens`), and donation stops at the settled row count.
+    ///
+    /// `keep_tokens` must not exceed the current token count. Released
+    /// blocks must be exclusively owned appends (never cache-shared);
+    /// rollback only ever drops slots the same step appended, so this
+    /// holds by construction.
+    pub fn truncate(
+        &mut self,
+        mgr: &mut BlockManager,
+        keep_tokens: usize,
+    ) -> Result<(), BlockError> {
+        if keep_tokens > self.num_tokens {
+            return Err(BlockError::TokenCountOverflow);
+        }
+        let keep_blocks = keep_tokens.div_ceil(mgr.block_size());
+        for &id in &self.blocks[keep_blocks.min(self.blocks.len())..] {
+            mgr.release(id)?;
+        }
+        self.blocks.truncate(keep_blocks);
+        self.num_tokens = keep_tokens;
+        Ok(())
+    }
+
     /// Clones the table, adding an owner to every block (prefix sharing).
     /// On failure the retains taken so far are rolled back, leaving the
     /// manager unchanged.
@@ -561,6 +595,63 @@ mod tests {
         forked.release(&mut mgr).unwrap();
         aligned.release(&mut mgr).unwrap();
         aligned_fork.release(&mut mgr).unwrap();
+        assert_eq!(mgr.num_free(), 4);
+    }
+
+    #[test]
+    fn table_truncate_releases_only_past_the_kept_tail() {
+        let mut mgr = BlockManager::new(8, 4).unwrap();
+        let mut table = BlockTable::new();
+        table.append_tokens(&mut mgr, 14).unwrap(); // 4 blocks, last holds 2 rows
+        assert_eq!(mgr.num_free(), 4);
+
+        // Mid-block truncate: the block holding token 9 stays.
+        table.truncate(&mut mgr, 10).unwrap();
+        assert_eq!(table.num_tokens(), 10);
+        assert_eq!(table.blocks().len(), 3);
+        assert_eq!(mgr.num_free(), 5);
+
+        // Block-aligned truncate drops exactly the blocks past the edge.
+        table.truncate(&mut mgr, 8).unwrap();
+        assert_eq!(table.blocks().len(), 2);
+        assert_eq!(mgr.num_free(), 6);
+
+        // No-op truncate to the current size.
+        table.truncate(&mut mgr, 8).unwrap();
+        assert_eq!(table.blocks().len(), 2);
+        assert_eq!(mgr.num_free(), 6);
+
+        // Growing through truncate is rejected, state untouched.
+        assert_eq!(
+            table.truncate(&mut mgr, 9).err(),
+            Some(BlockError::TokenCountOverflow)
+        );
+        assert_eq!(table.num_tokens(), 8);
+
+        // To zero: everything returns to the free list.
+        table.truncate(&mut mgr, 0).unwrap();
+        assert_eq!(table.num_tokens(), 0);
+        assert!(table.blocks().is_empty());
+        assert_eq!(mgr.num_free(), 8);
+        table.release(&mut mgr).unwrap();
+    }
+
+    #[test]
+    fn table_truncate_then_append_reuses_the_partial_tail() {
+        let mut mgr = BlockManager::new(4, 4).unwrap();
+        let mut table = BlockTable::new();
+        // The verify-round shape: 3 committed rows + a 5-slot speculative
+        // append, then rollback to 5 (2 slots rejected).
+        table.append_tokens(&mut mgr, 3).unwrap();
+        table.append_tokens(&mut mgr, 5).unwrap();
+        assert_eq!(table.num_tokens(), 8);
+        table.truncate(&mut mgr, 5).unwrap();
+        assert_eq!(table.blocks().len(), 2);
+        // The next append lands in the kept tail's free rows first.
+        let plan = table.append_tokens(&mut mgr, 3).unwrap();
+        assert!(plan.appended.is_empty());
+        assert_eq!(table.num_tokens(), 8);
+        table.release(&mut mgr).unwrap();
         assert_eq!(mgr.num_free(), 4);
     }
 

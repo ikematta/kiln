@@ -88,6 +88,14 @@ impl Sampler {
         })
     }
 
+    /// Pure argmax (temperature 0) — no PRNG draw is ever consumed, so a
+    /// variable number of samples per engine step (the speculative verify
+    /// round, SPEC §6.5) cannot desync any key chain. Speculation
+    /// eligibility keys off this.
+    pub fn is_greedy(&self) -> bool {
+        self.options.temperature == 0.0
+    }
+
     /// Samples one token id (`[1]` u32) from logprobs `[1, vocab]`.
     pub fn sample(&mut self, logprobs: &Array, s: &Stream) -> Result<Array, MlxError> {
         let opts = self.options;

@@ -1,10 +1,15 @@
-//! Draft-model coexistence (SPEC §6.5, Phase 8 part 1): the pinned
-//! Qwen3-0.6B-4bit checkpoint loads as a draft alongside a larger pinned
-//! target (Llama-3.2-1B-4bit) in one process, sharing the Metal
-//! device/stream, with its own weights and its own KV pool inside the
-//! same memory accounting. Deliberately a cross-tokenizer pair — this
-//! session proves loading isolation, not drafting compatibility (the
-//! vocab/tokenizer compatibility check belongs to the verify loop).
+//! Draft-model coexistence (SPEC §6.5): the pinned Qwen3-0.6B-4bit
+//! checkpoint loads as a draft alongside a larger pinned target
+//! (Llama-3.2-1B-4bit) in one process, sharing the Metal device/stream,
+//! with its own weights and its own KV pool inside the same memory
+//! accounting. Deliberately a cross-tokenizer pair, on purpose on both
+//! sides of Phase 8: part 1 proved loading isolation; with the part-2
+//! verify loop live, attaching this drafter at the ENGINE level (below
+//! the worker's `check_draft_compat` gate, which rejects the pair — see
+//! kiln-worker/tests/draft.rs) doubles as an adversarial-drafter
+//! invariance case — its proposals are near-guaranteed garbage for the
+//! target, verification must reject them, and greedy output must not
+//! move by a bit.
 //!
 //! Same-device invariants asserted (device-independent tier — blocking
 //! on CI):
@@ -250,8 +255,8 @@ fn draft_model_coexists_with_target() {
             "target generation altered draft pool bytes"
         );
 
-        // --- Drafter lifecycle on the real DraftModel (Phase 8 part 1:
-        // state tracking + the placeholder empty proposal).
+        // --- Drafter lifecycle on the real DraftModel (Phase 8 part 2:
+        // propose really decodes on the draft's own pool now).
         let err = draft
             .propose(1, &[], DEFAULT_GAMMA, &stream)
             .expect_err("propose before begin");
@@ -260,11 +265,35 @@ fn draft_model_coexists_with_target() {
         let proposal = draft
             .propose(1, &[], DEFAULT_GAMMA, &stream)
             .expect("propose");
-        assert!(
-            proposal.is_empty(),
-            "part 1 drafter must propose nothing (no decode loop yet)"
+        assert_eq!(
+            proposal.len(),
+            DEFAULT_GAMMA,
+            "a healthy drafter proposes the full gamma"
         );
+        let draft_vocab = 151_936; // qwen3 config.json vocab_size
+        assert!(
+            proposal.iter().all(|&t| t < draft_vocab),
+            "proposed ids must come from the draft's logits width: {proposal:?}"
+        );
+        assert!(
+            Drafter::memory(&draft).kv_used_bytes > 0,
+            "a proposing sequence must hold draft pool blocks"
+        );
+        // Reconcile feed-through: accept the first proposed token plus a
+        // deliberately different bonus, then propose again — the drafter
+        // truncates its speculated tail (O(1) block release) and continues
+        // from the corrected context.
+        let bonus = if proposal[1] == 0 { 1 } else { 0 };
+        let proposal2 = draft
+            .propose(1, &[proposal[0], bonus], DEFAULT_GAMMA, &stream)
+            .expect("propose after partial accept");
+        assert_eq!(proposal2.len(), DEFAULT_GAMMA);
         draft.release(1);
+        assert_eq!(
+            Drafter::memory(&draft).kv_used_bytes,
+            0,
+            "release must return the sequence's draft blocks"
+        );
         let err = draft
             .propose(1, &[], DEFAULT_GAMMA, &stream)
             .expect_err("propose after release");

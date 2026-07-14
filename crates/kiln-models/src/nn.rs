@@ -1222,6 +1222,18 @@ impl CausalLm {
                 message: format!("step batch of {n} token(s) for {total} sequence position(s)"),
             });
         }
+        if let Some(seq) = batch
+            .seqs
+            .iter()
+            .find(|seq| seq.sample_rows < 0 || seq.sample_rows > seq.len)
+        {
+            return Err(MlxError {
+                message: format!(
+                    "segment samples {} of its {} position(s)",
+                    seq.sample_rows, seq.len
+                ),
+            });
+        }
         let pad = batch.pad_rows;
         if pad < 0 || (pad > 0 && batch.seqs.len() != 1) {
             return Err(MlxError {
@@ -1257,16 +1269,15 @@ impl CausalLm {
             h = block.forward_step(&h, &batch.seqs, kv, layer, pad, s)?;
         }
 
-        // Sampled positions: the last position of each sampling sequence
-        // (always among the real rows — pads sit behind them and are never
-        // selectable).
+        // Sampled positions: the trailing `sample_rows` positions of each
+        // sampling sequence — 1 for plain decode, the whole segment for a
+        // speculative verify (SPEC §6.5). Always among the real rows: pads
+        // sit behind them and are never selectable.
         let mut sampled: Vec<u32> = Vec::new();
         let mut pos: u32 = 0;
         for seq in &batch.seqs {
             pos += seq.len as u32;
-            if seq.sample {
-                sampled.push(pos - 1);
-            }
+            sampled.extend(pos - seq.sample_rows as u32..pos);
         }
         if sampled.is_empty() {
             return Ok(None);
