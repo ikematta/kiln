@@ -123,9 +123,9 @@ jobs:
           cargo test -p kiln-tokenize --test tokenizer --test detok --test toolcall_fixtures
           cargo test -p kiln-engine --test grammar
           cargo test -p kiln-models --test batching --test calibration \
-            --test leak --test leak_batched --test preemption \
+            --test draft --test leak --test leak_batched --test preemption \
             --test prefill_pad --test prefix_cache --test prefix_multiturn
-          cargo test -p kiln-worker --test rpc --test grammar
+          cargo test -p kiln-worker --test rpc --test grammar --test draft
       # PERMANENTLY advisory (ADR 0004): golden bit-exactness is a
       # same-device bar bound to the fixture-generating device class;
       # token-id equality on this runner's paravirtual GPU is explicitly

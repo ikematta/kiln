@@ -4449,3 +4449,131 @@
   phase-gate review (PM: bench.sh + e2e on their hardware), then Phase 8 —
   speculative decoding. Parked: the default-flip follow-up above, gated
   on accumulated green CI bit-probe runs.
+
+## [2026-07-13] Phase 8 / Part 1 — Drafter abstraction + draft-model loading — DONE
+- What:
+  - `kiln-engine/src/drafter.rs` (new): the SPEC §6.5 `Drafter` trait —
+    `memory` / `begin` / `propose` / `release`, sequences keyed by the
+    engine's arrival numbers — plus `DraftError`, `DrafterMemory`, and
+    the §6.5 defaults (`DEFAULT_GAMMA = 4`, `DEFAULT_SPEC_MAX_BATCH = 4`).
+    `Engine` owns an `Option<Box<dyn Drafter>>` (`set_drafter`,
+    `drafter_memory`) because spec decode is scheduler-native; the step
+    loop does NOT consult it yet — this session is shape + loading only.
+  - `kiln-models/src/draft.rs` (new): `DraftModel` — a second `AnyModel`
+    with its OWN `BlockManager` + `PagedKv` (pools lazy, 0 bytes until
+    first write, exactly like the target's) and weights accounted by the
+    `StaticInfo.weights_bytes` `.safetensors` convention. Implements
+    `Drafter`: real memory numbers, real seq-lifecycle tracking, and a
+    placeholder `propose` returning the EMPTY proposal ("no speculation
+    this round" — a legal answer under the trait contract) until the
+    part-2 decode loop lands.
+  - `kiln-worker`: additive argv `--draft-model <dir>`; the draft loads
+    on the engine thread after target calibration, sharing the device/
+    stream; a configured draft that fails to load marks the worker
+    UNHEALTHY (silently serving without requested speculation would hide
+    a misconfiguration). `MemoryReport.weights_bytes`/`kv_pool_*` are
+    now explicitly worker TOTALS (target + draft summed in
+    `memory_report`; per-model gauges kept separate in `Shared`).
+    `CAPABILITY_SPECULATIVE` is deliberately NOT advertised yet.
+  - Tests: `kiln-engine/tests/drafter.rs` (scripted stub exercises the
+    trait-object contract incl. committed-feed-through and re-begin
+    reset); `kiln-models/tests/draft.rs` (coexistence, see Acceptance);
+    `kiln-worker/tests/rpc.rs::draft_model_loads_alongside_target`
+    (proto-level totals + identical greedy stream vs a draft-less
+    worker + SPECULATIVE not advertised). CI blocking model-gated step
+    gains `--test draft` (same-device invariants → device-independent
+    tier per the Option B split).
+- Decisions:
+  - Draft pool geometry defaults mirror the target pool (same
+    block_size × num_blocks ⇒ same token capacity): a target-admitted
+    sequence never needs a draft-side capacity decision; auto-disable
+    heuristics remain a later Phase 8 part.
+  - `propose(committed)` feed-through makes rollback implicit: the
+    drafter reconciles (truncates its speculated KV) from the committed
+    tokens before proposing again — O(1) via block release, same as the
+    target side. `begin` on a known seq doubles as the
+    preemption-resume reset.
+  - Proto untouched (frozen): draft bytes fold into the existing
+    `MemoryReport` totals — the fields keep their "whole worker" §2.3
+    semantics, which is what gateway budget math wants. `kv_blocks_*`
+    gauges stay target-pool-only (mixing pools with different
+    bytes-per-block would corrupt the gauge's meaning).
+  - NO tokenizer/vocab compatibility check at load, deliberately: this
+    session's mandated pair (qwen3-0.6b draft under the larger pinned
+    llama-3.2-1b target) is cross-family by construction of the pinned
+    model set — part 1 proves loading isolation. The compat check
+    belongs to the verify-loop session, where drafting actually starts.
+  - No deterministic-width calibration for the draft: proposals are
+    target-verified, so draft numerics never bind greedy correctness.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-engine --test drafter        # trait stub, boxed
+  test drafter_contract_via_trait_object ... ok
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --test draft -- --nocapture
+  coexistence: target weights 695283921B + draft weights 335450584B
+    + target kv 536870912B + draft kv 234881024B = 1802486441B;
+    budget 13743895347B; mlx active 1265752240B
+  test draft_model_coexists_with_target ... ok
+    (target greedy BIT-IDENTICAL alone / beside resident draft pool /
+     with drafter attached; draft-pool sentinel bytes survive target
+     generation; pool accounting geometry-exact; live-object leak gate
+     back to baseline)
+  $ KILN_TEST_MODELS=... cargo test -p kiln-worker --test rpc draft_model_loads_alongside_target
+  draft coexistence over RPC ok: weights 695283921 -> 1030734505 bytes,
+    24 identical tokens                  (= target + draft file bytes, exact)
+  test draft_model_loads_alongside_target ... ok
+  $ KILN_TEST_MODELS=... cargo test --workspace     -> exit 0, all suites ok
+    (45 test-result lines incl. golden both paths 601.75s, rpc 3/3;
+     3 ignored = the perf gates, as before)
+  $ cargo build --workspace --no-default-features   -> clean (linux shape)
+  $ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings      -> clean
+  $ ruff check / format --check python/ tests/e2e   -> clean (23 files)
+  $ pytest python/kiln_worker_py/tests              -> 35 passed
+  $ uv run --project tests/e2e pytest tests/e2e     -> 77 passed, 2 skipped
+    (identical to the pre-change baseline)
+  ```
+- Next: PR opened from `claude/p8-drafter-loading`; CI verification (all
+  four checks on the real runners) recorded per the established protocol
+  once the run completes. Then Phase 8 part 2 — the batched draft/verify
+  decode loop per §6.5: draft decode inside `DraftModel::propose`,
+  verify forward in the batch step, O(1) rollback via block release, and
+  the greedy-invariance test (speculation on vs off) — followed by
+  acceptance-rate metrics, auto-disable, and gateway config wiring
+  (`[model.speculative]` → `--draft-model` argv; `SpeculativeConfig`
+  parsing already exists). Only then advertise CAPABILITY_SPECULATIVE.
+
+## [2026-07-13] Phase 8 / Part 1 — PR #19 CI fix: draft RPC test placement — DONE
+- What: PR #19 run 29294575202 failed ONE lane (test-macos, 16m39s);
+  lint, compile-linux, and test-macos-release passed, and every NEW
+  suite passed on the runner — including
+  `draft_model_loads_alongside_target` and the kiln-models coexistence
+  suite. The failure was the PRE-EXISTING
+  `rpc.rs::cancel_and_drain_rpc_semantics`: my draft test initially
+  lived in rpc.rs, and cases inside one test binary run CONCURRENTLY.
+  The drain test measured 2055.3 ms/token while this test's two workers
+  held the GPU, sized its escalation deadline (657s) from that, then
+  contention vanished and the long request decoded at 29 tok/s — a ~60x
+  rate swing, past the 37x design margin that test documents (its
+  hardening was calibrated for the two historical siblings). The long
+  request finished (Length, 12000 tokens, 413s) before escalation.
+- Fix: restored `tests/rpc.rs` byte-for-byte to its pre-change state
+  and moved the draft coexistence test to its own binary,
+  `kiln-worker/tests/draft.rs` (self-contained harness — the
+  established grammar.rs pattern; test BINARIES run sequentially under
+  cargo test, so the drain test's contention profile is exactly its
+  calibrated one again). CI worker line gains `--test draft`. No
+  assertion anywhere was weakened; the drain test is untouched.
+- Acceptance (dev machine):
+  ```
+  $ KILN_TEST_MODELS=... cargo test -p kiln-worker --test draft -- --nocapture
+  draft coexistence over RPC ok: weights 695283921 -> 1030734505 bytes,
+    24 identical tokens
+  test draft_model_loads_alongside_target ... ok
+  $ KILN_TEST_MODELS=... cargo test -p kiln-worker --test rpc
+  test result: ok. 2 passed  (restored suite, original calibration)
+  $ cargo fmt --all --check; clippy --all-targets (both shapes) -D warnings -> clean
+  ```
+- Next: PR #19 CI re-run on the new head; record verification once the
+  four checks complete, then Phase 8 part 2 (draft/verify decode loop).

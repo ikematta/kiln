@@ -64,6 +64,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::block::{BlockError, BlockId, BlockManager, BlockTable};
+use crate::drafter::{Drafter, DrafterMemory};
 use crate::grammar::Grammar;
 use crate::paged::{KvSpec, PagedKv, WriteRun};
 use crate::paged_attn::PagedAttnInputs;
@@ -796,6 +797,12 @@ pub struct Engine<M> {
     inflight: Option<InFlight>,
     /// Radix prefix cache + SSD tier (SPEC §6.3/§6.4), when enabled.
     cache: Option<CacheState>,
+    /// Speculative-decoding proposer (SPEC §6.5), when configured. Owned
+    /// here because spec decode is scheduler-native — the draft/verify
+    /// loop (Phase 8 part 2) runs inside the batch step. Until that
+    /// lands, only its memory report is read: the drafter's weights and
+    /// KV pool are part of this worker's budget envelope (SPEC §2.3).
+    drafter: Option<Box<dyn Drafter>>,
     /// Why the SSD tier is off despite being configured, if it failed to
     /// open (silent-skip policy; the worker logs it once).
     ssd_error: Option<String>,
@@ -891,6 +898,7 @@ impl<M: StepModel> Engine<M> {
             running: Vec::new(),
             inflight: None,
             cache,
+            drafter: None,
             ssd_error,
             next_arrival: 0,
             preemptions_total: 0,
@@ -901,6 +909,20 @@ impl<M: StepModel> Engine<M> {
 
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// Attaches the speculative-decoding proposer (SPEC §6.5). Loading and
+    /// ownership only in Phase 8 part 1 — the step loop does not consult
+    /// it yet; its memory report flows into the worker heartbeat via
+    /// [`Self::drafter_memory`].
+    pub fn set_drafter(&mut self, drafter: Box<dyn Drafter>) {
+        self.drafter = Some(drafter);
+    }
+
+    /// The attached drafter's memory footprint (SPEC §2.3 accounting),
+    /// `None` when speculation is not configured.
+    pub fn drafter_memory(&self) -> Option<DrafterMemory> {
+        self.drafter.as_ref().map(|drafter| drafter.memory())
     }
 
     /// Requests currently admitted or queued.

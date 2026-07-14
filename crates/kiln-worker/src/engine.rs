@@ -48,6 +48,13 @@ pub struct EngineOptions {
     /// Custom block-table-aware attention kernel for decode steps (SPEC
     /// §7.4 Phase 7). Default OFF: the gather path is the reference.
     pub paged_attention_kernel: bool,
+    /// Draft model directory for speculative decoding (SPEC §6.5, Phase
+    /// 8): loaded alongside the target in this process, with its own
+    /// weights and KV pool inside the same memory accounting. A
+    /// configured draft that fails to load marks the worker UNHEALTHY —
+    /// silently serving without the requested speculation would hide a
+    /// misconfiguration.
+    pub draft_model: Option<PathBuf>,
 }
 
 impl Default for EngineOptions {
@@ -57,6 +64,7 @@ impl Default for EngineOptions {
             ssd_dir: None,
             ssd_max_bytes: DEFAULT_SSD_MAX_BYTES,
             paged_attention_kernel: false,
+            draft_model: None,
         }
     }
 }
@@ -117,6 +125,15 @@ pub struct Shared {
     pub kv_pool_used_bytes: AtomicU64,
     pub kv_blocks_allocated: AtomicU64,
     pub kv_blocks_free: AtomicU64,
+    /// Draft-model footprint (SPEC §6.5/§2.3), 0 when no draft is
+    /// configured. Kept separate from the target gauges and summed only
+    /// in `memory_report`, so the proto fields stay worker totals. The
+    /// `kv_blocks_*` gauges above remain target-pool-only: draft blocks
+    /// never serve requests directly, and mixing pools with different
+    /// bytes-per-block would corrupt the gauge's meaning.
+    pub draft_weights_bytes: AtomicU64,
+    pub draft_kv_allocated_bytes: AtomicU64,
+    pub draft_kv_used_bytes: AtomicU64,
     pub engine_steps_total: AtomicU64,
     pub prefix_tokens_reused_total: AtomicU64,
     pub ssd_blocks_stored: AtomicU64,
@@ -170,6 +187,9 @@ impl Shared {
             kv_pool_used_bytes: AtomicU64::new(0),
             kv_blocks_allocated: AtomicU64::new(0),
             kv_blocks_free: AtomicU64::new(0),
+            draft_weights_bytes: AtomicU64::new(0),
+            draft_kv_allocated_bytes: AtomicU64::new(0),
+            draft_kv_used_bytes: AtomicU64::new(0),
             engine_steps_total: AtomicU64::new(0),
             prefix_tokens_reused_total: AtomicU64::new(0),
             ssd_blocks_stored: AtomicU64::new(0),
@@ -244,10 +264,17 @@ impl Shared {
     pub fn memory_report(&self) -> MemoryReport {
         // The mlx memory getters are allocator stat reads — safe off the
         // engine thread (no Array/Stream involved).
+        //
+        // Weights and KV fields are worker TOTALS (SPEC §2.3: the
+        // gateway budgets whole workers): a loaded draft model's weights
+        // and pool bytes are summed in, never reported out-of-band.
         MemoryReport {
-            weights_bytes: self.info.weights_bytes,
-            kv_pool_allocated_bytes: self.kv_pool_allocated_bytes.load(Ordering::Acquire),
-            kv_pool_used_bytes: self.kv_pool_used_bytes.load(Ordering::Acquire),
+            weights_bytes: self.info.weights_bytes
+                + self.draft_weights_bytes.load(Ordering::Acquire),
+            kv_pool_allocated_bytes: self.kv_pool_allocated_bytes.load(Ordering::Acquire)
+                + self.draft_kv_allocated_bytes.load(Ordering::Acquire),
+            kv_pool_used_bytes: self.kv_pool_used_bytes.load(Ordering::Acquire)
+                + self.draft_kv_used_bytes.load(Ordering::Acquire),
             mlx_active_bytes: kiln_mlx::memory::active_memory().unwrap_or(0) as u64,
             mlx_cache_bytes: kiln_mlx::memory::cache_memory().unwrap_or(0) as u64,
             mlx_peak_bytes: kiln_mlx::memory::peak_memory().unwrap_or(0) as u64,
@@ -376,6 +403,34 @@ pub fn engine_main(
         // schedule. See AnyModel::monolithic_prefill_required.
         config.prefill_fine_chunk = config.prefill_chunk;
     }
+    // SPEC §6.5 draft model: loaded on this same thread, sharing the
+    // device/stream, with its own weights and its own KV pool sized to
+    // the target pool's token capacity (see DraftPoolSpec). No
+    // deterministic-width calibration: proposals are verified by the
+    // target, so draft numerics never bind greedy correctness. Load
+    // failure is UNHEALTHY, exactly like the target — a configured
+    // drafter is part of the worker's contract.
+    let drafter = match &opts.draft_model {
+        Some(dir) => {
+            let pool = kiln_models::DraftPoolSpec {
+                block_size: config.block_size,
+                num_blocks: config.num_blocks,
+            };
+            match kiln_models::DraftModel::load(dir, pool, &stream) {
+                Ok(draft) => Some(draft),
+                Err(err) => {
+                    tracing::error!(error = %err, path = %dir.display(),
+                        "draft model load failed");
+                    shared.set_state(
+                        WorkerState::Unhealthy,
+                        format!("draft model load failed: {err}"),
+                    );
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
     let mut engine = match Engine::new(model, dims, config, stream) {
         Ok(engine) => engine,
         Err(err) => {
@@ -388,6 +443,22 @@ pub fn engine_main(
         // SPEC §6.4: the tier degrades silently for requests; say it once.
         tracing::warn!(model = %shared.model_id, reason, "ssd tier disabled");
         shared.clear_ssd_capability();
+    }
+    if let Some(draft) = drafter {
+        // CAPABILITY_SPECULATIVE is deliberately NOT advertised yet:
+        // draft/verify decoding is not available until the Phase 8 part 2
+        // loop lands — loading alone must not signal the capability.
+        let memory = kiln_engine::Drafter::memory(&draft);
+        shared
+            .draft_weights_bytes
+            .store(memory.weights_bytes, Ordering::Release);
+        tracing::info!(
+            model = %shared.model_id,
+            draft = %draft.model().model_type(),
+            draft_weights_bytes = memory.weights_bytes,
+            "draft model loaded"
+        );
+        engine.set_drafter(Box::new(draft));
     }
     tracing::info!(
         model = %shared.model_id,
@@ -463,6 +534,17 @@ fn publish_stats(engine: &Engine<kiln_models::AnyModel>, shared: &Shared) {
         .kv_blocks_allocated
         .store(blocks_used, Ordering::Release);
     shared.kv_blocks_free.store(blocks_free, Ordering::Release);
+    if let Some(draft) = engine.drafter_memory() {
+        shared
+            .draft_weights_bytes
+            .store(draft.weights_bytes, Ordering::Release);
+        shared
+            .draft_kv_allocated_bytes
+            .store(draft.kv_allocated_bytes, Ordering::Release);
+        shared
+            .draft_kv_used_bytes
+            .store(draft.kv_used_bytes, Ordering::Release);
+    }
     shared
         .engine_steps_total
         .store(engine.steps(), Ordering::Release);
