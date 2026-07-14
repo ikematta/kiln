@@ -9,11 +9,17 @@
 //!   incompatibility in its detail, and never serves;
 //! - a COMPATIBLE pair (qwen3-0.6b-8bit target, qwen3-0.6b-4bit draft —
 //!   byte-identical tokenizers) must reach READY, report worker-total
-//!   weights (SPEC §2.3), keep CAPABILITY_SPECULATIVE un-advertised (that
-//!   flag waits for the config-wiring/auto-disable part), stream greedy
-//!   output IDENTICAL to a draft-less worker on the same device (the
-//!   §6.5 correctness invariant, over RPC, with the verify loop live),
-//!   and record acceptance metrics in `Timings` and `Stats`.
+//!   weights (SPEC §2.3), advertise CAPABILITY_SPECULATIVE (gated on the
+//!   correctness attach gates only — compat + the ADR 0005 envelope —
+//!   never on a throughput expectation, per ADR 0006; a draft-less worker
+//!   must NOT advertise it), stream greedy output IDENTICAL to a
+//!   draft-less worker on the same device (the §6.5 correctness
+//!   invariant, over RPC, with the verify loop live), and record
+//!   acceptance metrics in `Timings` and `Stats`.
+//!
+//! Plus the `--draft-gamma` argv contract (the gateway's
+//! `[model.speculative]` wiring emits it): 0 and gamma-without-draft are
+//! rejected at parse, before any MLX work.
 //!
 //! Its own test binary, NOT a case in rpc.rs: test binaries run
 //! sequentially under `cargo test`, while cases inside one binary run
@@ -196,8 +202,56 @@ async fn read_token_ids(stream: &mut tonic::Streaming<TokenEvent>) -> (Finished,
     }
 }
 
+/// Spawns the worker binary with `args` and asserts it exits with a
+/// failure whose stderr names `expect`. Argv parsing happens before any
+/// MLX init, so this needs neither a GPU nor models.
+fn assert_rejected_argv(args: &[&str], expect: &str) {
+    let output = Command::new(env!("CARGO_BIN_EXE_kiln-worker"))
+        .args(args)
+        .output()
+        .expect("kiln-worker spawns");
+    assert!(
+        !output.status.success(),
+        "argv {args:?} must be rejected, got exit {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(expect),
+        "rejection of {args:?} must name its cause ({expect:?}), got: {stderr}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn draft_verify_over_rpc_with_compat_gate() {
+    // --- argv contract first (no GPU, no models): the gateway's
+    // [model.speculative] wiring appends `--draft-gamma`; a zero gamma
+    // (speculation requested but never proposing) and a gamma without a
+    // draft are both misconfigurations, rejected at parse.
+    assert_rejected_argv(
+        &[
+            "--model",
+            "/nonexistent",
+            "--socket",
+            "/tmp/x.sock",
+            "--draft-gamma",
+            "0",
+        ],
+        "--draft-gamma needs an integer >= 1",
+    );
+    assert_rejected_argv(
+        &[
+            "--model",
+            "/nonexistent",
+            "--socket",
+            "/tmp/x.sock",
+            "--draft-gamma",
+            "4",
+        ],
+        "--draft-gamma requires --draft-model",
+    );
+    eprintln!("draft-gamma argv rejections ok");
+
     if !kiln_mlx::memory::metal_is_available() {
         eprintln!("skipping: no Metal device");
         return;
@@ -261,6 +315,18 @@ async fn draft_verify_over_rpc_with_compat_gate() {
     let (base_weights, base_tokens) = {
         let worker = Worker::spawn(&target, "nodraft", &[]);
         let mut client = worker.client_when_ready().await;
+        let info = client
+            .get_info(InfoRequest {})
+            .await
+            .expect("info ok")
+            .into_inner();
+        assert!(
+            !info
+                .capabilities
+                .contains(&(Capability::Speculative as i32)),
+            "a worker without a draft must not advertise SPECULATIVE: {:?}",
+            info.capabilities
+        );
         let health = client
             .health(HealthRequest {})
             .await
@@ -284,9 +350,14 @@ async fn draft_verify_over_rpc_with_compat_gate() {
         (memory.weights_bytes, tokens)
     };
 
-    // --- Same target with the compatible draft attached: the verify loop
+    // --- Same target with the compatible draft attached (through the
+    // full gateway argv shape, --draft-gamma included): the verify loop
     // is live, and greedy output must not move by a token.
-    let worker = Worker::spawn(&target, "draft", &["--draft-model", &draft_arg]);
+    let worker = Worker::spawn(
+        &target,
+        "draft",
+        &["--draft-model", &draft_arg, "--draft-gamma", "4"],
+    );
     let mut client = worker.client_when_ready().await;
 
     let info = client
@@ -295,10 +366,10 @@ async fn draft_verify_over_rpc_with_compat_gate() {
         .expect("info ok")
         .into_inner();
     assert!(
-        !info
-            .capabilities
+        info.capabilities
             .contains(&(Capability::Speculative as i32)),
-        "SPECULATIVE stays un-advertised until the config-wiring part: {:?}",
+        "a compatible attached draft must advertise SPECULATIVE \
+         (correctness-gated only, ADR 0006): {:?}",
         info.capabilities
     );
 

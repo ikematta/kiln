@@ -160,8 +160,10 @@ def build_binaries() -> pathlib.Path:
 def running_stack(models: list[tuple]):
     """Launches a gateway serving `models` — (id, worker_kind) entries serve
     the pinned test model; (id, worker_kind, path) entries name their own
-    model directory (auto-routing tests point at doctored configs). Tears
-    down with the leaked-worker guard. Callers wait_ready()."""
+    model directory (auto-routing tests point at doctored configs); a 4th
+    element is extra TOML appended inside the model block (e.g. a
+    [model.speculative] sub-table). Tears down with the leaked-worker
+    guard. Callers wait_ready()."""
     binary = build_binaries()
     key_hash = subprocess.run(
         [binary, "hash-key", API_KEY], capture_output=True, text=True, check=True
@@ -178,6 +180,7 @@ def running_stack(models: list[tuple]):
 id = "{entry[0]}"
 path = "{entry[2] if len(entry) > 2 else model_path}"
 worker = "{entry[1]}"
+{entry[3] if len(entry) > 3 else ""}
 """
         for entry in models
     )
