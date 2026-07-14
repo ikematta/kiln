@@ -5271,3 +5271,57 @@
 - Next: unchanged — PM ruling on the Phase 8 speedup-bar DECISION
   NEEDED, then gateway `[model.speculative]` config wiring and
   CAPABILITY_SPECULATIVE advertisement.
+
+## [2026-07-14] Phase 8 — ADR 0006: speedup-bar DECISION NEEDED closed (PM ruling: option A) — DONE
+- What:
+  - The 2026-07-14 DECISION NEEDED (disposition of the SPEC §12 Phase 8
+    "≥1.6× at acceptance >60%" bar, measured NOT MET on every pinned
+    pair) is CLOSED by PM ruling: option A. Recorded as
+    `docs/decisions/0006-speculative-throughput-bar-deployment-shape.md`.
+  - ADR 0006 states the bar as originally written implicitly assumed a
+    deployment shape (small draft, large target, meaningful cost
+    asymmetry) that the sub-1B pinned CI fleet cannot produce, citing
+    this session's `spec_throughput.rs` measurements as evidence:
+    certified qwen3-0.6b-8bit/4bit pair 0.71× (γ4) / 0.68× (γ3),
+    clamped qwen2.5-0.5b self-pair 0.63× at 100% acceptance, with the
+    cost-ratio arithmetic (draft weighs ~0.65× target, so γ proposal
+    forwards + verify exceed the plain steps replaced; ceiling <~1.4×
+    even at 100% acceptance) establishing the loss as structural at
+    these pins, not tunable.
+  - The amendment: CAPABILITY_SPECULATIVE's correctness gate (golden
+    parity under speculation, the ADR 0005 envelope, the auto-disable
+    heuristics) remains a permanent BLOCKING CI requirement — unchanged.
+    The ≥1.6× throughput claim is decoupled from CI and becomes a
+    documented deployment-shape precondition: expected for draft ≤1B vs
+    target ≥7–8B, unverified in CI until such a pair enters the pinned
+    fleet, and operators enabling small/small pairs should expect a
+    measured loss (0.63–0.71×), not a gain.
+  - SPEC §12 Phase 8 Accept line amended to reference ADR 0006 (doc-only;
+    correctness clauses lead, throughput clause restated as the
+    precondition). Option B (pinning a 7–8B model for a perf-lane-only
+    measurement) declined for pinned-fleet cost; revisit trigger in the
+    ADR re-arms the measurement if such a pair is ever pinned.
+  - The attachment-time weights-byte-ratio guard (flagged in the part 3
+    entry as candidate future work) is now a TRACKED backlog item: a
+    `> BACKLOG:` block in SPEC §6.5 (same convention as the §8.3
+    rate-limits item) plus a Consequences bullet in ADR 0006 — warn or
+    reject at drafter attachment when the byte ratio predicts a loss,
+    because the acceptance heuristic structurally cannot catch
+    cost-ratio losses.
+- Decisions: within the ruling's latitude — ADR numbered 0006 following
+  0005; revisit triggers mirror ADR 0003's convention (pin bumps stale
+  the figures; a size-gap pin lifts "unverified").
+- Deviations: none (SPEC §12 edit and new ADR are both PM-directed; the
+  docs/decisions read-only rule applies to EXISTING files, and 0006 is
+  new).
+- Acceptance: docs-only change —
+  ```
+  $ ls docs/decisions/ | tail -1
+  0006-speculative-throughput-bar-deployment-shape.md
+  $ grep -c "ADR 0006" docs/SPEC.md
+  2   (Phase 8 Accept line + §6.5 BACKLOG block)
+  $ cargo fmt --all --check && ruff format --check python/ tests/e2e  -> clean
+  ```
+- Next: gateway `[model.speculative]` → `--draft-model` config wiring
+  (operator docs must state the ADR 0006 shape precondition), then
+  CAPABILITY_SPECULATIVE advertisement gated on correctness only.
