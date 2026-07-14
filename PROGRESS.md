@@ -5219,3 +5219,55 @@
   §12 Phase 8 speedup bar), then the remaining Phase 8 parts — gateway
   `[model.speculative]` → `--draft-model` config wiring, then
   CAPABILITY_SPECULATIVE advertisement.
+
+## [2026-07-14] CI infra — serialize GPU-worker cases in the rpc suite — DONE
+- What:
+  - Incident: run 29364413227 (the PR #22 merge push) attempt 1 failed
+    `prefix_cache_stats_and_ssd_restart` — the ssd-restart worker died
+    mid-stream (h2 BrokenPipe) while `cancel_and_drain_rpc_semantics`'s
+    worker was concurrently live on the macos-14 runner's shared
+    paravirtual GPU. Attempt 2 of the identical commit passed, and the
+    suite passed 6/6 locally on real Metal → environment flake of the
+    same class as the spec_probe segfault (PROGRESS 2026-07-13), at
+    process level instead of in-process.
+  - `crates/kiln-worker/tests/rpc.rs`: the two `#[tokio::test]` fns are
+    now plain async fns invoked sequentially from a single
+    `worker_rpc_semantics` test (old in-file order), so only one GPU
+    worker process runs at a time — the spec_probe remedy applied at the
+    worker-process level. Zero assertion changes; both phases' skip
+    guards intact.
+  - Sweep for a third instance (this is the second of this class): every
+    other MLX-driving integration binary is already a documented single
+    `#[test]` ("Single #[test] because the kiln-mlx live-object counter
+    is process-global" — batching, preemption, prefix_cache/multiturn,
+    draft, spec_decode/probe/throughput, leak*, golden, paged*,
+    pipeline_discard, prefill_pad, sampler, deterministic_partition,
+    wrappers, rollback_cost+grammar(engine) are explicitly no-MLX/no-GPU,
+    tokenize suites are CPU). In-crate unit tests: the only GPU-driving
+    unit test in the workspace is nn.rs's single YarnRoPE parity test
+    (config.rs/paged_attn.rs/openai.rs matches are comments/CPU). NO
+    third instance exists; rpc.rs was the last multi-test GPU binary.
+- Decisions: merged-#[test] over `--test-threads=1` in the CI step:
+  the repo convention already encodes the constraint in the test files
+  themselves (spec_probe precedent), it holds for local `cargo test
+  --workspace` runs too, and it needs no workflow change.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-worker --test rpc -- --nocapture
+  running 1 test
+  worker 1: cancel + graceful drain (deadline escalation) ok
+  worker 2: immediate drain ok
+  stats + prefix cache over RPC ok: WorkerStats { requests_total: 2, ...
+    prefix_tokens_reused_total: 63, ssd_blocks_stored: 2, ssd_writes_total: 2, ... }
+  worker restart served the prefix from SSD: PrefixCacheHit { tokens_reused: 63, from_ssd: true }
+  test worker_rpc_semantics ... ok
+  test result: ok. 1 passed; 0 failed; 0 ignored; ... finished in 16.21s
+  $ cargo fmt --all --check                                            -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings              -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features ...   -> clean
+  $ ruff check / ruff format --check python/ tests/e2e                 -> clean
+  ```
+- Next: unchanged — PM ruling on the Phase 8 speedup-bar DECISION
+  NEEDED, then gateway `[model.speculative]` config wiring and
+  CAPABILITY_SPECULATIVE advertisement.

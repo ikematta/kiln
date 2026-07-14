@@ -204,7 +204,6 @@ async fn measured_token_period(stream: &mut EventStream, min_tokens: u32) -> Dur
         .max(Duration::from_millis(1))
 }
 
-#[tokio::test(flavor = "multi_thread")]
 async fn cancel_and_drain_rpc_semantics() {
     if !kiln_mlx::memory::metal_is_available() {
         eprintln!("skipping: no Metal device");
@@ -390,7 +389,6 @@ async fn cancel_and_drain_rpc_semantics() {
 /// the `Stats` RPC (SPEC §5), and the SSD tier surviving a worker restart
 /// (SPEC §6.4 persistence) — all over the frozen proto, exactly as the
 /// gateway consumes them.
-#[tokio::test(flavor = "multi_thread")]
 async fn prefix_cache_stats_and_ssd_restart() {
     use kiln_proto::v1::{Capability, InfoRequest, StatsRequest};
 
@@ -542,4 +540,18 @@ async fn prefix_cache_stats_and_ssd_restart() {
         eprintln!("worker restart served the prefix from SSD: {hit:?}");
     }
     let _ = std::fs::remove_dir_all(&ssd_dir);
+}
+
+/// One `#[test]` because cases in a binary run concurrently and both of
+/// the above spawn kiln-worker child processes that drive the GPU — the
+/// process-level counterpart of the single-engine-thread discipline every
+/// Metal suite follows (see spec_probe.rs for the in-process precedent).
+/// Concurrent workers on the CI runner's shared paravirtual GPU killed one
+/// mid-stream (run 29364413227 attempt 1: h2 BrokenPipe from the
+/// ssd-restart worker while the cancel test's worker was live; attempt 2
+/// of the identical commit passed). Cases run in the old in-file order.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_rpc_semantics() {
+    cancel_and_drain_rpc_semantics().await;
+    prefix_cache_stats_and_ssd_restart().await;
 }
