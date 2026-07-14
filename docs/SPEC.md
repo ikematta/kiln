@@ -221,6 +221,8 @@ Two modes behind one abstraction, `Drafter`:
 - `SelfDraft` / MTP-style heads: deferred to Phase 8 stretch; interface reserved.
 Verify: single target-model forward over draft tokens for each speculating request within the normal batch step (speculative requests contribute `γ+1` positions to the step budget). Accept longest agreeing prefix + bonus token; on rejection, roll back = release the speculative blocks and truncate the block table (paging makes rollback O(1) — this is the composition win over oMLX). Speculation auto-disables per-request when batch size > `spec_max_batch` (default 4) since batching already saturates the GPU.
 
+> **BACKLOG:** attachment-time weights-byte-ratio guard — the worker knows draft and target weight byte counts at drafter attachment and should warn (or reject, behind config) when the ratio predicts a throughput loss: ~0.65 measured ratio loses at ANY acceptance rate, and the acceptance auto-disable structurally cannot catch cost-ratio losses; the profitable deployment shape is ratio ≈ 0.05–0.1 (ADR 0006; PROGRESS.md 2026-07-14).
+
 ### 6.6 Sampling
 Implemented on-GPU with MLX ops where possible (temperature scale, top-k via `mlx_topk`, top-p via sorted cumsum mask, min-p), categorical draw via `mlx_random_categorical` with per-request keys derived from seed; repetition/frequency/presence penalties applied on gathered logits for the request's recent window. Deterministic given seed (document that determinism holds per-worker-version, not across releases).
 
@@ -371,7 +373,7 @@ Accept: 100/100 schema-valid JSON generations; `anthropic` SDK conformance tests
 
 ### Phase 8 — Speculative decoding
 Tasks: `Drafter` abstraction, draft-model loading, batched draft/verify per 6.5, O(1) rollback via block release, acceptance-rate metrics, auto-disable heuristics, config wiring.
-Accept: with Qwen3-0.6B drafting for a 14B target (or tiny-pair in CI), single-stream decode ≥1.6× baseline at acceptance >60%; greedy outputs identical with speculation on vs off (correctness invariant of spec decode); composes with prefix cache (test asserts both active).
+Accept: greedy outputs identical with speculation on vs off (correctness invariant of spec decode); composes with prefix cache (test asserts both active). The ≥1.6×-at-acceptance->60% throughput clause is a deployment-shape precondition, not a CI bar (ADR 0006): it presumes substantial draft/target size asymmetry (e.g. Qwen3-0.6B drafting 8–14B), which the sub-1B pinned fleet cannot produce — measured 0.63–0.71× on every pinned pair — and it remains unverified in CI until such a pair enters the pinned fleet.
 
 ### Phase 9 — Multi-model supervision + memory governance
 Tasks: LRU eviction with drain, pinning, TTL; machine budget accounting from worker heartbeats; per-worker admission (prefill projection); INTERACTIVE/BATCH priorities + preemption ordering; crash-loop backoff; python worker batching upgrade (mlx-lm batch API) if straightforward.
