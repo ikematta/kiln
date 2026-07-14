@@ -4938,3 +4938,26 @@
   > 60% — NOT claimed here), acceptance-rate auto-disable heuristics,
   gateway `[model.speculative]` config wiring, and only then
   CAPABILITY_SPECULATIVE advertisement.
+
+## [2026-07-13] Phase 8 / Part 2 — PR #20 CI verification recorded — DONE
+- What: PR #20 (`claude/p8-verify-loop`, both task-8.2 commits) run
+  29304244457: ALL FOUR checks pass on the real runners — lint 36s,
+  compile-linux 37s, test-macos-release 3m3s, test-macos 23m44s.
+- The newly BLOCKING spec_decode lane passed on the foreign GPU under
+  `KILN_FIXTURE_PARITY=skip` (live speculation-off baselines): the
+  device-independent SPEC §6.5 on-vs-off invariant held on a different
+  device class, which is exactly the certification the ADR 0005
+  envelope was built to give. rpc/grammar/draft and every other
+  blocking suite green; the reworked worker draft suite (tokenizer +
+  envelope loud rejections, compatible-pair identity + metrics) passed
+  on the runner.
+- Advisory golden lane (ADR 0004, permanently non-blocking): the ONLY
+  divergence is the known gemma-3-1b-it-4bit/chat-basic flip — the same
+  fixture and position class recorded in ADR 0004 (4-ULP fp16 race,
+  kernel-class coin toss on the foreign device). No pattern change →
+  no action per the ADR; noted here per its protocol.
+- Next: remaining Phase 8 parts — throughput measurement against the
+  SPEC §12 Phase 8 bar (≥1.6x at acceptance >60%, not yet claimed),
+  acceptance-rate auto-disable heuristics, gateway `[model.speculative]`
+  → `--draft-model` config wiring, then CAPABILITY_SPECULATIVE
+  advertisement.
