@@ -5325,3 +5325,77 @@
 - Next: gateway `[model.speculative]` → `--draft-model` config wiring
   (operator docs must state the ADR 0006 shape precondition), then
   CAPABILITY_SPECULATIVE advertisement gated on correctness only.
+
+## [2026-07-14] Phase 8 / final part — [model.speculative] config wiring + CAPABILITY_SPECULATIVE — DONE
+- What (commit 74eb417, PR #25):
+  - Gateway registry resolves `[model.speculative].draft` to a local model
+    directory (tilde-expanded, config.json required — the model-path
+    locality contract) and stores it on the ModelEntry; a speculative
+    block on a python-routed model (explicit or auto-downgraded) is a
+    STARTUP ERROR — speculation is a rust-worker capability, and silently
+    dropping the block would be the gateway-side twin of the "requested
+    speculation silently inert" state ADR 0005 forbids the worker.
+  - Supervisor appends `--draft-model <resolved dir> --draft-gamma <n>`
+    to the rust worker argv (kiln.toml schema: draft + gamma, SPEC §10).
+  - Worker grew `--draft-gamma` (>= 1 enforced at parse; rejected without
+    `--draft-model`): sets the engine's per-round proposal count BEFORE
+    the ADR 0005 envelope clamp, which still applies on top.
+  - CAPABILITY_SPECULATIVE is now advertised in WorkerInfo, exactly when
+    a compatible draft is attached: the gate is correctness only — the
+    tokenizer-compat check plus the ADR 0005 envelope, both enforced at
+    attach — never the ADR 0006 throughput precondition. A draft-less
+    worker, and any UNHEALTHY-rejected pair, never advertises it.
+  - Operator docs (kiln.toml.example) state the ADR 0006 deployment-shape
+    precondition plainly: correctness-safe on any certified pair; only a
+    small-draft/large-target shape (~<=1B drafting >=7-8B) is expected to
+    gain; similar-size pairs are a measured LOSS (0.63-0.71x at sub-1B
+    scale) regardless of observed acceptance.
+  - Tests: NEW tests/e2e/test_speculative.py — a real kiln.toml with
+    [model.speculative] through the real gateway; asserts the spawned
+    worker's live command line carries the resolved --draft-model path
+    and --draft-gamma, the gateway log shows the draft attach + envelope
+    clamp, and the stack serves greedy completions (integration, not
+    config parsing). draft.rs flips its capability assertion (advertised
+    with a compatible draft via the full gateway argv shape incl.
+    --draft-gamma 4; absent on the draft-less baseline) and pins the
+    --draft-gamma argv rejections (0; gamma without draft) — parse-level,
+    pre-MLX. Registry unit tests: python rejection (explicit + auto),
+    non-local draft rejection, local-draft resolution.
+- Decisions: flag named `--draft-gamma` (pairs with `--draft-model`;
+  gamma is meaningless without a draft, enforced). Worker-kind gate
+  checked before draft locality (the more fundamental config
+  contradiction reports first). Capability advertised at attach and never
+  withdrawn at runtime: the auto-disable heuristics are per-request
+  stand-downs (policy), not capability loss.
+- Deviations: none.
+- Acceptance (local, Metal dev machine):
+  ```
+  $ cargo test -p kiln-gateway --lib                       -> 45 passed (3 new resolve_draft tests)
+  $ KILN_TEST_MODELS=... cargo test -p kiln-worker         -> draft 1 passed (argv rejections ok;
+      incompatible + out-of-envelope UNHEALTHY; SPECULATIVE advertised with draft, absent without;
+      24 identical greedy tokens, 16/27 accepted); grammar 1 passed; rpc 1 passed
+  $ uv run --project tests/e2e pytest tests/e2e            -> 79 passed, 2 skipped
+      (test_speculative.py::test_speculative_config_reaches_the_worker_argv PASSED,
+       ::test_speculative_stack_serves_greedy_completions PASSED)
+  $ cargo fmt --all --check; clippy --all-targets (default + --no-default-features) -D warnings;
+    ruff check + format --check python/ tests/e2e          -> all clean
+  ```
+- CI verification (PR #25, commit 74eb417, run 29374672707 — ALL FOUR
+  checks pass on the real runners): lint 44s, compile-linux 35s,
+  test-macos-release 3m9s, test-macos 28m28s. On the foreign GPU:
+  draft_verify_over_rpc_with_compat_gate ok in both the workspace pass
+  and the blocking model-gated lane; e2e 79 passed, 2 skipped with both
+  test_speculative.py cases PASSED. Advisory golden lane (ADR 0004,
+  permanently non-blocking): the ONLY divergence is the known
+  gemma-3-1b-it-4bit/chat-basic flip — same fixture and class as recorded
+  in the ADR; no pattern change -> no action, noted per its protocol.
+- This closes Phase 8 entirely (SPEC §12): Drafter abstraction, draft
+  loading, batched draft/verify, O(1) rollback, acceptance metrics,
+  auto-disable heuristics, and config wiring are all landed; correctness
+  clauses are permanent blocking CI gates, and the >=1.6x throughput
+  clause stands as the ADR 0006 deployment-shape precondition (unverified
+  in CI until a size-asymmetric pair enters the pinned fleet).
+- Next: Phase 9 — multi-model supervision + memory governance (LRU
+  eviction with drain, pinning, TTL; budget accounting from heartbeats;
+  per-worker admission; INTERACTIVE/BATCH priorities; crash-loop backoff;
+  the §8.3 BACKLOG rate-limit/timeout enforcement lands here too).
