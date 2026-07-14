@@ -4543,3 +4543,37 @@
   acceptance-rate metrics, auto-disable, and gateway config wiring
   (`[model.speculative]` → `--draft-model` argv; `SpeculativeConfig`
   parsing already exists). Only then advertise CAPABILITY_SPECULATIVE.
+
+## [2026-07-13] Phase 8 / Part 1 — PR #19 CI fix: draft RPC test placement — DONE
+- What: PR #19 run 29294575202 failed ONE lane (test-macos, 16m39s);
+  lint, compile-linux, and test-macos-release passed, and every NEW
+  suite passed on the runner — including
+  `draft_model_loads_alongside_target` and the kiln-models coexistence
+  suite. The failure was the PRE-EXISTING
+  `rpc.rs::cancel_and_drain_rpc_semantics`: my draft test initially
+  lived in rpc.rs, and cases inside one test binary run CONCURRENTLY.
+  The drain test measured 2055.3 ms/token while this test's two workers
+  held the GPU, sized its escalation deadline (657s) from that, then
+  contention vanished and the long request decoded at 29 tok/s — a ~60x
+  rate swing, past the 37x design margin that test documents (its
+  hardening was calibrated for the two historical siblings). The long
+  request finished (Length, 12000 tokens, 413s) before escalation.
+- Fix: restored `tests/rpc.rs` byte-for-byte to its pre-change state
+  and moved the draft coexistence test to its own binary,
+  `kiln-worker/tests/draft.rs` (self-contained harness — the
+  established grammar.rs pattern; test BINARIES run sequentially under
+  cargo test, so the drain test's contention profile is exactly its
+  calibrated one again). CI worker line gains `--test draft`. No
+  assertion anywhere was weakened; the drain test is untouched.
+- Acceptance (dev machine):
+  ```
+  $ KILN_TEST_MODELS=... cargo test -p kiln-worker --test draft -- --nocapture
+  draft coexistence over RPC ok: weights 695283921 -> 1030734505 bytes,
+    24 identical tokens
+  test draft_model_loads_alongside_target ... ok
+  $ KILN_TEST_MODELS=... cargo test -p kiln-worker --test rpc
+  test result: ok. 2 passed  (restored suite, original calibration)
+  $ cargo fmt --all --check; clippy --all-targets (both shapes) -D warnings -> clean
+  ```
+- Next: PR #19 CI re-run on the new head; record verification once the
+  four checks complete, then Phase 8 part 2 (draft/verify decode loop).
