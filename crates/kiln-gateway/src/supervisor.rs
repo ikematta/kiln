@@ -84,6 +84,18 @@ impl Supervisor {
                     if config.defaults.paged_attention_kernel {
                         argv.push("--paged-attention-kernel".to_owned());
                     }
+                    // SPEC §6.5/§10 [model.speculative]: draft path was
+                    // resolved (and gated to rust workers) at registry
+                    // build; the worker enforces the ADR 0005 attach
+                    // gates and goes UNHEALTHY on an incompatible pair.
+                    if let (Some(draft), Some(spec)) =
+                        (&entry.draft_path, &entry.config.speculative)
+                    {
+                        argv.push("--draft-model".to_owned());
+                        argv.push(draft.display().to_string());
+                        argv.push("--draft-gamma".to_owned());
+                        argv.push(spec.gamma.to_string());
+                    }
                     argv
                 }
                 _ => config.server.python_worker_argv.clone(),

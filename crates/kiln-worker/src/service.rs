@@ -90,7 +90,8 @@ impl Worker for WorkerService {
             dtype: info.dtype.clone(),
             // PREFIX_CACHE/SSD_TIER per the startup flags (Phase 5);
             // GRAMMAR once the engine thread builds the llguidance
-            // environment (Phase 7). No LOGPROBS yet; notably NOT
+            // environment (Phase 7); SPECULATIVE once a compatible draft
+            // is attached (Phase 8). No LOGPROBS yet; notably NOT
             // TOKENIZER_OWNED — the gateway tokenizes for this worker.
             capabilities: self.shared.capabilities(),
             worker_kind: "rust".to_owned(),

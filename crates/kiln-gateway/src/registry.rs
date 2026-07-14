@@ -48,6 +48,10 @@ pub struct ModelEntry {
     pub id: String,
     /// Resolved local model directory.
     pub model_path: PathBuf,
+    /// Resolved local draft-model directory; `Some` exactly when the
+    /// config has `[model.speculative]` (SPEC §6.5/§10, Rust workers
+    /// only — validated at registry build).
+    pub draft_path: Option<PathBuf>,
     pub socket_path: PathBuf,
     pub config: ModelConfig,
     /// Which worker binary serves this model (Rust or Python; `auto` is
@@ -109,6 +113,18 @@ pub enum RegistryError {
          shorten server.runtime_dir"
     )]
     SocketPathTooLong(String),
+    #[error(
+        "model '{id}': [model.speculative] requires the rust worker, but this model is \
+         served by the python worker ({reason}); speculative decoding is a rust-worker \
+         capability (SPEC §6.5) — remove the speculative block or make the model rust-servable"
+    )]
+    SpeculativeNeedsRust { id: String, reason: String },
+    #[error(
+        "model '{id}': speculative draft '{path}' is not a local model directory \
+         (config.json missing); model downloads arrive with kiln-jobs (Phase 10) — \
+         fetch it first"
+    )]
+    DraftNotLocal { id: String, path: String },
 }
 
 impl Registry {
@@ -137,6 +153,7 @@ impl Registry {
             }
 
             let (worker_kind, tokenizer) = resolve_worker(model, &model_path)?;
+            let draft_path = resolve_draft(model, worker_kind)?;
 
             let template = match ChatTemplate::from_model_dir(&model_path) {
                 Ok(t) => Some(t),
@@ -165,6 +182,7 @@ impl Registry {
             let entry = Arc::new(ModelEntry {
                 id: model.id.clone(),
                 model_path,
+                draft_path,
                 socket_path,
                 config: model.clone(),
                 worker_kind,
@@ -255,6 +273,41 @@ fn resolve_worker(
             }
         },
     }
+}
+
+/// Resolves `[model.speculative]` to a local draft directory (SPEC
+/// §6.5/§10). Speculation is a rust-worker capability, so a speculative
+/// block on a python-routed model is a startup error — dropping it
+/// silently would be exactly the "requested speculation silently inert"
+/// state ADR 0005 forbids the worker. Deeper validation (tokenizer
+/// compatibility, the ADR 0005 envelope) is the worker's job at attach;
+/// the registry only guarantees a spawnable `--draft-model` path.
+fn resolve_draft(
+    model: &ModelConfig,
+    worker_kind: WorkerKind,
+) -> Result<Option<PathBuf>, RegistryError> {
+    let Some(spec) = &model.speculative else {
+        return Ok(None);
+    };
+    if worker_kind != WorkerKind::Rust {
+        let reason = if model.worker == WorkerKind::Python {
+            "worker = \"python\" is configured".to_owned()
+        } else {
+            "worker = \"auto\" resolved to python".to_owned()
+        };
+        return Err(RegistryError::SpeculativeNeedsRust {
+            id: model.id.clone(),
+            reason,
+        });
+    }
+    let draft_path = expand_tilde(Path::new(&spec.draft));
+    if !draft_path.join("config.json").is_file() {
+        return Err(RegistryError::DraftNotLocal {
+            id: model.id.clone(),
+            path: spec.draft.clone(),
+        });
+    }
+    Ok(Some(draft_path))
 }
 
 /// `$KILN_RUNTIME_DIR/worker-<model_hash>.sock` (SPEC §3). The hash keeps the
@@ -476,6 +529,70 @@ mod tests {
         );
         assert_eq!(kind, WorkerKind::Python);
         assert!(!has_tokenizer);
+    }
+
+    #[test]
+    fn speculative_requires_the_rust_worker() {
+        use crate::config::SpeculativeConfig;
+        let dir = temp_dir("spec-python");
+        // The draft points at a real local dir — the failure under test is
+        // the worker kind, not draft locality.
+        let mut model = model_in_dir(&dir, WorkerKind::Python, supported_config());
+        model.speculative = Some(SpeculativeConfig {
+            draft: dir.to_string_lossy().into_owned(),
+            gamma: 4,
+        });
+        let err = resolve_draft(&model, WorkerKind::Python).expect_err("python cannot speculate");
+        assert!(
+            matches!(err, RegistryError::SpeculativeNeedsRust { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("worker = \"python\""), "{err}");
+
+        // auto that resolved to python is rejected just as loudly — silently
+        // dropping the speculative block would hide the misconfiguration.
+        model.worker = WorkerKind::Auto;
+        let err = resolve_draft(&model, WorkerKind::Python)
+            .expect_err("auto->python cannot speculate either");
+        assert!(err.to_string().contains("resolved to python"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn speculative_draft_must_be_local() {
+        use crate::config::SpeculativeConfig;
+        let dir = temp_dir("spec-draft");
+        let mut model = model_in_dir(&dir, WorkerKind::Rust, supported_config());
+        model.speculative = Some(SpeculativeConfig {
+            draft: "mlx-community/Qwen3-0.6B-4bit".into(),
+            gamma: 4,
+        });
+        let err = resolve_draft(&model, WorkerKind::Rust).expect_err("an HF id is not local");
+        assert!(matches!(err, RegistryError::DraftNotLocal { .. }), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn speculative_draft_resolves_to_the_local_dir() {
+        use crate::config::SpeculativeConfig;
+        let dir = temp_dir("spec-ok");
+        let mut model = model_in_dir(&dir, WorkerKind::Rust, supported_config());
+        model.speculative = Some(SpeculativeConfig {
+            draft: dir.to_string_lossy().into_owned(),
+            gamma: 4,
+        });
+        let path = resolve_draft(&model, WorkerKind::Rust)
+            .expect("local draft resolves")
+            .expect("speculative block yields a path");
+        assert_eq!(path, dir);
+
+        model.speculative = None;
+        assert!(
+            resolve_draft(&model, WorkerKind::Rust)
+                .expect("no block is fine")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

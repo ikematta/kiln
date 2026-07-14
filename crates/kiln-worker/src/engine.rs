@@ -55,6 +55,10 @@ pub struct EngineOptions {
     /// silently serving without the requested speculation would hide a
     /// misconfiguration.
     pub draft_model: Option<PathBuf>,
+    /// Tokens proposed per speculation round (SPEC §10
+    /// `[model.speculative]` gamma); `None` keeps the engine default.
+    /// The ADR 0005 envelope clamp still applies on top at attach.
+    pub draft_gamma: Option<usize>,
 }
 
 impl Default for EngineOptions {
@@ -65,6 +69,7 @@ impl Default for EngineOptions {
             ssd_max_bytes: DEFAULT_SSD_MAX_BYTES,
             paged_attention_kernel: false,
             draft_model: None,
+            draft_gamma: None,
         }
     }
 }
@@ -147,8 +152,8 @@ pub struct Shared {
     pub ssd_fingerprint_rejects_total: AtomicU64,
     /// Capability enum values advertised in `GetInfo` (set at startup
     /// from the cache flags; the engine thread may clear SSD_TIER if the
-    /// store fails to open, and adds GRAMMAR once the llguidance
-    /// environment builds).
+    /// store fails to open, adds GRAMMAR once the llguidance environment
+    /// builds, and adds SPECULATIVE once a compatible draft is attached).
     pub capabilities: std::sync::Mutex<Vec<i32>>,
     /// Structured-output compiler (SPEC §12 Phase 7), set by the engine
     /// thread before it reports Ready; absent = grammars unsupported
@@ -228,6 +233,18 @@ impl Shared {
     /// The structured-output compiler, when this worker supports grammars.
     pub(crate) fn grammar_env(&self) -> Option<&GrammarEnv> {
         self.grammar.get()
+    }
+
+    /// Advertises `CAPABILITY_SPECULATIVE`. Engine thread, once, after a
+    /// compatible draft passed the ADR 0005 attach gates — never on
+    /// loading alone, and never for a worker without a draft.
+    pub(crate) fn advertise_speculative(&self) {
+        use kiln_proto::v1::Capability;
+        let mut guard = match self.capabilities.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.push(Capability::Speculative as i32);
     }
 
     /// Advertised capability values (proto enum ints).
@@ -430,14 +447,18 @@ pub fn engine_main(
                 );
                 return;
             }
-            // ADR 0005 envelope: clamp gamma to the largest verify width
-            // whose kernel classes provably match plain decode for THIS
-            // target. A target outside the envelope (manual softcapped
-            // attention, dense trunk, unsupported head_dim, extreme GQA)
-            // cannot speculate at all — a configured draft there is a
-            // misconfiguration, rejected as loudly as an incompatible
-            // tokenizer; silently serving without the requested
-            // speculation would hide it.
+            // SPEC §10 [model.speculative] gamma, when configured...
+            if let Some(gamma) = opts.draft_gamma {
+                config.gamma = gamma;
+            }
+            // ...then the ADR 0005 envelope: clamp gamma to the largest
+            // verify width whose kernel classes provably match plain
+            // decode for THIS target. A target outside the envelope
+            // (manual softcapped attention, dense trunk, unsupported
+            // head_dim, extreme GQA) cannot speculate at all — a
+            // configured draft there is a misconfiguration, rejected as
+            // loudly as an incompatible tokenizer; silently serving
+            // without the requested speculation would hide it.
             match model.speculative_gamma_bound() {
                 Some(bound) => {
                     config.gamma = config.gamma.min(bound);
@@ -493,9 +514,6 @@ pub fn engine_main(
         shared.clear_ssd_capability();
     }
     if let Some(draft) = drafter {
-        // CAPABILITY_SPECULATIVE is deliberately NOT advertised yet:
-        // draft/verify decoding is not available until the Phase 8 part 2
-        // loop lands — loading alone must not signal the capability.
         let memory = kiln_engine::Drafter::memory(&draft);
         shared
             .draft_weights_bytes
@@ -507,6 +525,13 @@ pub fn engine_main(
             "draft model loaded"
         );
         engine.set_drafter(Box::new(draft));
+        // Advertised only here — a compatible draft is attached and the
+        // draft/verify loop is live. The gate is correctness only: the
+        // compat check plus the ADR 0005 envelope (both enforced above),
+        // never a throughput expectation — advertising the capability
+        // does not imply a speedup on the operator's chosen pair
+        // (ADR 0006; the shape precondition is documented at the config).
+        shared.advertise_speculative();
     }
     tracing::info!(
         model = %shared.model_id,

@@ -25,7 +25,7 @@ fn main() -> std::process::ExitCode {
 
     const USAGE: &str = "usage: kiln-worker --model <dir> --socket <path> [--model-id <id>] \
                          [--no-prefix-cache] [--ssd-dir <dir>] [--ssd-max-gb <n>] \
-                         [--paged-attention-kernel] [--draft-model <dir>]";
+                         [--paged-attention-kernel] [--draft-model <dir> [--draft-gamma <n>]]";
 
     let mut model: Option<PathBuf> = None;
     let mut socket: Option<PathBuf> = None;
@@ -60,6 +60,17 @@ fn main() -> std::process::ExitCode {
             "--draft-model" => {
                 value("--draft-model").map(|v| opts.draft_model = Some(PathBuf::from(v)))
             }
+            // SPEC §10 [model.speculative] gamma: tokens proposed per
+            // round. Still clamped by the ADR 0005 envelope at attach;
+            // 0 is rejected because a draft that never proposes is the
+            // "requested speculation silently inert" state ADR 0005 bans.
+            "--draft-gamma" => value("--draft-gamma").and_then(|v| match v.parse::<usize>() {
+                Ok(0) | Err(_) => Err(format!("--draft-gamma needs an integer >= 1, got {v:?}")),
+                Ok(gamma) => {
+                    opts.draft_gamma = Some(gamma);
+                    Ok(())
+                }
+            }),
             other => Err(format!("unknown argument {other:?}")),
         };
         if let Err(err) = result {
@@ -72,6 +83,11 @@ fn main() -> std::process::ExitCode {
         eprintln!("{USAGE}");
         return std::process::ExitCode::FAILURE;
     };
+    if opts.draft_gamma.is_some() && opts.draft_model.is_none() {
+        eprintln!("kiln-worker: --draft-gamma requires --draft-model");
+        eprintln!("{USAGE}");
+        return std::process::ExitCode::FAILURE;
+    }
     let model_id = model_id.unwrap_or_else(|| {
         model
             .file_name()

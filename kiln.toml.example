@@ -46,10 +46,28 @@ worker = "auto"                       # rust | python | auto (rust if arch + qua
 pinned = true                         # never evicted under memory pressure
 ttl_seconds = 0                       # idle auto-unload; 0 = never
 
-# Optional per-model speculative decoding (served from Phase 8).
+# Optional per-model speculative decoding (SPEC §6.5; rust workers only —
+# a speculative block on a python-routed model is a startup error).
+#
+# Correctness is unconditional: on any pair the worker agrees to serve,
+# greedy output is bit-identical with speculation on or off. The worker
+# refuses to start (UNHEALTHY) on a draft with an incompatible tokenizer
+# or a target outside the certified verify-kernel envelope, and clamps
+# gamma to that envelope (docs/decisions/0005). At runtime, speculation
+# stands down automatically per-request under wide batches or sustained
+# low acceptance.
+#
+# THROUGHPUT PRECONDITION (docs/decisions/0006): speculation only pays off
+# when the draft is much smaller than the target — roughly a <=1B draft
+# proposing for a >=7-8B target. On pairs of similar size it is a measured
+# LOSS regardless of the acceptance rate you observe (0.63-0.71x at sub-1B
+# scale: each round spends gamma draft forwards plus a verify forward, and
+# at a draft/target weight ratio near 0.65 that costs more than the plain
+# decode steps it replaces). Enable it for a small-drafts-large shape;
+# expect a slowdown, not a gain, on anything else.
 [model.speculative]
-draft = "mlx-community/Qwen3-0.6B-4bit"
-gamma = 4
+draft = "mlx-community/Qwen3-0.6B-4bit" # HF repo id or local path; tokenizer must match the target's
+gamma = 4                               # tokens proposed per round (clamped per ADR 0005)
 
 [auth]
 # argon2 hash of the admin bearer token — never the raw token.
