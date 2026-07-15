@@ -24,6 +24,10 @@ pub enum WorkerStatus {
     Starting,
     /// Health reports READY; requests are routed.
     Ready,
+    /// Being unloaded (eviction or idle TTL): drain in progress.
+    Draining,
+    /// Deliberately not loaded; a request (or admin action) reloads it.
+    Unloaded { reason: UnloadReason },
     /// Crashed; the supervisor is backing off before respawning.
     Restarting { attempt: u32 },
     /// Exceeded the restart budget; requires manual intervention.
@@ -32,11 +36,43 @@ pub enum WorkerStatus {
     Stopped,
 }
 
+/// Why a model is not loaded (SPEC §2.2/§2.3 memory governance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnloadReason {
+    /// LRU-evicted to make room for another model's load.
+    Evicted,
+    /// Idle past its configured `ttl_seconds`.
+    IdleTtl,
+    /// Its own load was rejected: over budget with no evictable model.
+    OverBudget,
+}
+
+impl UnloadReason {
+    /// Bounded label for `kiln_worker_unloads_total{reason}`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Evicted => "evicted",
+            Self::IdleTtl => "idle_ttl",
+            Self::OverBudget => "over_budget",
+        }
+    }
+}
+
 impl fmt::Display for WorkerStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Starting => write!(f, "starting"),
             Self::Ready => write!(f, "ready"),
+            Self::Draining => write!(f, "draining"),
+            Self::Unloaded {
+                reason: UnloadReason::Evicted,
+            } => write!(f, "unloaded (evicted)"),
+            Self::Unloaded {
+                reason: UnloadReason::IdleTtl,
+            } => write!(f, "unloaded (idle ttl)"),
+            Self::Unloaded {
+                reason: UnloadReason::OverBudget,
+            } => write!(f, "unloaded (over budget)"),
             Self::Restarting { attempt } => write!(f, "restarting (attempt {attempt})"),
             Self::Failed => write!(f, "failed"),
             Self::Stopped => write!(f, "stopped"),

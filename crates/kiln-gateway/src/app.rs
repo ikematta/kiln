@@ -14,12 +14,14 @@ use serde_json::json;
 
 use crate::auth::Auth;
 use crate::error::ApiError;
+use crate::lifecycle::Lifecycle;
 use crate::metrics::Metrics;
 use crate::openai::ModelObject;
 use crate::registry::{Registry, WorkerStatus};
 
 pub struct AppState {
     pub registry: Arc<Registry>,
+    pub lifecycle: Arc<Lifecycle>,
     pub metrics: Arc<Metrics>,
     pub auth: Auth,
 }
@@ -105,14 +107,16 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
 }
 
-/// 200 once every configured worker is Ready; 503 with per-model states
-/// otherwise.
+/// 200 once every configured worker has settled: Ready, or deliberately
+/// Unloaded (idle TTL / evicted / over budget — SPEC §2.2 lifecycle states,
+/// reloaded on demand). Everything transitional or broken is 503 with
+/// per-model states.
 async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     let mut models = serde_json::Map::new();
     let mut all_ready = true;
     for entry in state.registry.iter() {
         let status = entry.status();
-        all_ready &= status == WorkerStatus::Ready;
+        all_ready &= matches!(status, WorkerStatus::Ready | WorkerStatus::Unloaded { .. });
         models.insert(entry.id.clone(), json!(status.to_string()));
     }
     let status = if all_ready {

@@ -9,6 +9,7 @@ pub mod chat;
 pub mod completions;
 pub mod config;
 pub mod error;
+pub mod lifecycle;
 pub mod messages;
 pub mod metrics;
 pub mod openai;

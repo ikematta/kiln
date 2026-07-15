@@ -66,13 +66,14 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(&runtime_dir).await?;
 
     let metrics = Arc::new(Metrics::new()?);
-    let (registry, supervisor) = Supervisor::start(&config, Arc::clone(&metrics))?;
+    let (registry, lifecycle, supervisor) = Supervisor::start(&config, Arc::clone(&metrics))?;
     if registry.is_empty() {
         tracing::warn!("no [[model]] entries configured; chat endpoints will 404");
     }
     let auth = Auth::from_config(&config.auth);
     let state = Arc::new(AppState {
         registry,
+        lifecycle,
         metrics,
         auth,
     });
