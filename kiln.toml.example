@@ -32,6 +32,16 @@ python_worker_argv = ["uv", "run", "--project", "python/kiln_worker_py", "python
 # and outside its TTL keep-alive lease (Drain → SIGTERM → SIGKILL after
 # grace); with no evictable model the load is rejected and retried on the
 # next request for it.
+#
+# The budget is also enforced per REQUEST (SPEC §2.3/§8.2): serving a
+# request may materialize the rest of a worker's lazily-allocated KV pool,
+# and when that projected growth exceeds the live headroom (budget minus
+# measured footprints) the request gets a retriable 503
+# `insufficient_memory` instead of drifting the machine over budget.
+#
+# Requests carry an optional `priority` field ("interactive" default,
+# "batch"): under memory pressure BATCH work is preempted first and queues
+# behind INTERACTIVE arrivals (SPEC §6.1).
 budget_fraction = 0.80
 # Explicit budget in bytes; overrides budget_fraction when set.
 #budget_bytes = 25000000000

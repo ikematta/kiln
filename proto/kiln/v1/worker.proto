@@ -88,6 +88,13 @@ message WorkerInfo {
   // sub-batching deterministic (greedy/seeded) rows; 0 = greedy determinism
   // under batching is not guaranteed at this build (e.g. the python worker).
   uint32 max_deterministic_decode_width = 13;
+  // Paged KV pool geometry (Phase 9 admission control, SPEC §2.3/§6.4;
+  // ADDITIVE fields per the compatibility rules above): the gateway
+  // projects a request's / the pool's memory cost against the machine
+  // budget. Both 0 when the worker is not paged (the python worker) —
+  // receivers must skip the projection then.
+  uint64 kv_bytes_per_block = 14;   // bytes one block occupies across all layers (K+V)
+  uint64 kv_pool_blocks = 15;       // total pool capacity in blocks
 }
 
 // ---------------------------------------------------------------------------

@@ -670,14 +670,17 @@ async fn unload(
     RunExit::Unloaded { reason }
 }
 
-/// Records one heartbeat's memory numbers: the budget ledger and the
-/// per-model gauges (SPEC §2.3).
+/// Records one heartbeat's memory numbers: the budget ledger, the pool
+/// materialization gauge feeding per-request admission, and the per-model
+/// gauges (SPEC §2.3).
 fn record_memory(ctx: &SuperviseCtx, health: &HealthStatus) {
     let Some(report) = &health.memory else {
         return;
     };
     let footprint = lifecycle::footprint_bytes(report);
     ctx.lifecycle.record_usage(&ctx.entry.id, footprint);
+    ctx.lifecycle
+        .record_pool_materialized(&ctx.entry.id, report.kv_pool_allocated_bytes);
     ctx.metrics
         .worker_memory
         .record(&ctx.entry.id, report, footprint);
@@ -750,6 +753,12 @@ async fn refresh_info(ctx: &SuperviseCtx, client: &mut WorkerClient<tonic::trans
                     worker_hash = %info.chat_template_hash,
                     "chat template mismatch between gateway and worker");
             }
+            // Full-pool cost for per-request admission (SPEC §2.3/§6.4);
+            // 0 (no gating) for workers that report no pool geometry.
+            ctx.lifecycle.set_pool_commitment(
+                &entry.id,
+                info.kv_bytes_per_block.saturating_mul(info.kv_pool_blocks),
+            );
             *entry.info.write().await = Some(info);
         }
         other => {

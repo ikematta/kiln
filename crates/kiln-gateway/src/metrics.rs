@@ -40,6 +40,9 @@ pub struct Metrics {
     /// Deliberate unloads by model and reason (`evicted | idle_ttl |
     /// over_budget`) — SPEC §2.2 memory governance, distinct from crashes.
     pub worker_unloads_total: IntCounterVec,
+    /// Requests refused by per-request memory admission (SPEC §2.3/§8.2,
+    /// Phase 9 part 2), per model.
+    pub admission_rejects_total: IntCounterVec,
     /// Machine memory budget (SPEC §2.3): total unified memory ×
     /// `memory.budget_fraction`, or the explicit `memory.budget_bytes`.
     pub memory_budget_bytes: IntGauge,
@@ -201,6 +204,12 @@ impl Metrics {
             "Deliberate worker unloads per model and reason (evicted | idle_ttl | over_budget)",
             &["model", "reason"],
         )?;
+        let admission_rejects_total = counter(
+            "kiln_admission_rejects_total",
+            "Requests refused by per-request memory admission (projected pool growth \
+             exceeded the machine budget headroom)",
+            &["model"],
+        )?;
         let plain_gauge = |name: &str, help: &str| {
             let gauge = IntGauge::new(name, help)?;
             registry.register(Box::new(gauge.clone()))?;
@@ -316,6 +325,7 @@ impl Metrics {
             worker_restarts_total,
             worker_up,
             worker_unloads_total,
+            admission_rejects_total,
             memory_budget_bytes,
             memory_used_bytes,
             worker_stats,

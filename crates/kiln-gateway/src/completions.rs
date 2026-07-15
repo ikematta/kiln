@@ -18,14 +18,14 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use kiln_proto::v1::worker_client::WorkerClient;
 use kiln_proto::v1::{
-    Priority, StoppingParams, SubmitRequest, TokenEvent, TokenIds, submit_request, token_event,
+    StoppingParams, SubmitRequest, TokenEvent, TokenIds, submit_request, token_event,
 };
 use tonic::Streaming;
 
 use crate::app::{AppState, RequestId};
 use crate::chat::{
-    CompletionCtx, MAX_BODY_BYTES, StreamEnd, TextPipeline, classify_finished, encode_prompt,
-    ready_entry, sse_json, unix_now, usage_of,
+    CompletionCtx, MAX_BODY_BYTES, StreamEnd, TextPipeline, admit_memory, classify_finished,
+    encode_prompt, ready_entry, sse_json, unix_now, usage_of,
 };
 use crate::error::ApiError;
 use crate::openai::{CompletionChoice, CompletionRequest, TextCompletion, Usage};
@@ -79,6 +79,7 @@ async fn handle(
     request_id: RequestId,
 ) -> Result<Response, ApiError> {
     let entry = ready_entry(&state, &request.model)?;
+    admit_memory(&state, &entry)?;
     let validated = request.validate()?;
 
     let mut client = WorkerClient::new(entry.channel.clone());
@@ -118,7 +119,7 @@ async fn handle(
             ignore_eos: false,
         }),
         grammar: None,
-        priority: Priority::Interactive as i32,
+        priority: validated.priority as i32,
         prefix_hint: 0,
         echo_prompt: false,
     };

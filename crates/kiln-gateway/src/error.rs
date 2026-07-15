@@ -73,6 +73,23 @@ impl ApiError {
         }
     }
 
+    /// Per-request admission rejection (SPEC §2.3/§8.2, Phase 9 part 2):
+    /// serving the request would grow the worker past the machine's
+    /// remaining memory headroom. Retriable — headroom recovers when
+    /// another model unloads or its usage shrinks.
+    pub fn insufficient_memory(model: &str, needed_bytes: u64, headroom_bytes: u64) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "server_error",
+            code: "insufficient_memory",
+            message: format!(
+                "admission rejected: serving this request could grow model '{model}' by \
+                 {needed_bytes} bytes (KV pool materialization) but only {headroom_bytes} \
+                 bytes of the machine memory budget remain; retry later or unload a model"
+            ),
+        }
+    }
+
     /// Worker died (mid-request or before it): the SPEC §2.2 structured 502
     /// with a retriable code.
     pub fn worker_crashed(message: impl Into<String>) -> Self {

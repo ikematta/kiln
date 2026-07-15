@@ -164,6 +164,15 @@ pub struct Shared {
     /// published in `WorkerInfo` for diagnostics; set by the engine
     /// thread after model load (0 while loading).
     pub deterministic_decode_width: AtomicU32,
+    /// Target-pool geometry for the gateway's admission projections
+    /// (SPEC §2.3/§6.4, proto `WorkerInfo.kv_bytes_per_block` /
+    /// `kv_pool_blocks`); set by the engine thread before Ready. The
+    /// byte figure uses the 16-bit element size every rust-servable
+    /// checkpoint computes in (SPEC §7.3), fixed here at load so the
+    /// gateway can project the pool's full cost before any traffic
+    /// materializes it.
+    pub kv_bytes_per_block: AtomicU64,
+    pub kv_pool_blocks: AtomicU64,
     started_at: Instant,
 }
 
@@ -211,6 +220,8 @@ impl Shared {
             capabilities: std::sync::Mutex::new(capabilities),
             grammar: std::sync::OnceLock::new(),
             deterministic_decode_width: AtomicU32::new(0),
+            kv_bytes_per_block: AtomicU64::new(0),
+            kv_pool_blocks: AtomicU64::new(0),
             started_at: Instant::now(),
         }
     }
@@ -500,6 +511,24 @@ pub fn engine_main(
         }
         None => None,
     };
+    // Pool geometry for the gateway's admission projections (SPEC
+    // §2.3/§6.4): published before Ready so the full pool cost is
+    // projectable while the lazily-materialized pool still reports 0
+    // allocated bytes. Element size 2 per SPEC §7.3 — every checkpoint
+    // this worker serves computes (and caches KV) in f16/bf16.
+    let kv_spec = kiln_engine::KvSpec {
+        layers: dims.layers,
+        kv_heads: dims.kv_heads,
+        head_dim: dims.head_dim,
+        num_blocks: config.num_blocks,
+        block_size: config.block_size,
+    };
+    shared
+        .kv_bytes_per_block
+        .store(kv_spec.bytes_per_block(2), Ordering::Release);
+    shared
+        .kv_pool_blocks
+        .store(config.num_blocks as u64, Ordering::Release);
     let mut engine = match Engine::new(model, dims, config, stream) {
         Ok(engine) => engine,
         Err(err) => {

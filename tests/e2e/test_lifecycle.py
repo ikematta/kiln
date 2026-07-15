@@ -10,14 +10,23 @@ fixed 512-block KV pool dominate, and the pool only materializes on first
 traffic):
 
   gemma-3-1b-it-4bit rust worker: ~766 MB idle after load, ~1176 MB once
-  the KV pool is touched; weights on disk 733 MB. LRU_BUDGET (2.08 GB)
-  sits between "one traffic-warmed resident + one load" (~1.91 GB) and
-  "two idle residents + one load" (~2.26 GB), so a third load always
-  evicts exactly one model.
+  the KV pool is touched (pool commitment 436 MB); weights on disk 733 MB.
+  LRU_BUDGET (2.08 GB) sits between "one traffic-warmed resident + one
+  load" (~1.91 GB) and "two idle residents + one load" (~2.26 GB), so a
+  third load always evicts exactly one model.
 
-  qwen2.5-0.5b-4bit rust worker: ~300 MB idle, ~486 MB after traffic;
-  weights 278 MB. PINNED_BUDGET (730 MB) fits two idle residents but not
-  two residents + a third load (~880 MB).
+  qwen2.5-0.5b-4bit rust worker: ~300 MB idle, ~486 MB after traffic
+  (pool commitment 201 MB); weights 278 MB. PINNED_BUDGET (730 MB) fits
+  two idle residents but not two residents + a third load (~880 MB).
+
+Phase 9 part 2 note: these budgets deliberately over-pack the machine —
+part 1 let requests materialize KV pools past the budget (the recorded
+continuous-drift gap). Part 2's per-request admission now REFUSES the
+request that would start that drift with a structured 503
+(`insufficient_memory`), so the flows below assert the 503 exactly where
+part 1 silently went over, and the ledger stays <= budget throughout.
+The routing touch still lands before the gate, so LRU recency semantics
+are unchanged. test_admission.py holds the isolated gate scenarios.
 """
 
 from __future__ import annotations
@@ -146,9 +155,24 @@ def test_lru_eviction_order_and_on_demand_reload():
         # LRU even though bravo is the older worker — a load-order policy
         # would evict bravo here.
         assert_completes(stack, "charlie")
-        time.sleep(3)  # charlie's busy-heartbeat touches settle first
-        assert_completes(stack, "bravo")
-        time.sleep(2)  # pool-inflated footprints reach the ledger
+        time.sleep(3)  # charlie's busy-heartbeat touches settle first, and
+        # its pool-inflated footprint (~1.18 GB) reaches the ledger.
+
+        # Part 2's per-request admission: warming bravo's pool too (436 MB
+        # growth) no longer fits the headroom charlie's warm left
+        # (~140 MB). Part 1 let exactly this request drift the machine to
+        # ~2.35 GB against the 2.08 GB budget; the structured 503 is that
+        # gap closing. The routing touch landed before the gate, so bravo
+        # is still the most recently used model for the eviction below.
+        response = complete(stack, "bravo")
+        assert response.status_code == 503, response.text
+        assert response.json()["error"]["code"] == "insufficient_memory", response.text
+        text = stack.metrics_text()
+        assert metric_value(text, "kiln_admission_rejects_total", model="bravo") == 1, (
+            text
+        )
+        used = metric_value(text, "kiln_memory_used_bytes")
+        assert used <= LRU_BUDGET, f"admission let the ledger drift over budget: {used}"
 
         # On-demand reload: a request for the evicted model 503s (retriable)
         # and starts the load, which must evict charlie and spare bravo.
@@ -218,8 +242,22 @@ def test_pinned_model_survives_eviction_pressure():
         f_pin = metric_value(text, "kiln_worker_memory_bytes", model="pin")
         assert f_pin > 250_000_000, f"implausible measured footprint: {f_pin}"
 
-        # The survivor serves.
-        assert_completes(stack, "pin")
+        # This budget deliberately over-packs the machine: warming any
+        # pool (201 MB) exceeds the ~130 MB of headroom two idle residents
+        # leave. Part 1 served here by silently drifting over budget;
+        # part 2's per-request admission refuses with a structured 503 and
+        # the worker stays READY — the load-time gate passed, the request
+        # gate did not. (Serving within a budget that has pool headroom is
+        # test_admission.py's positive control.)
+        response = complete(stack, "pin")
+        assert response.status_code == 503, response.text
+        assert response.json()["error"]["code"] == "insufficient_memory", response.text
+        _, statuses = readyz(stack)
+        assert statuses["pin"] == "ready", statuses
+        text = stack.metrics_text()
+        assert metric_value(text, "kiln_admission_rejects_total", model="pin") == 1, (
+            text
+        )
 
 
 def test_ttl_idle_model_auto_unloads_and_reloads_on_demand():

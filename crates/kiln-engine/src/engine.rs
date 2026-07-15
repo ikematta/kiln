@@ -777,6 +777,20 @@ fn finish(
     }
 }
 
+/// Inserts into the WAITING queue in admission order (SPEC §6.1 priority
+/// classes): INTERACTIVE ahead of BATCH, FIFO by arrival within a class.
+/// Both producers use it — `submit` (new arrivals) and the end-of-iteration
+/// preemption return — so a resumed request keeps its seniority within its
+/// class but never queues ahead of a higher class.
+fn enqueue_waiting(waiting: &mut VecDeque<Seq>, seq: Seq) {
+    let key = |s: &Seq| (Reverse(s.priority), s.arrival);
+    let at = waiting
+        .iter()
+        .position(|w| key(w) > key(&seq))
+        .unwrap_or(waiting.len());
+    waiting.insert(at, seq);
+}
+
 /// One planned decode/replay segment (index into `running` + its step).
 struct DecodePlan {
     seq: usize,
@@ -1334,7 +1348,7 @@ impl<M: StepModel> Engine<M> {
         if seq.prompt.len() == 1 {
             seq.history.push(seq.prompt[0]);
         }
-        self.waiting.push_back(seq);
+        enqueue_waiting(&mut self.waiting, seq);
     }
 
     /// One SPEC §6.2 iteration. On `Err` every in-flight request has been
@@ -1768,11 +1782,18 @@ impl<M: StepModel> Engine<M> {
     /// so admission pauses while a prefill is in flight. The head of the
     /// queue gets its prefix-cache match here (SPEC §6.3 "on admit"), then
     /// waits until its remaining admission projection fits in free blocks
-    /// (SPEC §6.4) — evicting cache-only blocks to make room before giving
-    /// up.
+    /// (SPEC §6.4) — evicting cache-only blocks first, then (SPEC §6.1
+    /// priority classes) preempting strictly-lower-priority running
+    /// requests in deservingness order, so an INTERACTIVE arrival is
+    /// admitted over BATCH decodes instead of waiting behind them. Same-
+    /// class arrivals never preempt: the newcomer is by definition the
+    /// least deserving of its class.
     fn admit(&mut self) {
         loop {
-            let mid_prefill = self.running.iter().any(|seq| !seq.decoding());
+            let mid_prefill = self
+                .running
+                .iter()
+                .any(|seq| !seq.finished && !seq.preempted && !seq.decoding());
             let budget_left = self.running.len() < self.config.max_batch_tokens;
             if mid_prefill || !budget_left {
                 return;
@@ -1782,13 +1803,30 @@ impl<M: StepModel> Engine<M> {
                 return;
             };
             let needed = head.admission_blocks(self.mgr.block_size());
+            let head_priority = head.priority;
             while self.mgr.num_free() < needed {
                 let evicted = self
                     .cache
                     .as_mut()
                     .is_some_and(|state| state.evict_one(&mut self.mgr));
-                if !evicted {
-                    return;
+                if evicted {
+                    continue;
+                }
+                let victim = self
+                    .running
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, seq)| {
+                        !seq.finished
+                            && !seq.preempted
+                            && seq.priority < head_priority
+                            && !seq.table.blocks().is_empty()
+                    })
+                    .min_by_key(|(_, seq)| seq.deservingness())
+                    .map(|(j, _)| j);
+                match victim {
+                    Some(j) => self.preempt(j),
+                    None => return,
                 }
             }
             match self.waiting.pop_front() {
@@ -2344,19 +2382,14 @@ impl<M: StepModel> Engine<M> {
         }
 
         // --- Preempted requests return to WAITING (SPEC §6.1), reset for
-        // re-prefill; insertion keeps the queue sorted by arrival so a
-        // resumed request keeps its seniority.
+        // re-prefill; insertion keeps the queue's class-then-arrival order
+        // so a resumed request keeps its seniority within its class.
         let mut i = 0;
         while i < self.running.len() {
             if self.running[i].preempted {
                 let mut seq = self.running.remove(i);
                 seq.preempted = false;
-                let at = self
-                    .waiting
-                    .iter()
-                    .position(|w| w.arrival > seq.arrival)
-                    .unwrap_or(self.waiting.len());
-                self.waiting.insert(at, seq);
+                enqueue_waiting(&mut self.waiting, seq);
             } else {
                 i += 1;
             }

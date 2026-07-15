@@ -45,8 +45,8 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use kiln_proto::v1::worker_client::WorkerClient;
 use kiln_proto::v1::{
-    CancelRequest, FinishReason, Finished, Priority, StoppingParams, SubmitRequest, TokenChunk,
-    TokenEvent, TokenIds, TokenizeRequest, submit_request, token_event,
+    CancelRequest, FinishReason, Finished, StoppingParams, SubmitRequest, TokenChunk, TokenEvent,
+    TokenIds, TokenizeRequest, submit_request, token_event,
 };
 use kiln_tokenize::{StopStringMatcher, StreamingDecoder, ToolCallParser, ToolEvent};
 use tonic::Streaming;
@@ -94,6 +94,26 @@ pub(crate) fn ready_entry(state: &AppState, model: &str) -> Result<Arc<ModelEntr
         ))),
         WorkerStatus::Failed => Err(ApiError::worker_failed(&entry.id)),
     }
+}
+
+/// Per-request memory admission (SPEC §2.3/§8.2, Phase 9 part 2), shared by
+/// every completion-shaped endpoint: refuses the request when serving it
+/// could materialize KV-pool bytes the machine budget no longer has room
+/// for. Runs against live heartbeat numbers, so drift since load (pools,
+/// caches) is priced in — this is the per-request check, distinct from the
+/// load-time `load()` gate.
+pub(crate) fn admit_memory(state: &AppState, entry: &ModelEntry) -> Result<(), ApiError> {
+    state.lifecycle.admit_request(&entry.id).map_err(|denial| {
+        state
+            .metrics
+            .admission_rejects_total
+            .with_label_values(&[&entry.id])
+            .inc();
+        tracing::warn!(target: "kiln::admission", model = %entry.id,
+            needed_bytes = denial.needed_bytes, headroom_bytes = denial.headroom_bytes,
+            "request rejected: projected pool growth exceeds machine headroom");
+        ApiError::insufficient_memory(&entry.id, denial.needed_bytes, denial.headroom_bytes)
+    })
 }
 
 /// Prompt-text → token ids under the entry's tokenization ownership: locally
@@ -172,6 +192,7 @@ async fn handle(
     request_id: RequestId,
 ) -> Result<Response, ApiError> {
     let entry = ready_entry(&state, &request.model)?;
+    admit_memory(&state, &entry)?;
 
     let mut validated = request.validate()?;
     let prompt = render_prompt(&entry, &validated)?;
@@ -245,7 +266,7 @@ async fn handle(
             ignore_eos: false,
         }),
         grammar,
-        priority: Priority::Interactive as i32,
+        priority: validated.priority as i32,
         prefix_hint: 0,
         echo_prompt: false,
     };

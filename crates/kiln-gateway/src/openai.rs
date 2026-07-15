@@ -4,7 +4,7 @@
 //! unsupported *features* are rejected with clear 400s rather than silently
 //! dropped.
 
-use kiln_proto::v1::{GrammarSpec, SamplingParams, grammar_spec};
+use kiln_proto::v1::{GrammarSpec, Priority, SamplingParams, grammar_spec};
 use kiln_tokenize::{ChatMessage, MessageToolCall, MessageToolFunction};
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,10 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub response_format: Option<ResponseFormat>,
     pub user: Option<String>,
+    /// Kiln extension (SPEC §6.1 priority classes): `"interactive"`
+    /// (default) or `"batch"` — BATCH requests are preempted first under
+    /// memory pressure and queue behind INTERACTIVE arrivals.
+    pub priority: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +135,8 @@ pub struct ValidatedChat {
     /// template (`tools` variable) and used as parser type hints. Empty
     /// when the request has none or `tool_choice` is `"none"`.
     pub tools: Vec<serde_json::Value>,
+    /// SPEC §6.1 priority class for the worker's scheduler.
+    pub priority: Priority,
     pub stream: bool,
     pub include_usage: bool,
 }
@@ -299,12 +305,25 @@ impl ChatCompletionRequest {
             stop_strings,
             grammar,
             tools,
+            priority: validate_priority(self.priority.as_deref())?,
             stream: self.stream,
             include_usage: self
                 .stream_options
                 .as_ref()
                 .is_some_and(|o| o.include_usage),
         })
+    }
+}
+
+/// The Kiln `priority` extension field, shared by all three completion
+/// endpoints (SPEC §6.1 priority classes). Absent = INTERACTIVE.
+pub(crate) fn validate_priority(value: Option<&str>) -> Result<Priority, ApiError> {
+    match value {
+        None | Some("interactive") => Ok(Priority::Interactive),
+        Some("batch") => Ok(Priority::Batch),
+        Some(other) => Err(ApiError::invalid_request(format!(
+            "unsupported 'priority' '{other}' (expected 'interactive' or 'batch')"
+        ))),
     }
 }
 
@@ -455,6 +474,9 @@ pub struct CompletionRequest {
     pub echo: bool,
     pub suffix: Option<String>,
     pub user: Option<String>,
+    /// Kiln extension (SPEC §6.1 priority classes) — see
+    /// [`ChatCompletionRequest::priority`].
+    pub priority: Option<String>,
 }
 
 /// The `prompt` forms OpenAI accepts. Token-id forms are parsed so they can
@@ -478,6 +500,8 @@ pub struct ValidatedCompletion {
     /// None = OpenAI's legacy default of 16, applied at submit time.
     pub max_tokens: Option<u32>,
     pub stop_strings: Vec<String>,
+    /// SPEC §6.1 priority class for the worker's scheduler.
+    pub priority: Priority,
     pub stream: bool,
     pub include_usage: bool,
 }
@@ -543,6 +567,7 @@ impl CompletionRequest {
             sampling,
             max_tokens,
             stop_strings,
+            priority: validate_priority(self.priority.as_deref())?,
             stream: self.stream,
             include_usage: self
                 .stream_options
@@ -911,6 +936,42 @@ mod tests {
         .validate()
         .expect("valid");
         assert!(v.tools.is_empty());
+    }
+
+    #[test]
+    fn priority_extension_field_validates() {
+        // Absent and explicit "interactive" → INTERACTIVE (the default).
+        let base = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+        });
+        let v = request(base.clone()).validate().expect("valid");
+        assert_eq!(v.priority, Priority::Interactive);
+        let mut body = base.clone();
+        body["priority"] = serde_json::json!("interactive");
+        assert_eq!(
+            request(body).validate().expect("valid").priority,
+            Priority::Interactive
+        );
+        // "batch" → BATCH on both endpoints.
+        let mut body = base.clone();
+        body["priority"] = serde_json::json!("batch");
+        assert_eq!(
+            request(body).validate().expect("valid").priority,
+            Priority::Batch
+        );
+        let v = completion_request(
+            serde_json::json!({"model": "m", "prompt": "x", "priority": "batch"}),
+        )
+        .validate()
+        .expect("valid");
+        assert_eq!(v.priority, Priority::Batch);
+        // Anything else is a named 400, not a silent default.
+        let mut body = base;
+        body["priority"] = serde_json::json!("urgent");
+        let err = request(body).validate().expect_err("must reject");
+        assert!(err.message.contains("'priority'"), "{}", err.message);
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
