@@ -25,7 +25,16 @@ python_worker_argv = ["uv", "run", "--project", "python/kiln_worker_py", "python
 
 [memory]
 # Fraction of unified memory the gateway may hand out across all workers.
+# The machine budget (SPEC §2.3) is total unified memory × this fraction;
+# every worker's heartbeat-measured footprint (max(MLX active, weights +
+# KV pool) + MLX cache) is charged against it. A load that would exceed
+# the budget first evicts the least-recently-used model that is unpinned
+# and outside its TTL keep-alive lease (Drain → SIGTERM → SIGKILL after
+# grace); with no evictable model the load is rejected and retried on the
+# next request for it.
 budget_fraction = 0.80
+# Explicit budget in bytes; overrides budget_fraction when set.
+#budget_bytes = 25000000000
 
 [defaults]
 max_batch_tokens = 8192
@@ -44,7 +53,11 @@ id = "qwen3-14b-4bit"
 path = "mlx-community/Qwen3-14B-4bit" # HF repo id or local path
 worker = "auto"                       # rust | python | auto (rust if arch + quant format supported, else python)
 pinned = true                         # never evicted under memory pressure
-ttl_seconds = 0                       # idle auto-unload; 0 = never
+# Idle keep-alive lease in seconds; 0 = resident forever. A model idle past
+# its ttl auto-unloads (memory returns to the machine budget) and reloads on
+# the next request for it; within the lease it is also protected from LRU
+# eviction. Requests in flight always hold the lease open.
+ttl_seconds = 0
 
 # Optional per-model speculative decoding (SPEC §6.5; rust workers only —
 # a speculative block on a python-routed model is a startup error).

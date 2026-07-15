@@ -67,7 +67,10 @@ pub(crate) const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Registry lookup + worker-status gate shared by every completion-shaped
 /// endpoint: only a Ready worker receives requests; every other state maps
-/// to the matching client-visible error.
+/// to the matching client-visible error. Routing a request counts as use
+/// (LRU position + TTL idle clock), and a request for an Unloaded model is
+/// the on-demand reload trigger (SPEC §2.2): the load starts in the
+/// background while the client gets the retriable `model_loading` error.
 pub(crate) fn ready_entry(state: &AppState, model: &str) -> Result<Arc<ModelEntry>, ApiError> {
     let entry = state
         .registry
@@ -75,8 +78,16 @@ pub(crate) fn ready_entry(state: &AppState, model: &str) -> Result<Arc<ModelEntr
         .cloned()
         .ok_or_else(|| ApiError::model_not_found(model))?;
     match entry.status() {
-        WorkerStatus::Ready => Ok(entry),
+        WorkerStatus::Ready => {
+            state.lifecycle.touch(&entry.id);
+            Ok(entry)
+        }
         WorkerStatus::Starting | WorkerStatus::Stopped => Err(ApiError::model_loading(&entry.id)),
+        WorkerStatus::Unloaded { .. } => {
+            state.lifecycle.request_load(&entry.id);
+            Err(ApiError::model_loading(&entry.id))
+        }
+        WorkerStatus::Draining => Err(ApiError::model_unloading(&entry.id)),
         WorkerStatus::Restarting { .. } => Err(ApiError::worker_crashed(format!(
             "the worker for model '{}' crashed and is restarting; retry shortly",
             entry.id

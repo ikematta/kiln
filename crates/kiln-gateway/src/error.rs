@@ -62,6 +62,17 @@ impl ApiError {
         }
     }
 
+    /// Worker mid-unload (eviction or idle TTL): retriable, distinct from
+    /// loading — the model may come back only on a later request.
+    pub fn model_unloading(model: &str) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "server_error",
+            code: "model_unloading",
+            message: format!("The model '{model}' is being unloaded; retry shortly."),
+        }
+    }
+
     /// Worker died (mid-request or before it): the SPEC §2.2 structured 502
     /// with a retriable code.
     pub fn worker_crashed(message: impl Into<String>) -> Self {

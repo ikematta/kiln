@@ -74,6 +74,10 @@ pub struct MemoryConfig {
     /// Fraction of unified memory the gateway may hand out across workers.
     #[serde(default = "defaults::budget_fraction")]
     pub budget_fraction: f64,
+    /// Explicit machine budget in bytes; overrides `budget_fraction`
+    /// (operator caps and eviction tests need an exact number).
+    #[serde(default)]
+    pub budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -194,6 +198,9 @@ impl KilnConfig {
                 "memory.budget_fraction must be in (0, 1], got {fraction}"
             ));
         }
+        if self.memory.budget_bytes == Some(0) {
+            return invalid("memory.budget_bytes must be non-zero when set".into());
+        }
         let block_size = self.defaults.block_size;
         if !block_size.is_power_of_two() {
             return invalid(format!(
@@ -258,6 +265,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             budget_fraction: defaults::budget_fraction(),
+            budget_bytes: None,
         }
     }
 }

@@ -8,9 +8,10 @@
 //! worker-lifetime totals, so they are exported as gauges (`set`) — they
 //! reset when a worker restarts, exactly like a scraped counter would.
 
-use kiln_proto::v1::WorkerStats;
+use kiln_proto::v1::{MemoryReport, WorkerStats};
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 
 pub struct Metrics {
@@ -36,8 +37,51 @@ pub struct Metrics {
     pub worker_restarts_total: IntCounterVec,
     /// 1 while the worker is Ready, else 0.
     pub worker_up: IntGaugeVec,
+    /// Deliberate unloads by model and reason (`evicted | idle_ttl |
+    /// over_budget`) — SPEC §2.2 memory governance, distinct from crashes.
+    pub worker_unloads_total: IntCounterVec,
+    /// Machine memory budget (SPEC §2.3): total unified memory ×
+    /// `memory.budget_fraction`, or the explicit `memory.budget_bytes`.
+    pub memory_budget_bytes: IntGauge,
+    /// Bytes currently charged against the budget across all workers.
+    pub memory_used_bytes: IntGauge,
     /// Worker `Stats` mirrors, per model.
     pub worker_stats: WorkerStatGauges,
+    /// Heartbeat `MemoryReport` mirrors, per model (SPEC §2.3).
+    pub worker_memory: MemoryGauges,
+}
+
+/// Per-model memory gauges from the heartbeat `MemoryReport`, plus the
+/// derived budget footprint (`crate::lifecycle::footprint_bytes`).
+pub struct MemoryGauges {
+    footprint: IntGaugeVec,
+    weights: IntGaugeVec,
+    kv_pool_allocated: IntGaugeVec,
+    mlx_active: IntGaugeVec,
+    mlx_cache: IntGaugeVec,
+    process_rss: IntGaugeVec,
+}
+
+impl MemoryGauges {
+    /// Applies one heartbeat snapshot for `model`.
+    pub fn record(&self, model: &str, report: &MemoryReport, footprint_bytes: u64) {
+        let set = |gauge: &IntGaugeVec, value: u64| {
+            gauge
+                .with_label_values(&[model])
+                .set(i64::try_from(value).unwrap_or(i64::MAX));
+        };
+        set(&self.footprint, footprint_bytes);
+        set(&self.weights, report.weights_bytes);
+        set(&self.kv_pool_allocated, report.kv_pool_allocated_bytes);
+        set(&self.mlx_active, report.mlx_active_bytes);
+        set(&self.mlx_cache, report.mlx_cache_bytes);
+        set(&self.process_rss, report.process_rss_bytes);
+    }
+
+    /// Zeroes every gauge for `model` (worker exited: unload or crash).
+    pub fn clear(&self, model: &str) {
+        self.record(model, &MemoryReport::default(), 0);
+    }
 }
 
 /// One gauge per re-exported `WorkerStats` field (all labeled `model`).
@@ -152,6 +196,52 @@ impl Metrics {
             "1 while the model's worker is Ready, else 0",
             &["model"],
         )?;
+        let worker_unloads_total = counter(
+            "kiln_worker_unloads_total",
+            "Deliberate worker unloads per model and reason (evicted | idle_ttl | over_budget)",
+            &["model", "reason"],
+        )?;
+        let plain_gauge = |name: &str, help: &str| {
+            let gauge = IntGauge::new(name, help)?;
+            registry.register(Box::new(gauge.clone()))?;
+            Ok::<_, prometheus::Error>(gauge)
+        };
+        let memory_budget_bytes = plain_gauge(
+            "kiln_memory_budget_bytes",
+            "Machine memory budget for all workers (SPEC 2.3)",
+        )?;
+        let memory_used_bytes = plain_gauge(
+            "kiln_memory_used_bytes",
+            "Bytes currently charged against the machine budget",
+        )?;
+        // Heartbeat MemoryReport mirrors (SPEC §2.3), per model.
+        let mem = |name: &str, help: &str| gauge(name, help, &["model"]);
+        let worker_memory = MemoryGauges {
+            footprint: mem(
+                "kiln_worker_memory_bytes",
+                "Budgeted footprint of the worker: max(mlx active, weights + KV pool) + mlx cache",
+            )?,
+            weights: mem(
+                "kiln_worker_weights_bytes",
+                "Weight bytes held by the worker (target + draft)",
+            )?,
+            kv_pool_allocated: mem(
+                "kiln_worker_kv_pool_allocated_bytes",
+                "Preallocated KV pool bytes (target + draft)",
+            )?,
+            mlx_active: mem(
+                "kiln_worker_mlx_active_bytes",
+                "MLX active memory reported by the worker",
+            )?,
+            mlx_cache: mem(
+                "kiln_worker_mlx_cache_bytes",
+                "MLX buffer-cache memory reported by the worker",
+            )?,
+            process_rss: mem(
+                "kiln_worker_process_rss_bytes",
+                "Worker process resident set size",
+            )?,
+        };
         // Worker Stats mirrors (SPEC §5/§2.3). Gauge-typed: worker-lifetime
         // totals that reset with the worker process.
         let stat = |name: &str, help: &str| gauge(name, help, &["model"]);
@@ -225,7 +315,11 @@ impl Metrics {
             completion_tokens_total,
             worker_restarts_total,
             worker_up,
+            worker_unloads_total,
+            memory_budget_bytes,
+            memory_used_bytes,
             worker_stats,
+            worker_memory,
         })
     }
 
@@ -252,6 +346,43 @@ mod tests {
         let text = metrics.encode().expect("encode");
         assert!(text.contains("kiln_http_requests_total"), "{text}");
         assert!(text.contains("kiln_worker_up{model=\"m\"} 1"), "{text}");
+    }
+
+    #[test]
+    fn memory_gauges_record_and_clear() {
+        let metrics = Metrics::new().expect("metrics build");
+        metrics.memory_budget_bytes.set(1000);
+        metrics.memory_used_bytes.set(700);
+        let report = MemoryReport {
+            weights_bytes: 500,
+            kv_pool_allocated_bytes: 100,
+            mlx_active_bytes: 620,
+            mlx_cache_bytes: 80,
+            process_rss_bytes: 900,
+            ..MemoryReport::default()
+        };
+        metrics.worker_memory.record("m", &report, 700);
+        metrics
+            .worker_unloads_total
+            .with_label_values(&["m", "evicted"])
+            .inc();
+        let text = metrics.encode().expect("encode");
+        for needle in [
+            "kiln_memory_budget_bytes 1000",
+            "kiln_memory_used_bytes 700",
+            "kiln_worker_memory_bytes{model=\"m\"} 700",
+            "kiln_worker_weights_bytes{model=\"m\"} 500",
+            "kiln_worker_mlx_cache_bytes{model=\"m\"} 80",
+            "kiln_worker_unloads_total{model=\"m\",reason=\"evicted\"} 1",
+        ] {
+            assert!(text.contains(needle), "missing {needle} in:\n{text}");
+        }
+        metrics.worker_memory.clear("m");
+        let text = metrics.encode().expect("encode");
+        assert!(
+            text.contains("kiln_worker_memory_bytes{model=\"m\"} 0"),
+            "{text}"
+        );
     }
 
     #[test]

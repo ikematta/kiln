@@ -157,12 +157,14 @@ def build_binaries() -> pathlib.Path:
 
 
 @contextlib.contextmanager
-def running_stack(models: list[tuple]):
+def running_stack(models: list[tuple], extra_toml: str = ""):
     """Launches a gateway serving `models` — (id, worker_kind) entries serve
     the pinned test model; (id, worker_kind, path) entries name their own
     model directory (auto-routing tests point at doctored configs); a 4th
     element is extra TOML appended inside the model block (e.g. a
-    [model.speculative] sub-table). Tears down with the leaked-worker
+    [model.speculative] sub-table or `pinned`/`ttl_seconds` keys).
+    `extra_toml` is inserted at top level between [server] and the model
+    blocks (e.g. a [memory] section). Tears down with the leaked-worker
     guard. Callers wait_ready()."""
     binary = build_binaries()
     key_hash = subprocess.run(
@@ -192,6 +194,7 @@ host = "127.0.0.1"
 port = {port}
 runtime_dir = "{runtime_dir}"
 cache_dir = "{runtime_dir}/cache"
+{extra_toml}
 {blocks}
 [[auth.api_keys]]
 name = "e2e"

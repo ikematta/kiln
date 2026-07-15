@@ -5399,3 +5399,118 @@
   eviction with drain, pinning, TTL; budget accounting from heartbeats;
   per-worker admission; INTERACTIVE/BATCH priorities; crash-loop backoff;
   the §8.3 BACKLOG rate-limit/timeout enforcement lands here too).
+
+## [2026-07-14] Phase 9 / part 1 — machine memory budget + model lifecycle supervision — DONE
+- What (commit 9729fd6, PR #26):
+  - NEW crates/kiln-gateway/src/lifecycle.rs — machine-level memory
+    governance (SPEC §2.3): budget = total unified memory (shelled-out
+    `sysctl hw.memsize`; unsafe stays confined to kiln-mlx, same
+    rationale as the supervisor's /bin/kill) × `memory.budget_fraction`,
+    or the NEW explicit `[memory] budget_bytes` override. Each worker is
+    charged `max(mlx_active, weights + kv_pool_allocated) + mlx_cache`
+    from its real heartbeat MemoryReport — every MLX byte counted once,
+    weights+pool as the floor under a runtime that can't report active.
+    Load-time projection = weight bytes on disk (target + draft
+    safetensors); the first post-READY heartbeat replaces it with the
+    measured footprint BEFORE the machine-wide load permit releases, so
+    the next load budgets against real bytes, never stale reservations.
+  - supervisor.rs restructured into a command-driven per-model state
+    machine: idle (Unloaded) → Load → budget acquisition → spawn → READY
+    → monitor. A load that would exceed the budget first evicts the LRU
+    model that is loaded, unpinned, and outside its TTL keep-alive lease
+    — per the SPEC §2.2 ladder: Drain GRACEFUL (30s bound, polled until
+    the worker is empty) → SIGTERM → SIGKILL after 5s grace, all
+    process-group signaled; with no evictable candidate the load is
+    rejected (Unloaded{over budget}). The monitor records memory every
+    heartbeat, counts in-flight work as use, and self-unloads once idle
+    past `ttl_seconds`. Phase 2 crash semantics preserved (exponential
+    backoff, max 3 attempts, STABLE_RESET forgiveness, Failed = manual
+    reset; Failed refuses Load commands) and respawns re-pass the budget
+    gate. Startup loads are sequenced in config order by a bootstrap
+    task, so boot-time eviction is deterministic (LRU clock starts at
+    READY; the load permit alone would leave ordering to task-spawn
+    races).
+  - Lifecycle surfaced end-to-end: WorkerStatus grew Draining +
+    Unloaded{evicted | idle ttl | over budget}; /readyz treats Unloaded
+    as settled (200 — deliberate and reversible); ready_entry touches
+    the LRU/TTL clock on every routed request, 503s `model_unloading`
+    on Draining, and on Unloaded triggers the on-demand background
+    reload while returning the retriable `model_loading` — what makes
+    TTL unload and eviction reversible before the Phase 10 admin API.
+  - Metrics: kiln_memory_budget_bytes, kiln_memory_used_bytes,
+    kiln_worker_memory_bytes + MemoryReport mirrors (weights, kv_pool,
+    mlx_active, mlx_cache, process_rss), kiln_worker_unloads_total
+    {model, reason}. kiln.toml.example documents the budget/eviction/
+    pinning/ttl semantics.
+  - NEW tests/e2e/test_lifecycle.py — 3 real-stack scenarios, budgets
+    placed between measured bounds (dev machine: gemma-3-1b rust worker
+    766MB idle / 1176MB after traffic — the 512-block KV pool allocates
+    lazily on first use; qwen2.5-0.5b 300MB / 486MB; weights 733MB /
+    278MB): (1) three gemma models vs a 2.08GB budget — startup evicts
+    the LRU (alpha); touching charlie-then-bravo and reloading alpha
+    then evicts charlie, NOT the older worker bravo (request recency,
+    not load order), and reloaded alpha serves; (2) a pinned qwen model
+    that is the machine-wide LRU survives eviction pressure that takes
+    the unpinned model instead; (3) a ttl_seconds=10 model auto-unloads
+    on schedule (process gone, gauges zeroed, readyz stays 200) and
+    reloads on demand. All memory assertions read real heartbeat bytes
+    via /metrics — nothing mocked.
+- Decisions:
+  - `ttl_seconds` reads as a keep-alive lease (the task's "unpinned,
+    non-TTL-protected" eviction set): within ttl of last use a model is
+    protected from LRU eviction; past it the supervisor auto-unloads it
+    anyway, and in-flight work holds the lease open (busy heartbeats
+    touch). Pinned = permanent lease.
+  - Budget enforcement is load-time only (SPEC §2.3 "gateway rejects
+    load()"): measured usage can drift over budget as lazily-allocated
+    KV pools and caches grow; continuous-pressure eviction is left for
+    part 2 alongside admission control.
+  - One load at a time machine-wide (lifecycle load permit): budget
+    acquisition can't double-spend headroom, and one GPU only loads one
+    weight set usefully anyway.
+  - Eviction racing a crash resolves cleanly: the backoff wait accepts
+    Unload and cancels the pending restart. The python worker's
+    UNIMPLEMENTED Drain is best-effort — escalate straight to SIGTERM.
+  - Gateway shutdown remains SIGKILL (Phase 2 semantics); the graceful
+    ladder is the eviction contract, not the shutdown contract.
+- Deviations: SPEC §2.3's budget formula says "minus a fixed floor"; no
+  separate floor knob was added — the 1−fraction headroom (20% default)
+  is the floor, and `budget_bytes` covers operators needing an exact
+  cap. Flagged here rather than silently dropped.
+- Acceptance (local, Metal dev machine):
+  ```
+  $ cargo test -p kiln-gateway --lib
+  test result: ok. 52 passed; 0 failed  (new: lifecycle victim selection —
+    pinned/TTL-lease/LRU/Ready-only; footprint math; budget_bytes override;
+    weights-on-disk projection; memory gauges record/clear)
+  $ KILN_TEST_MODELS=... uv run --project tests/e2e pytest tests/e2e
+  82 passed, 2 skipped in 147.29s
+    test_lifecycle.py::test_lru_eviction_order_and_on_demand_reload PASSED
+    test_lifecycle.py::test_pinned_model_survives_eviction_pressure PASSED
+    test_lifecycle.py::test_ttl_idle_model_auto_unloads_and_reloads_on_demand PASSED
+  $ cargo test --workspace                                  -> green (exit 0)
+  $ cargo fmt --all --check                                 -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings   -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean
+  $ ruff check / ruff format --check python/ tests/e2e      -> clean
+  ```
+- CI verification (PR #26, commit 9729fd6, run 29380692612 — ALL FOUR
+  checks pass on the real runners): lint 43s, compile-linux 49s,
+  test-macos-release 4m1s, test-macos 27m30s. On the foreign runner the
+  full e2e suite is 82 passed, 2 skipped in 256s with all three
+  lifecycle scenarios PASSED — the measured-bounds budgets (2.08GB /
+  730MB) held on the CI machine exactly as on the dev machine,
+  confirming the footprint components (packed weights + fixed 512-block
+  KV pool) are device-stable. Advisory golden lane (ADR 0004,
+  permanently non-blocking): the ONLY divergence is the known
+  gemma-3-1b-it-4bit/chat-basic flip — same fixture and class as
+  recorded in the ADR and the P8 closeout; no pattern change -> no
+  action, noted per its protocol.
+- Next: Phase 9 part 2 — INTERACTIVE/BATCH priority classes + preemption
+  ordering, admission control, the §8.3 BACKLOG rate-limit/timeout
+  enforcement, python worker batching upgrade (mlx-lm batch API) if
+  straightforward, the interactive-vs-batch acceptance (flood BATCH,
+  send INTERACTIVE -> interactive TTFT p95 unaffected >2×), and the
+  30-min full-stack soak leak gate. Consider continuous-pressure
+  eviction (usage drift over budget from lazy pools) alongside the
+  admission work.
