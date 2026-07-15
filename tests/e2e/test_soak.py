@@ -84,8 +84,13 @@ Correctness gates, held THROUGHOUT:
     overshoot is measured and reported, not gated.
   - llama-int (pinned, warmed first): never evicted, never
     admission-rejected — its pool growth is 0 after warmup.
-  - Every 503 is a structured insufficient_memory; anything else is a
-    hard failure. Grammar outputs 100% schema-valid.
+  - Every refusal is structured and expected: 503 insufficient_memory /
+    model_loading / model_unloading are counted outcome classes; a 502
+    worker_crashed is tolerated only as the bounded-drain severed tail
+    of a deliberate unload (correlated ±60 s with that model's unload
+    counter, never the pinned model, ≤ SEVERED_MAX per run — SPEC §2.2:
+    Drain is 30 s bounded, then SIGTERM severs stragglers). Anything
+    else is a hard failure. Grammar outputs 100% schema-valid.
   - Interactive requests complete < 90 s even mid-flood (priority
     admission), every gemma burst recovers to a 200 within its window.
 """
@@ -141,7 +146,15 @@ GATE_FULL_MINUTES = 20
 GW_RSS_FINAL_CAP = 160 * 1024 * 1024
 GW_RSS_LATE_DELTA = 20 * 1024 * 1024
 WORKER_RSS_SLOPE_KB_MIN = 1024  # mmap paging of weight files adds noise
-PY_RSS_SLOPE_KB_MIN = 1536  # python GC sawtooth on top
+PY_RSS_CAP = 700 * 1024 * 1024  # evictable python worker: working-set cap
+# Bounded-drain severed tail (SPEC §2.2): a request in flight on a worker
+# being deliberately unloaded gets 30 s of drain (supervisor
+# DRAIN_DEADLINE), then SIGTERM severs the stream and the gateway maps it
+# to a retriable 502 worker_crashed. Tolerated ONLY when correlated with
+# an unload of that model (±60 s), never on the pinned model, and at most
+# this many per run (observed: 1 in ~20k requests across four runs, on
+# the slowest runner).
+SEVERED_MAX = 3
 ACTIVE_BAND_BYTES = 2 * 1024 * 1024
 CACHE_CAP_BYTES = 768 * 1024 * 1024
 # Live-object transient allowance at quiesced checkpoints: SSD-flush
@@ -287,6 +300,12 @@ class Ctx:
     gate: threading.Event  # set = generators may run; cleared = quiesce
     flood_active: threading.Event
     hard_errors: list[str] = field(default_factory=list)
+    # 502 worker_crashed responses, held for post-run correlation: an
+    # in-flight request severed by the BOUNDED drain of a deliberate
+    # unload (SPEC §2.2: Drain 30 s -> SIGTERM; the severed stream maps
+    # to a retriable 502) is within contract; anything uncorrelated with
+    # an unload of that model is a hard failure. (model, t, detail).
+    severed: list[tuple[str, float, str]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     started: float = 0.0
 
@@ -355,19 +374,22 @@ class Runner(threading.Thread):
         self.client.close()
 
 
-def classify(runner: Runner, response: httpx.Response, what: str) -> bool:
-    """True when 200. Two structured 503s are EXPECTED under this
-    scenario's deliberate pressure and are counted, not failed:
-    `insufficient_memory` (the part 2 admission gate) and `model_loading`
-    (a request landing while its evicted/TTL'd model reloads on demand —
-    the part 1 "rejected and retried on the next request" path). Any
-    other non-200 is a hard error."""
+def classify(runner: Runner, response: httpx.Response, what: str, model: str) -> bool:
+    """True when 200. Structured refusals that this scenario's deliberate
+    pressure makes EXPECTED are counted, not failed: 503
+    `insufficient_memory` (the part 2 admission gate), 503 `model_loading`
+    (on-demand reload in progress — part 1's "rejected and retried"
+    path), and 503 `model_unloading` (routed during a drain window). A
+    502 `worker_crashed` is held for post-run correlation (see
+    Ctx.severed): tolerated only as the bounded-drain severed tail of a
+    deliberate unload of this exact model. Anything else is a hard
+    error."""
     if response.status_code == 200:
         return True
+    code = None
+    with contextlib.suppress(Exception):
+        code = response.json()["error"]["code"]
     if response.status_code == 503:
-        code = None
-        with contextlib.suppress(Exception):
-            code = response.json()["error"]["code"]
         if code == "insufficient_memory":
             runner.rejects += 1
             runner.last_503 = response.text[:300]
@@ -376,7 +398,17 @@ def classify(runner: Runner, response: httpx.Response, what: str) -> bool:
             runner.bump("loading_retry")
             runner.last_503 = response.text[:300]
             return False
+        if code == "model_unloading":
+            runner.bump("unloading_retry")
+            runner.last_503 = response.text[:300]
+            return False
         runner.error(f"{what}: unexpected 503 ({code}): {response.text[:200]}")
+        return False
+    if response.status_code == 502 and code == "worker_crashed":
+        with runner.ctx.lock:
+            runner.ctx.severed.append(
+                (model, runner.ctx.elapsed(), f"{what}: {response.text[:200]}")
+            )
         return False
     runner.error(f"{what}: HTTP {response.status_code}: {response.text[:200]}")
     return False
@@ -392,7 +424,7 @@ def completion(
     except httpx.HTTPError as exc:
         runner.error(f"completion({model}): {type(exc).__name__}: {exc}")
         return None
-    if not classify(runner, response, f"completion({model})"):
+    if not classify(runner, response, f"completion({model})", model):
         return None
     choice = response.json()["choices"][0]
     if not choice["text"]:
@@ -441,7 +473,7 @@ def stream_completion(
         with runner.client.stream("POST", "/v1/completions", json=body) as r:
             if r.status_code != 200:
                 r.read()
-                classify(runner, r, f"stream({model})")
+                classify(runner, r, f"stream({model})", model)
                 return 0
             for _event in sse_data_lines(r):
                 chunks += 1
@@ -482,7 +514,7 @@ def interactive_fn(runner: Runner) -> None:
         except httpx.HTTPError as exc:
             runner.error(f"chat: {type(exc).__name__}: {exc}")
             return
-        if classify(runner, response, "chat"):
+        if classify(runner, response, "chat", LLAMA):
             runner.oks += 1
     else:
         body = {
@@ -496,7 +528,7 @@ def interactive_fn(runner: Runner) -> None:
             with runner.client.stream("POST", "/v1/chat/completions", json=body) as r:
                 if r.status_code != 200:
                     r.read()
-                    classify(runner, r, "chat-stream")
+                    classify(runner, r, "chat-stream", LLAMA)
                     return
                 for _event in sse_data_lines(r):
                     chunks += 1
@@ -563,7 +595,7 @@ def grammar_fn(runner: Runner) -> None:
     except httpx.HTTPError as exc:
         runner.error(f"grammar: {type(exc).__name__}: {exc}")
         return
-    if not classify(runner, response, "grammar"):
+    if not classify(runner, response, "grammar", LLAMA):
         return
     text = response.json()["choices"][0]["message"]["content"]
     try:
@@ -610,7 +642,7 @@ def anthropic_fn(runner: Runner) -> None:
             ) as r:
                 if r.status_code != 200:
                     r.read()
-                    classify(runner, r, "messages-stream")
+                    classify(runner, r, "messages-stream", LLAMA)
                     return
                 saw_stop = False
                 for line in r.iter_lines():
@@ -629,7 +661,7 @@ def anthropic_fn(runner: Runner) -> None:
         except httpx.HTTPError as exc:
             runner.error(f"messages: {type(exc).__name__}: {exc}")
             return
-        if not classify(runner, response, "messages"):
+        if not classify(runner, response, "messages", LLAMA):
             return
         if not response.json()["content"]:
             runner.error("messages: empty content")
@@ -666,9 +698,25 @@ def spec_fn(runner: Runner) -> None:
 
 def ttl_fn(runner: Runner) -> None:
     # Two touches, then the runner period (> ttl 75 s) lets the lease
-    # expire: one idle_ttl unload + on-demand reload per cycle.
+    # expire: one idle_ttl unload + on-demand reload per cycle. Each
+    # touch retries through 503 model_loading like a real client — on a
+    # slow runner the reload can eat several attempts (CI run
+    # 29408682271 landed 26 loading retries and only 3 successes when
+    # touches gave up after one attempt). But it BACKS OFF on
+    # insufficient_memory: retrying through pressure keeps touching the
+    # model, which keeps its TTL lease alive and removes the lease-expiry
+    # release valve the gemma bursts need to recover (run D starved a
+    # burst for its full 120 s window exactly this way, ttl rejects
+    # 2 -> 50).
     for _ in range(2):
-        completion(runner, TTL, "The capital of France is", 24)
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and not runner.ctx.should_abort():
+            rejects_before = runner.rejects
+            if completion(runner, TTL, "The capital of France is", 24):
+                break
+            if runner.rejects > rejects_before:
+                return  # pressure: stand down for the whole cycle
+            time.sleep(5)
         if runner.ctx.should_abort():
             return
         time.sleep(runner.rng.uniform(2, 5))
@@ -940,6 +988,13 @@ def test_full_stack_soak():
                 "models": {m: model_snapshot(metrics, m) for m in RUST_MODELS},
                 "py_rss": mval(metrics, "kiln_worker_process_rss_bytes", model=PYSMOL)
                 or 0,
+                # Per-model unload+restart totals, for correlating any
+                # severed-stream 502 with the deliberate unload that cut it.
+                "gen": {
+                    m: msum(metrics, "kiln_worker_unloads_total", model=m)
+                    + msum(metrics, "kiln_worker_restarts_total", model=m)
+                    for m in (*RUST_MODELS, PYSMOL)
+                },
             }
             samples.append(row)
             if row["committed"] > row["budget"]:
@@ -997,6 +1052,40 @@ def test_full_stack_soak():
                 gateway_rss=final_gateway_rss,
                 per_model={m: model_snapshot(final_metrics, m) for m in RUST_MODELS},
             )
+        )
+        # Close the correlation window for any 502 severed during the
+        # drain tail (after the sampler loop stopped): without a sample
+        # past the event, its ±60 s unload-counter check cannot see the
+        # unload that cut it.
+        samples.append(
+            {
+                "t": ctx.elapsed(),
+                "gateway_rss": final_gateway_rss,
+                "used": mval(final_metrics, "kiln_memory_used_bytes") or 0,
+                "budget": mval(final_metrics, "kiln_memory_budget_bytes") or 0,
+                "committed": sum(
+                    (mval(final_metrics, "kiln_worker_weights_bytes", model=m) or 0)
+                    + (
+                        mval(
+                            final_metrics,
+                            "kiln_worker_kv_pool_allocated_bytes",
+                            model=m,
+                        )
+                        or 0
+                    )
+                    for m in (*RUST_MODELS, PYSMOL)
+                ),
+                "models": {m: model_snapshot(final_metrics, m) for m in RUST_MODELS},
+                "py_rss": mval(
+                    final_metrics, "kiln_worker_process_rss_bytes", model=PYSMOL
+                )
+                or 0,
+                "gen": {
+                    m: msum(final_metrics, "kiln_worker_unloads_total", model=m)
+                    + msum(final_metrics, "kiln_worker_restarts_total", model=m)
+                    for m in (*RUST_MODELS, PYSMOL)
+                },
+            }
         )
 
         # ------------------------------------------------------------------
@@ -1181,6 +1270,41 @@ def test_full_stack_soak():
         # ------------------------------------------------------------------
         # Gates
         # ------------------------------------------------------------------
+        # Severed-stream 502s: each must be the bounded-drain tail of a
+        # deliberate unload of that model — the per-model unload counter
+        # must move within ±60 s of the error. Uncorrelated ones are hard
+        # errors (with restarts==0 asserted separately, a correlated one
+        # cannot be a hidden crash: crashes increment restarts, unloads
+        # don't).
+        severed_ok = 0
+        for model, when, detail in ctx.severed:
+            if model == LLAMA:
+                failures.append(
+                    f"pinned {LLAMA} had a severed request (it is never "
+                    f"unloaded, so this cannot be a drain tail): {detail}"
+                )
+                continue
+            window = [s for s in samples if abs(s["t"] - when) <= 60]
+            moved = len(window) >= 2 and window[-1]["gen"].get(model, 0) > window[0][
+                "gen"
+            ].get(model, 0)
+            if moved:
+                severed_ok += 1
+                print(
+                    f"severed-by-drain 502 accepted: {model} at t+{when:.1f}s "
+                    f"(unload counter moved in ±60s window)"
+                )
+            else:
+                failures.append(
+                    f"502 worker_crashed NOT correlated with an unload of "
+                    f"{model} at t+{when:.1f}s: {detail}"
+                )
+        if severed_ok > SEVERED_MAX:
+            failures.append(
+                f"{severed_ok} drain-severed requests exceeds the "
+                f"SEVERED_MAX={SEVERED_MAX} bound — eviction is cutting "
+                "in-flight work too often to be the rare bounded tail"
+            )
         if ctx.hard_errors:
             preview = "\n  ".join(ctx.hard_errors[:20])
             failures.append(
@@ -1303,18 +1427,27 @@ def test_full_stack_soak():
                     f"{GW_RSS_LATE_DELTA / 1e6:.0f} MB: leak-shaped, not "
                     f"plateau-shaped)"
                 )
-        # Worker RSS slope gates stay slope-based (both runs passed with
-        # >2.5x margin) — one-sided: a leak GROWS; negative slopes (page
-        # reclaim) are reported above, never failed.
+        # llama's RSS slope gate stays slope-based: pinned means ONE
+        # process generation, so its slope measures the process, not
+        # churn. One-sided: a leak GROWS; negative slopes (page reclaim)
+        # are reported above, never failed.
         if llama_slope > WORKER_RSS_SLOPE_KB_MIN:
             failures.append(
                 f"{LLAMA} RSS slope {llama_slope:+.1f} KiB/min exceeds "
                 f"+{WORKER_RSS_SLOPE_KB_MIN}"
             )
-        if py_points and py_slope > PY_RSS_SLOPE_KB_MIN:
+        # py-smollm is EVICTABLE (9-24 evictions per run): its RSS series
+        # crosses process generations, each ramping ~50 -> ~470 MB as
+        # python mlx materializes weights, so a cross-generation slope
+        # measures churn phase, not leaks (observed -17,490 and +4,716
+        # KiB/min on back-to-back clean runs). Gate the working set
+        # instead: every sample under an absolute cap.
+        py_peak = max((v for _, v in py_points), default=0)
+        if py_peak > PY_RSS_CAP:
             failures.append(
-                f"{PYSMOL} RSS slope {py_slope:+.1f} KiB/min exceeds "
-                f"+{PY_RSS_SLOPE_KB_MIN}"
+                f"{PYSMOL} RSS peaked at {py_peak / 1e6:.1f} MB "
+                f"(> {PY_RSS_CAP / 1e6:.0f} MB cap; warm working set is "
+                "~450-470 MB)"
             )
 
         # Governance sanity.
