@@ -5851,3 +5851,129 @@
   bit-exact and returning every leak counter to its baseline.
 - Next: Phase 10 (jobs, admin UI, packaging, docs) — not started in this
   session per the task instruction.
+
+## [2026-07-15] Phase 9 / Part 3 addendum — BLOCKED (soak outcome contract; admission race needs a ruling)
+- What: the CI run of the previous entry's own recording commit
+  (283749a — docs-only, code identical to the run that passed) FAILED
+  the soak, and the fix cycle surfaced two further findings on the next
+  CI run. Every failure across six 30-min runs (5 local + 2 CI soaks)
+  has been taken to root cause. Harness contract fixes shipped
+  (fe877d9 + follow-up); ONE product-side finding needs a PM ruling
+  before Phase 9's closure stands — see DECISION NEEDED.
+- Finding 1 — bounded-drain severed tail (CI run 29408682271 → fixed
+  contract in fe877d9): one in-flight spec-qwen25 request died with a
+  retriable 502 worker_crashed while restarts stayed 0 (8 deliberate
+  evictions that run). Mechanism pinned in code: routing refuses
+  Draining workers (503 model_unloading) so this was no routing race;
+  tonic Unknown on a streaming RPC = stream severed MID-FLIGHT;
+  eviction's drain is bounded (supervisor.rs DRAIN_DEADLINE 30 s →
+  SIGTERM → SIGKILL, the SPEC §2.2 contract), so a request outliving
+  its evicted worker's drain window is severed, and the dead stream
+  maps to §2.2's retriable 502. Composition of two specced behaviors;
+  once in ~20k requests, slowest runner only. Soak contract: a 502
+  worker_crashed is tolerated ONLY correlated (±60 s) with an unload
+  of that model, never the pinned model, ≤3/run, every instance
+  printed; uncorrelated → hard failure; restarts==0 still gates.
+- Finding 2 — worker_draining, the race's structured leg (CI run
+  29436961038): a request routed while Ready, refused worker-side
+  after its Drain RPC, surfaces 503 worker_draining (gateway
+  error.rs:152). Correct, structured, retriable — added to the counted
+  expected-outcome classes (insufficient_memory, model_loading,
+  model_unloading, worker_draining).
+- Finding 3 — ADMISSION TOCTOU: committed bytes exceeded budget
+  (CI run 29436961038; the subject of the DECISION NEEDED):
+  - Observed: Σ(weights + materialized pools) = 3,906,848,078 >
+    budget 3,900,000,000 (+6.8 MB) for 3 consecutive 10 s samples
+    (~t+1491..1511s), then self-healed by the next unload. State:
+    llama warm (1232.2 MB) + gemma warm (1168.8) + spec warm (958.3)
+    + ttl idle-resident (278.1) + smollm (269.1).
+  - Why this is a real race and not measurement noise: used (ledger) ≥
+    committed always, and every admission requires used + growth ≤
+    budget at decision time — so NO sequence of correctly-priced
+    admissions can produce committed > budget. The state above can
+    only arise because admission priced against HEARTBEAT-LAGGED
+    footprints (1 s cadence, plus load/materialization latency before
+    the next heartbeat lands): rapid admissions across workers jointly
+    overshot. Worst-case schedule bound: one pool commitment + one
+    load footprint (~0.9 GB with this fleet), not the 6.8 MB observed.
+  - This contradicts part 2's recorded acceptance ("ledger stays <=
+    budget throughout" — measured there under sequential scenarios
+    only) and was invisible until this soak measured committed-vs-
+    budget continuously under concurrency. The soak's committed gate
+    remains STRICT pending the ruling: weakening it to tolerate the
+    race would be weakening a test to make it pass (CLAUDE.md).
+- Harness gate corrections (design errors mine, same fix cycle):
+  - py-smollm RSS slope → 700 MB working-set cap: cross-generation
+    slope on an EVICTABLE python worker (11-24 evictions/run, each
+    fresh process ramping ~50 → ~470 MB) measures churn phase, not
+    leaks (read -17,490 and +4,716 KiB/min on adjacent clean runs).
+    Pinned llama keeps its slope gate: one process generation.
+  - ttl class: retries through 503 model_loading (a slow CI runner's
+    reloads ate 26 attempts leaving 3 successes) but BACKS OFF on
+    insufficient_memory — local run D proved retrying through pressure
+    keeps the TTL lease alive and removes the lease-expiry release
+    valve gemma-burst recovery depends on (one burst starved its full
+    120 s window; ttl rejects 2 → 50).
+- Corroborations across the fix-cycle runs, all machines: live objects
+  drained to exactly 437/1401 at final checkpoints everywhere (CI run 4
+  showed two interior 439s that DRAINED — the SSD-flush transient
+  reproduced and returned to floor on a second machine, validating that
+  characterization); canaries bit-identical in every run (llama 27-31
+  samples, spec 17-21); zero crash-restarts in ~120k total requests;
+  pinned model never unloaded/rejected; victim selection unpinned-only
+  throughout.
+- Acceptance (local run E, 30 min, PASS all gates, on the shipped
+  contract):
+  ```
+  $ ./scripts/soak.sh --minutes 30
+  duration: 1822s   PASSED (0:30:36)
+  live objects: llama-int 437 at ALL SIX checkpoints (gen 0);
+    spec-qwen25 1401 at every warm checkpoint through g11
+  gateway 59.2 MB final (cap 160), late delta -11.4 MB (cap +20)
+  llama-int gated slope -288.6 KiB/min; py-smollm working set ~457 MB
+    (cap 700; its window slope read +2,077 KiB/min — would have
+    false-failed the old gate)
+  committed peak 3.84 / 3.90 GB (no overshoot this run); raw used
+    worst +512 MB over (cache-drift gap; six-run envelope +479..+711)
+  canaries 29/29 and 21/21 identical; restarts 0; severed 0;
+  evictions spec 11 + smollm 11; idle_ttl 19; rejects 87;
+  preemptions 8; cancellations 93; prefix 114,441; SSD 2,736;
+  spec totals 4,685/4,685
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- CI verification: run 29404814236 (998df53) remains the fully-green
+  matrix proof (all four checks, soak blocking, 57m53s test-macos).
+  Run 29436961038 (fe877d9) passed lint/compile-linux/
+  test-macos-release and failed ONLY the soak on findings 2 and 3
+  above; finding 2's classification is shipped, finding 3 is the open
+  ruling. The next CI run reds or greens with the race's dice until
+  the ruling lands.
+- Deviations: none beyond the open item below.
+- DECISION NEEDED: how to close the admission TOCTOU (finding 3) —
+  Phase 9's "closed" status from the previous entry is qualified until
+  one of these is picked:
+  - Option A (fix product-side): reservation-based ledger — admission
+    atomically reserves the priced growth/load against the budget and
+    releases the reservation when the heartbeat reflects it
+    (lifecycle.rs; moderate change to the part 2 machinery, needs its
+    own tests). Soak gate stays strict and becomes the regression
+    proof. Cost: new engineering on closed part 2 code; benefit: the
+    recorded "ledger <= budget" guarantee becomes true under
+    concurrency.
+  - Option B (accept bounded transience): record the staleness window
+    as a designed property alongside the cache-drift gap; the soak
+    gates SUSTAINED committed-overshoot (leak-shaped, e.g. > 60 s)
+    and counts+reports transients with their magnitude. Cost: the
+    part 2 acceptance line is weakened from "always" to "except
+    ~heartbeat-window transients bounded by one admission's
+    footprint"; benefit: no new code, CI deterministic.
+  - Option C (strict + tolerate red): keep the strict gate and accept
+    occasional CI failures until Option A is scheduled (e.g. as the
+    Phase 10 opener). Honest but makes a blocking gate
+    non-deterministic, which invites alert fatigue.
+  No option is picked. The branch is otherwise complete: PR #28 holds
+  the soak harness, the outcome contract, and this ledger.
+- Next: the ruling above; then Phase 10 (jobs, admin UI, packaging,
+  docs). Also still open from earlier parts: §8.3 rate-limit/timeout
+  BACKLOG, python-worker batching upgrade, continuous-pressure
+  eviction for cache drift (envelope now +479..+711 MB measured).
