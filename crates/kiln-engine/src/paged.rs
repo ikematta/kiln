@@ -40,6 +40,24 @@ pub struct KvSpec {
     pub block_size: usize,
 }
 
+impl KvSpec {
+    /// Bytes one block occupies across all layers (K and V) at the given
+    /// element size — the single source of the pool-cost formula
+    /// (SPEC §2.3/§6.4 admission projections). [`PagedKv::bytes_per_block`]
+    /// applies it with the materialized dtype; the worker applies it at
+    /// load with the 16-bit element size every rust-servable checkpoint
+    /// computes in (SPEC §7.3: quantized-with-16-bit-scales or f16/bf16
+    /// dense) to report pool geometry before any traffic arrives.
+    pub fn bytes_per_block(&self, element_size: usize) -> u64 {
+        element_size as u64
+            * 2
+            * self.layers as u64
+            * self.kv_heads as u64
+            * self.block_size as u64
+            * self.head_dim as u64
+    }
+}
+
 /// One contiguous run of token rows to write into a single block.
 ///
 /// A step segment of `len` tokens covers at most `len / block_size + 1`
@@ -349,18 +367,13 @@ impl PagedKv {
     /// Bytes one block occupies across all layers (K and V), once the
     /// dtype is known.
     pub fn bytes_per_block(&self) -> u64 {
-        let per_pool = self
+        let element = self
             .pools
             .iter()
             .flatten()
             .next()
-            .map_or(0, |(k, _)| k.dtype().map_or(0, |d| d.size()) as u64);
-        per_pool
-            * 2
-            * self.spec.layers as u64
-            * self.spec.kv_heads as u64
-            * self.spec.block_size as u64
-            * self.spec.head_dim as u64
+            .map_or(0, |(k, _)| k.dtype().map_or(0, |d| d.size()));
+        self.spec.bytes_per_block(element)
     }
 
     /// Drops all pool storage (engine fault recovery); pools reallocate

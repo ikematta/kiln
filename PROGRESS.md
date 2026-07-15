@@ -5514,3 +5514,154 @@
   30-min full-stack soak leak gate. Consider continuous-pressure
   eviction (usage drift over budget from lazy pools) alongside the
   admission work.
+
+## [2026-07-14] Phase 9 / part 2 — priority classes + per-request admission control — DONE
+- What (commit 1f2dd80, PR #27):
+  - INTERACTIVE/BATCH priorities wired end-to-end (SPEC §6.1/§12): all
+    three completion endpoints accept a `priority` request field
+    ("interactive" default | "batch"; anything else is a named 400),
+    validated into the frozen proto's `SubmitRequest.priority` — which the
+    gateway previously hardcoded to INTERACTIVE, making the field accepted
+    but ignored. The engine now consults priority at ADMISSION, not just
+    plan-time victim choice: the WAITING queue is class-ordered
+    (INTERACTIVE ahead of BATCH, FIFO by arrival within a class, preempted
+    requests keep class seniority — engine.rs enqueue_waiting), and
+    admit() escalates from prefix-cache eviction to preempting
+    strictly-lower-priority RUNNING requests in SPEC §6.1 deservingness
+    order, so an INTERACTIVE arrival claims blocks from BATCH decodes
+    instead of waiting for a natural finish. Same-class arrivals never
+    preempt (the newcomer is the least deserving of its class), so
+    uniform-priority traffic schedules exactly as before — golden,
+    batching, and determinism suites see no change.
+  - Per-request memory admission (SPEC §2.3 second level, the §8.2
+    "admission check" step) — closes part 1's continuous-drift gap. The
+    rust worker publishes its paged-pool geometry in GetInfo via two
+    ADDITIVE WorkerInfo fields (`kv_bytes_per_block` = 14,
+    `kv_pool_blocks` = 15; additive changes are explicitly allowed on the
+    frozen proto, no renumber/retype/reuse, SubmitRequest's reserved range
+    untouched; python worker reports 0 = not gated). Bytes/block is
+    computed at load from KvDims with the 16-bit element size every
+    rust-servable checkpoint computes in (SPEC §7.3), single-sourced in
+    KvSpec::bytes_per_block (PagedKv::bytes_per_block now delegates). Per
+    request, the gateway projects the pool growth serving could
+    materialize (full-pool commitment − heartbeat-materialized bytes,
+    saturating: heartbeat pool totals include draft pools) against LIVE
+    headroom (budget − Σ measured footprints) and refuses with a
+    retriable 503 `insufficient_memory` + kiln_admission_rejects_total
+    {model}. The drift part 1 permitted — lazily-materialized KV pools
+    blowing past the budget after every load-time check passed — is now
+    refused at the request that would cause it; a fully-materialized pool
+    projects zero growth and is never gated (its bytes are already in the
+    footprint ledger). ready_entry's LRU touch still precedes the gate, so
+    recency semantics are unchanged. kiln.toml.example documents both.
+  - NEW tests/e2e/test_priority.py — the SPEC §12 Phase 9 acceptance
+    scenario on a real stack: 12 BATCH streams (unique ~1150-token
+    prompts, greedy, 512 max_tokens) saturate llama-3.2-1b's 512-block
+    pool (verified via kv_blocks gauges), then INTERACTIVE probes measure
+    TTFT. Stated threshold: worst flooded TTFT ≤ 2× worst unloaded
+    baseline + 500 ms floor (SPEC's ">2×" bar plus timer-noise floor).
+    Also asserts preemptions occurred and every preempted BATCH stream
+    still finished with `length`.
+  - NEW tests/e2e/test_admission.py — three real-stack scenarios with
+    budgets between part 1's measured bounds (qwen2.5-0.5b: 300 MB idle /
+    486 MB warm / 278 MB weights / 201 MB pool commitment): (1) budget
+    450 MB — the LOAD passes, the first request 503s `insufficient_memory`,
+    the worker stays READY, the pool stays unmaterialized, ledger ≤
+    budget (the per-request check, distinct from part 1's load-time
+    check); (2) budget 850 MB — the identical request serves, the pool
+    materializes, ledger ≤ budget (the gate refuses over-commitment, not
+    traffic); (3) two models under 900 MB — warming one model's pool
+    consumes the headroom, the OTHER model's first request is then
+    refused: per-request admission pricing in another model's
+    post-load drift.
+  - kiln-models/tests/preemption.rs grew scenarios 9 (admission-time
+    preemption: BATCH-saturated pool, late INTERACTIVE's first token ≤ 8
+    steps after submit — measured 2 — with the most recent BATCH request
+    preempted, everything bit-exact vs solo) and 10 (WAITING-queue class
+    order: an INTERACTIVE arrival is served before an earlier-queued BATCH
+    request without preempting the same-class runner).
+- Decisions:
+  - Priority surfaces as a request-body extension field on all three
+    endpoints (OpenAI ignores unknown fields, so clients can send it
+    unconditionally); OpenAI's `service_tier` was not overloaded — its
+    semantics (uptime tiers) are not preemption classes.
+  - The admission gate lives in the gateway: it owns the budget and the
+    live footprint ledger, and SPEC §8.2 places an "admission check" in
+    the request path. Worker-local admission (queue on free blocks,
+    in-band OOM_REJECTED for never-fits) is unchanged Phase 4 behavior.
+  - Over-headroom requests are REJECTED (retriable 503), not queued or
+    eviction-triggering — per the task ("reject or queue"); rejection
+    keeps the gate O(1) and the retry loop client-visible. Residual gap,
+    documented: cache-only drift on fully-materialized pools has no
+    admission lever (growth = 0); that remains for continuous-pressure
+    eviction, still open alongside §8.3.
+  - Pool-growth projection is the materialization delta, not
+    tokens×bytes: MLX pools materialize per-layer on first write, so any
+    first request materializes the whole pool — a token-proportional
+    projection would be fiction. The e2e asserts the projected number
+    against real post-traffic heartbeat bytes.
+  - Two pre-existing test scenarios asserted behavior this task was
+    explicitly assigned to change; updated with rationale, NOT silently
+    weakened (CLAUDE.md rule): (a) preemption.rs scenario 5 pinned the
+    pre-Phase-9 thrash dynamics — a preempted BATCH request resumed at
+    the first free block and was re-preempted by each next INTERACTIVE
+    arrival (`preemptions >= 2`); class-ordered admission makes it yield
+    once and queue behind the arrivals (now asserts `preemptions == 1`);
+    its bit-exactness and liveness clauses are unchanged and still pass.
+    (b) test_lifecycle.py's LRU and pinned flows deliberately over-packed
+    budgets and completed requests by silently drifting past them (the
+    recorded part 1 gap); those exact requests now assert the 503
+    `insufficient_memory` where the drift used to begin, plus ledger ≤
+    budget throughout. Eviction-order, pinning, TTL, and recency
+    assertions are all unchanged.
+- Deviations: none. (Out of this part's scope, still open in Phase 9:
+  the §8.3 rate-limit/timeout BACKLOG, python-worker batching upgrade,
+  continuous-pressure eviction for materialized-pool cache drift.)
+- Acceptance (local, Metal dev machine):
+  ```
+  $ KILN_TEST_MODELS=... uv run --project tests/e2e pytest tests/e2e
+  86 passed, 2 skipped in 287.15s
+    test_priority.py::test_interactive_ttft_survives_batch_flood PASSED
+      baseline TTFTs: [2.462, 2.423, 2.471, 2.453]  (worst 2.471s)
+      flooded  TTFTs: [3.162, 4.377, 2.908, 3.846]  (worst 4.377s)
+      -> 1.77x worst-vs-worst, within the stated 2x + 500ms bar
+         (limit 5.441s); preemptions observed; all 12 BATCH streams
+         finished "length"
+    test_admission.py::test_request_rejected_when_pool_growth_exceeds_headroom PASSED
+    test_admission.py::test_request_admitted_when_headroom_allows PASSED
+    test_admission.py::test_drift_from_one_model_gates_anothers_requests PASSED
+    test_lifecycle.py (all 3, recalibrated for the closed drift gap) PASSED
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --test preemption
+  ok (scenarios 1-10; new: admission preemption — interactive first token
+     2 steps after submit into a saturated BATCH pool, all bit-exact;
+     waiting-queue class order — interactive served before earlier batch)
+  $ cargo test -p kiln-gateway --lib      -> 55 passed (new: priority
+     field validation; admit_request growth/headroom math incl. the
+     cross-model drift case)
+  $ KILN_TEST_MODELS=... cargo test --workspace          -> green (exit 0)
+  $ uv run --project python/kiln_worker_py pytest ...    -> 35 passed
+  $ cargo fmt --all --check                              -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings                 -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean
+  $ ruff check / ruff format --check python/ tests/e2e   -> clean
+  ```
+- CI verification (PR #27, commit 1f2dd80, run 29390381637 — ALL FOUR
+  checks pass on the real runners): lint 49s, compile-linux 46s,
+  test-macos-release 3m19s, test-macos 30m52s. On the foreign GPU the
+  full e2e suite is 86 passed, 2 skipped in 450s, with all three
+  test_admission.py scenarios AND
+  test_priority.py::test_interactive_ttft_survives_batch_flood PASSED —
+  the TTFT bar, the measured-bounds budgets (450/850/900 MB), and the
+  recalibrated lifecycle budgets (2.08 GB / 730 MB) all held on the CI
+  machine, confirming the pool-commitment projection
+  (kv_bytes_per_block × kv_pool_blocks) matches real materialization
+  device-independently. Advisory golden lane (ADR 0004, permanently
+  non-blocking): the ONLY divergence is the known
+  gemma-3-1b-it-4bit/chat-basic flip — same fixture and class as
+  recorded in the ADR and the P8/P9p1 closeouts; no pattern change ->
+  no action, noted per its protocol.
+- Next: Phase 9 part 3 — the 30-minute full-stack soak leak gate that
+  closes the phase. (Also still open in Phase 9, per the part-1 Next
+  list: §8.3 rate-limit/timeout enforcement, python-worker batching
+  upgrade if straightforward, continuous-pressure eviction for
+  materialized-pool cache drift.)

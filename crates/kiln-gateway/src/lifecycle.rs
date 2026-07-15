@@ -57,6 +57,24 @@ pub(crate) struct Slot {
     /// initialized at READY, advanced by [`Lifecycle::touch`] and by the
     /// supervisor while the worker reports in-flight work.
     last_used_ms: AtomicU64,
+    /// Full KV-pool cost once materialized (`WorkerInfo.kv_bytes_per_block
+    /// × kv_pool_blocks`, set at READY): what serving traffic on this
+    /// worker will grow it to. 0 for non-paged workers (python) — no
+    /// projection is possible, so requests are not gated.
+    pool_commitment_bytes: AtomicU64,
+    /// Pool bytes actually materialized so far (heartbeat
+    /// `kv_pool_allocated_bytes`); the commitment minus this is the growth
+    /// a request can still trigger.
+    pool_materialized_bytes: AtomicU64,
+}
+
+/// Why [`Lifecycle::admit_request`] refused a request: admitting it could
+/// grow the worker by `needed_bytes` but only `headroom_bytes` of the
+/// machine budget remain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryDenial {
+    pub needed_bytes: u64,
+    pub headroom_bytes: u64,
 }
 
 pub struct Lifecycle {
@@ -102,6 +120,8 @@ impl Lifecycle {
                     },
                     usage_bytes: AtomicU64::new(0),
                     last_used_ms: AtomicU64::new(0),
+                    pool_commitment_bytes: AtomicU64::new(0),
+                    pool_materialized_bytes: AtomicU64::new(0),
                 },
             );
             receivers.push(cmd_rx);
@@ -186,9 +206,63 @@ impl Lifecycle {
         }
     }
 
-    /// Releases the model's bytes (worker exited: unload or crash).
+    /// Releases the model's bytes (worker exited: unload or crash),
+    /// including its pool projection state.
     pub(crate) fn clear_usage(&self, model_id: &str) {
         self.record_usage(model_id, 0);
+        if let Some(slot) = self.slots.get(model_id) {
+            slot.pool_commitment_bytes.store(0, Ordering::Release);
+            slot.pool_materialized_bytes.store(0, Ordering::Release);
+        }
+    }
+
+    /// Records the worker's full-pool cost (READY-time `WorkerInfo`
+    /// geometry) for [`Lifecycle::admit_request`] projections.
+    pub(crate) fn set_pool_commitment(&self, model_id: &str, bytes: u64) {
+        if let Some(slot) = self.slots.get(model_id) {
+            slot.pool_commitment_bytes.store(bytes, Ordering::Release);
+        }
+    }
+
+    /// Records the pool bytes a heartbeat reports as materialized.
+    pub(crate) fn record_pool_materialized(&self, model_id: &str, bytes: u64) {
+        if let Some(slot) = self.slots.get(model_id) {
+            slot.pool_materialized_bytes.store(bytes, Ordering::Release);
+        }
+    }
+
+    /// Per-request admission check (SPEC §2.3 second level / §8.2
+    /// "admission check", Phase 9 part 2): serving a request on this
+    /// worker may materialize the rest of its lazily-allocated KV pool —
+    /// real machine bytes the load-time budget check never saw. Runs
+    /// against LIVE numbers on every request: projected growth (full-pool
+    /// commitment minus what heartbeats say is already materialized) must
+    /// fit the machine headroom (budget minus the sum of measured
+    /// footprints), so usage drift since load — pools, caches — is what
+    /// the check prices in. Workers without pool geometry (python, or
+    /// GetInfo not yet cached) are not gated; a fully-materialized pool
+    /// projects zero growth and always passes — its bytes are already in
+    /// the footprint sum.
+    pub fn admit_request(&self, model_id: &str) -> Result<(), MemoryDenial> {
+        let Some(slot) = self.slots.get(model_id) else {
+            return Ok(());
+        };
+        let commitment = slot.pool_commitment_bytes.load(Ordering::Acquire);
+        // The heartbeat figure sums draft pools in (proto worker totals),
+        // so it can exceed the target-only commitment: saturate to 0.
+        let growth =
+            commitment.saturating_sub(slot.pool_materialized_bytes.load(Ordering::Acquire));
+        if growth == 0 {
+            return Ok(());
+        }
+        let headroom = self.budget_bytes.saturating_sub(self.used_bytes());
+        if growth <= headroom {
+            return Ok(());
+        }
+        Err(MemoryDenial {
+            needed_bytes: growth,
+            headroom_bytes: headroom,
+        })
     }
 
     fn export_used(&self) {
@@ -404,6 +478,8 @@ mod tests {
                     ttl,
                     usage_bytes: AtomicU64::new(usage),
                     last_used_ms: AtomicU64::new(last_used_ms),
+                    pool_commitment_bytes: AtomicU64::new(0),
+                    pool_materialized_bytes: AtomicU64::new(0),
                 },
             );
             senders.push(status_tx);
@@ -468,6 +544,73 @@ mod tests {
         assert_eq!(lifecycle.pick_victim("loader").as_deref(), Some("draining"));
         senders[0].send_replace(WorkerStatus::Draining);
         assert_eq!(lifecycle.pick_victim("loader"), None);
+    }
+
+    #[test]
+    fn admit_request_gates_on_projected_pool_growth() {
+        // One loaded worker charged 700 of a 1000-byte budget.
+        let (lifecycle, _senders) = lifecycle_with(vec![("m", false, None, 700, 0)]);
+
+        // No pool geometry recorded (python worker / GetInfo pending):
+        // never gated.
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+        // Unknown model: the ready_entry 404 owns that path, not this gate.
+        assert_eq!(lifecycle.admit_request("ghost"), Ok(()));
+
+        // Pool commitment 500, nothing materialized: growth 500 > headroom
+        // 300 — rejected with the numbers.
+        lifecycle.set_pool_commitment("m", 500);
+        assert_eq!(
+            lifecycle.admit_request("m"),
+            Err(MemoryDenial {
+                needed_bytes: 500,
+                headroom_bytes: 300,
+            })
+        );
+
+        // Growth within headroom passes: 250 already materialized leaves
+        // 250 to grow against 300 free.
+        lifecycle.record_pool_materialized("m", 250);
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+
+        // Fully materialized: zero growth always passes — the bytes are in
+        // the footprint sum already, even if the machine is over budget.
+        lifecycle.record_pool_materialized("m", 500);
+        lifecycle.record_usage("m", 1200);
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+
+        // Heartbeat totals include draft pools and can exceed the
+        // target-only commitment: saturates to zero growth, never wraps.
+        lifecycle.record_pool_materialized("m", 900);
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+
+        // Worker gone: projection state clears with the usage.
+        lifecycle.record_pool_materialized("m", 0);
+        lifecycle.clear_usage("m");
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+    }
+
+    #[test]
+    fn admit_request_prices_in_other_models_drift() {
+        // Two workers under a 1000-byte budget: "hot" drifted to 600 bytes
+        // (pool materialized under traffic), "cold" idles at 250 with a
+        // 400-byte pool nothing has touched. The load-time check passed
+        // both; the per-request check must refuse cold's first request.
+        let (lifecycle, _senders) = lifecycle_with(vec![
+            ("hot", false, None, 600, 0),
+            ("cold", false, None, 250, 0),
+        ]);
+        lifecycle.set_pool_commitment("cold", 400);
+        assert_eq!(
+            lifecycle.admit_request("cold"),
+            Err(MemoryDenial {
+                needed_bytes: 400,
+                headroom_bytes: 150,
+            })
+        );
+        // The hot model unloads: headroom recovers, the same request passes.
+        lifecycle.clear_usage("hot");
+        assert_eq!(lifecycle.admit_request("cold"), Ok(()));
     }
 
     #[test]

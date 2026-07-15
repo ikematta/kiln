@@ -104,6 +104,10 @@ impl Worker for WorkerService {
                 .shared
                 .deterministic_decode_width
                 .load(Ordering::Acquire),
+            // Pool geometry for gateway admission projections (SPEC
+            // §2.3/§6.4); set by the engine thread before Ready.
+            kv_bytes_per_block: self.shared.kv_bytes_per_block.load(Ordering::Acquire),
+            kv_pool_blocks: self.shared.kv_pool_blocks.load(Ordering::Acquire),
         }))
     }
 

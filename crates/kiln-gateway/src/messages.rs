@@ -32,8 +32,7 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use kiln_proto::v1::worker_client::WorkerClient;
 use kiln_proto::v1::{
-    Finished, Priority, StoppingParams, SubmitRequest, TokenEvent, TokenIds, submit_request,
-    token_event,
+    Finished, StoppingParams, SubmitRequest, TokenEvent, TokenIds, submit_request, token_event,
 };
 use kiln_tokenize::{ThinkEvent, ThinkParser, ToolCallParser, ToolEvent};
 use tonic::Streaming;
@@ -45,8 +44,8 @@ use crate::anthropic::{
 };
 use crate::app::{AppState, RequestId};
 use crate::chat::{
-    CompletionCtx, MAX_BODY_BYTES, StreamEnd, TextPipeline, ToolRoute, classify_finished,
-    encode_prompt, ready_entry,
+    CompletionCtx, MAX_BODY_BYTES, StreamEnd, TextPipeline, ToolRoute, admit_memory,
+    classify_finished, encode_prompt, ready_entry,
 };
 use crate::error::ApiError;
 use crate::registry::ModelEntry;
@@ -98,6 +97,7 @@ async fn handle(
     request_id: RequestId,
 ) -> Result<Response, ApiError> {
     let entry = ready_entry(&state, &request.model)?;
+    admit_memory(&state, &entry)?;
     let validated = request.validate()?;
 
     let tool_parser = if validated.tools.is_empty() {
@@ -159,7 +159,7 @@ async fn handle(
             ignore_eos: false,
         }),
         grammar: None,
-        priority: Priority::Interactive as i32,
+        priority: validated.priority as i32,
         prefix_hint: 0,
         echo_prompt: false,
     };

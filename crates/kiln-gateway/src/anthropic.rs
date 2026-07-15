@@ -5,11 +5,12 @@
 //! Unknown top-level fields are ignored; unsupported *features* are
 //! rejected with clear 400s rather than silently dropped.
 
-use kiln_proto::v1::SamplingParams;
+use kiln_proto::v1::{Priority, SamplingParams};
 use kiln_tokenize::{ChatMessage, MessageToolCall, MessageToolFunction};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::openai::validate_priority;
 
 // ---------------------------------------------------------------------------
 // Request
@@ -40,6 +41,10 @@ pub struct MessagesRequest {
     /// Accepted and ignored (abuse-tracing hint in the reference API).
     #[allow(dead_code)]
     pub metadata: Option<serde_json::Value>,
+    /// Kiln extension (SPEC §6.1 priority classes): `"interactive"`
+    /// (default) or `"batch"` — BATCH requests are preempted first under
+    /// memory pressure and queue behind INTERACTIVE arrivals.
+    pub priority: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +156,8 @@ pub struct ValidatedMessages {
     /// Tool definitions converted to the OpenAI shape the chat templates
     /// and tool-call parsers consume.
     pub tools: Vec<serde_json::Value>,
+    /// SPEC §6.1 priority class for the worker's scheduler.
+    pub priority: Priority,
     pub stream: bool,
     /// `thinking: {"type": "disabled"}` — render with `enable_thinking=false`.
     pub thinking_disabled: bool,
@@ -272,6 +279,7 @@ impl MessagesRequest {
             max_tokens,
             stop_sequences: self.stop_sequences.clone().unwrap_or_default(),
             tools,
+            priority: validate_priority(self.priority.as_deref())?,
             stream: self.stream,
             thinking_disabled,
         })

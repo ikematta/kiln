@@ -429,10 +429,16 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
         }
 
         // 5) Sustained pressure: a BATCH request outcompeted by a stream
-        //    of younger INTERACTIVE arrivals is preempted on every cycle
-        //    but never starved — arrivals are finite, seniority is stable,
-        //    and it resumes onto its solo stream (drain()'s MAX_STEPS
-        //    guard is the liveness bound).
+        //    of younger INTERACTIVE arrivals yields once and then WAITS
+        //    behind them — Phase 9 part 2's class-ordered admission
+        //    (SPEC §6.1) queues the preempted BATCH request after
+        //    interactive arrivals instead of letting it thrash through a
+        //    resume/preempt cycle per arrival (the pre-Phase-9 dynamics
+        //    this scenario originally pinned with `preemptions >= 2`).
+        //    Liveness and correctness are unchanged: arrivals are finite,
+        //    the BATCH request finishes onto its solo stream bit-exact
+        //    (drain()'s MAX_STEPS guard is the liveness bound), and no
+        //    interactive request is ever the victim.
         if scope.runs_device_independent() {
             let mut engine = new_engine(&model, squeeze.clone());
             let (b, b_out) = request(senior, 60, Priority::Batch);
@@ -456,15 +462,16 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
             drain(&mut engine);
             let b_summary = b_out.summary();
             assert_eq!(b_summary.reason, FinishKind::Length);
-            assert!(
-                b_summary.preemptions >= 2,
-                "sustained pressure should preempt the BATCH request on \
-                 every cycle: {b_summary:?}"
+            assert_eq!(
+                b_summary.preemptions, 1,
+                "class-ordered admission should preempt the BATCH request \
+                 exactly once — it queues behind the interactive arrivals \
+                 instead of thrash-resuming into a second preemption: {b_summary:?}"
             );
             assert_eq!(
                 b_out.tokens(),
                 solo_senior,
-                "twice-preempted request did not resume onto its solo stream"
+                "preempted BATCH request did not resume onto its solo stream"
             );
             for (name, out) in [("i1", &i1_out), ("i2", &i2_out)] {
                 let summary = out.summary();
@@ -472,7 +479,10 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
                 assert_eq!(summary.preemptions, 0, "{name} must not be preempted");
                 assert_eq!(out.tokens(), solo_junior, "{name} stream diverged");
             }
-            eprintln!("double preemption under sustained pressure: resumed bit-exact both times");
+            eprintln!(
+                "sustained interactive pressure: BATCH yielded once, queued behind \
+                 both arrivals, resumed bit-exact"
+            );
         }
 
         // 6) Arrival seniority is stable across preemption: after J is
@@ -572,6 +582,147 @@ fn preemption_resumes_bit_exact_and_cancel_is_bounded() {
                 "mid-prefill preempted request did not re-prefill onto its solo stream"
             );
             eprintln!("mid-prefill preemption: junior re-prefilled from scratch, bit-exact");
+        }
+
+        // 9) Admission-time preemption (Phase 9 part 2, SPEC §6.1): two
+        //    BATCH requests saturate the pool mid-decode; an INTERACTIVE
+        //    request arriving THEN must not wait behind them for a natural
+        //    finish — admission preempts the least-deserving BATCH request
+        //    to make room, and the interactive first token arrives within a
+        //    few steps of submission. Everything still bit-exact.
+        if scope.runs_device_independent() {
+            // Pool: 8 blocks (256 slots). A grows to 160 (5 blocks), B to
+            // 81 (3 blocks) — together they own the whole pool mid-decode.
+            let saturating = EngineConfig {
+                num_blocks: 8,
+                prefix_cache: false,
+                ..EngineConfig::default()
+            };
+            let solo_a = solo(&model, saturating.clone(), senior, 60);
+            let solo_b = solo(&model, saturating.clone(), junior, 48);
+            let mut engine = new_engine(&model, saturating.clone());
+            let (a, a_out) = request(senior, 60, Priority::Batch);
+            let (b, b_out) = request(junior, 48, Priority::Batch);
+            engine.submit(a);
+            engine.submit(b);
+            // Drive until the pool is genuinely saturated: both decoding,
+            // fewer free blocks than the interactive needs (2).
+            let mut steps = 0;
+            loop {
+                assert!(steps < MAX_STEPS, "pool never saturated");
+                engine.step().expect("engine step");
+                steps += 1;
+                let (_, free) = engine.kv_blocks();
+                if engine.num_running() == 2 && free < 2 {
+                    break;
+                }
+            }
+            assert_eq!(engine.preemptions(), 0, "saturation alone must not preempt");
+            let (c, c_out) = request(junior, 48, Priority::Interactive);
+            engine.submit(c);
+            let mut ttft_steps = 0;
+            while c_out.tokens.borrow().is_empty() {
+                assert!(
+                    ttft_steps < 8,
+                    "interactive arrival waited behind BATCH decodes \
+                     (admission never preempted; {ttft_steps} steps, no token)"
+                );
+                engine.step().expect("engine step");
+                ttft_steps += 1;
+            }
+            assert!(
+                engine.preemptions() >= 1,
+                "interactive admission should have preempted a BATCH request"
+            );
+            drain(&mut engine);
+            let (a_summary, b_summary, c_summary) =
+                (a_out.summary(), b_out.summary(), c_out.summary());
+            assert_eq!(a_summary.reason, FinishKind::Length);
+            assert_eq!(b_summary.reason, FinishKind::Length);
+            assert_eq!(c_summary.reason, FinishKind::Length);
+            assert_eq!(
+                c_summary.preemptions, 0,
+                "the INTERACTIVE request must never be the victim"
+            );
+            assert!(
+                b_summary.preemptions >= 1,
+                "the most recent BATCH request is the admission victim: {b_summary:?}"
+            );
+            assert_eq!(a_out.tokens(), solo_a, "batch A diverged");
+            assert_eq!(b_out.tokens(), solo_b, "preempted batch B diverged");
+            assert_eq!(c_out.tokens(), solo_b, "interactive C diverged");
+            eprintln!(
+                "admission preemption: interactive first token {ttft_steps} step(s) \
+                 after submit into a saturated BATCH pool, all bit-exact"
+            );
+        }
+
+        // 10) WAITING-queue class order (Phase 9 part 2): with the pool
+        //     owned by a running request, a BATCH request queued first must
+        //     not block a later INTERACTIVE arrival — the interactive is
+        //     admitted first once blocks free up (no preemption involved:
+        //     the runner is INTERACTIVE, same class as the arrival).
+        if scope.runs_device_independent() {
+            // Pool: 6 blocks (192 slots). The runner grows to 148 slots
+            // (5 blocks), so neither waiter fits until it finishes.
+            let solo_r = solo(&model, squeeze.clone(), senior, 48);
+            let mut engine = new_engine(&model, squeeze.clone());
+            let first_tokens: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+            let tracked = |name: &'static str, prompt: &[u32], priority: Priority| {
+                let (mut req, out) = request(prompt, 48, priority);
+                let log = Rc::clone(&first_tokens);
+                let seen = std::cell::Cell::new(false);
+                let mut inner = std::mem::replace(
+                    &mut req.on_event,
+                    Box::new(|_| unreachable!("placeholder sink")),
+                );
+                req.on_event = Box::new(move |event| {
+                    if matches!(event, SeqEvent::Token(_)) && !seen.replace(true) {
+                        log.borrow_mut().push(name);
+                    }
+                    inner(event)
+                });
+                (req, out)
+            };
+            let (r, r_out) = tracked("runner", senior, Priority::Interactive);
+            let (b, b_out) = tracked("batch", &ids[100..200], Priority::Batch);
+            engine.submit(r);
+            engine.submit(b);
+            // Let the runner admit and grow before the interactive arrives,
+            // so the batch request is genuinely queued ahead of it.
+            for _ in 0..4 {
+                engine.step().expect("engine step");
+            }
+            let (i, i_out) = tracked("interactive", &ids[200..283], Priority::Interactive);
+            engine.submit(i);
+            drain(&mut engine);
+            for (name, out) in [
+                ("runner", &r_out),
+                ("batch", &b_out),
+                ("interactive", &i_out),
+            ] {
+                assert_eq!(out.summary().reason, FinishKind::Length, "{name}");
+            }
+            assert_eq!(
+                r_out.summary().preemptions,
+                0,
+                "same-class arrivals must not preempt the runner"
+            );
+            assert_eq!(r_out.tokens(), solo_r, "runner diverged");
+            let order = first_tokens.borrow().clone();
+            let pos = |name| {
+                order
+                    .iter()
+                    .position(|&n| n == name)
+                    .unwrap_or_else(|| panic!("{name} never streamed (order: {order:?})"))
+            };
+            assert!(
+                pos("interactive") < pos("batch"),
+                "INTERACTIVE queued behind an earlier BATCH arrival (order: {order:?})"
+            );
+            eprintln!(
+                "waiting-queue class order: interactive served before earlier batch ({order:?})"
+            );
         }
 
         // 8) Phase 4 closeout: preemption under the batch-16 load shape,
