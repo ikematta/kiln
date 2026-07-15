@@ -120,6 +120,11 @@ message MemoryReport {
   uint64 mlx_peak_bytes = 6;
   uint64 process_rss_bytes = 7;
   uint64 ssd_cache_bytes = 8;       // current cold-tier footprint on disk
+  // Live wrapper-owned mlx-c handles (kiln_mlx::debug::live_objects).
+  // Debug-build rust workers only; 0 in release builds and the python
+  // worker. Signed: a negative value means a double-free and is itself
+  // a reportable fault. Added Phase 9 part 3 (soak leak gate) — additive.
+  int64 mlx_live_objects = 9;
 }
 
 message HealthStatus {

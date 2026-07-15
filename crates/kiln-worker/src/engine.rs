@@ -314,6 +314,10 @@ impl Shared {
             mlx_peak_bytes: kiln_mlx::memory::peak_memory().unwrap_or(0) as u64,
             process_rss_bytes: kiln_mlx::os::process_rss_bytes(),
             ssd_cache_bytes: self.ssd_cache_bytes.load(Ordering::Acquire),
+            // Debug builds only (0 in release): the CLAUDE.md leak-gate
+            // counter, surfaced so the soak harness can watch it return
+            // to baseline across the run (SPEC §11.3).
+            mlx_live_objects: kiln_mlx::debug::live_objects(),
         }
     }
 

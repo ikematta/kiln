@@ -62,6 +62,7 @@ pub struct MemoryGauges {
     kv_pool_allocated: IntGaugeVec,
     mlx_active: IntGaugeVec,
     mlx_cache: IntGaugeVec,
+    mlx_live_objects: IntGaugeVec,
     process_rss: IntGaugeVec,
 }
 
@@ -78,6 +79,10 @@ impl MemoryGauges {
         set(&self.kv_pool_allocated, report.kv_pool_allocated_bytes);
         set(&self.mlx_active, report.mlx_active_bytes);
         set(&self.mlx_cache, report.mlx_cache_bytes);
+        // Signed passthrough: negative (double-free) must stay visible.
+        self.mlx_live_objects
+            .with_label_values(&[model])
+            .set(report.mlx_live_objects);
         set(&self.process_rss, report.process_rss_bytes);
     }
 
@@ -102,6 +107,8 @@ pub struct WorkerStatGauges {
     ssd_reads_total: IntGaugeVec,
     ssd_writes_total: IntGaugeVec,
     ssd_fingerprint_rejects_total: IntGaugeVec,
+    spec_tokens_proposed_total: IntGaugeVec,
+    spec_tokens_accepted_total: IntGaugeVec,
     engine_steps_total: IntGaugeVec,
 }
 
@@ -131,6 +138,14 @@ impl WorkerStatGauges {
         set(
             &self.ssd_fingerprint_rejects_total,
             stats.ssd_fingerprint_rejects_total,
+        );
+        set(
+            &self.spec_tokens_proposed_total,
+            stats.spec_tokens_proposed_total,
+        );
+        set(
+            &self.spec_tokens_accepted_total,
+            stats.spec_tokens_accepted_total,
         );
         set(&self.engine_steps_total, stats.engine_steps_total);
     }
@@ -246,6 +261,10 @@ impl Metrics {
                 "kiln_worker_mlx_cache_bytes",
                 "MLX buffer-cache memory reported by the worker",
             )?,
+            mlx_live_objects: mem(
+                "kiln_worker_mlx_live_objects",
+                "Live wrapper-owned mlx-c handles (debug-build rust workers; 0 otherwise)",
+            )?,
             process_rss: mem(
                 "kiln_worker_process_rss_bytes",
                 "Worker process resident set size",
@@ -306,6 +325,14 @@ impl Metrics {
             ssd_fingerprint_rejects_total: stat(
                 "kiln_worker_ssd_fingerprint_rejects_total",
                 "SSD slabs/slots rejected by fingerprint or verification (worker lifetime)",
+            )?,
+            spec_tokens_proposed_total: stat(
+                "kiln_worker_spec_tokens_proposed_total",
+                "Draft tokens proposed by speculative decoding (worker lifetime)",
+            )?,
+            spec_tokens_accepted_total: stat(
+                "kiln_worker_spec_tokens_accepted_total",
+                "Draft tokens accepted by speculative verify (worker lifetime)",
             )?,
             engine_steps_total: stat(
                 "kiln_worker_engine_steps_total",
@@ -368,6 +395,7 @@ mod tests {
             kv_pool_allocated_bytes: 100,
             mlx_active_bytes: 620,
             mlx_cache_bytes: 80,
+            mlx_live_objects: 42,
             process_rss_bytes: 900,
             ..MemoryReport::default()
         };
@@ -383,6 +411,7 @@ mod tests {
             "kiln_worker_memory_bytes{model=\"m\"} 700",
             "kiln_worker_weights_bytes{model=\"m\"} 500",
             "kiln_worker_mlx_cache_bytes{model=\"m\"} 80",
+            "kiln_worker_mlx_live_objects{model=\"m\"} 42",
             "kiln_worker_unloads_total{model=\"m\",reason=\"evicted\"} 1",
         ] {
             assert!(text.contains(needle), "missing {needle} in:\n{text}");
@@ -403,6 +432,8 @@ mod tests {
             prefix_tokens_reused_total: 2016,
             kv_blocks_free: 448,
             ssd_writes_total: 63,
+            spec_tokens_proposed_total: 96,
+            spec_tokens_accepted_total: 64,
             engine_steps_total: 1234,
             ..WorkerStats::default()
         };
@@ -413,6 +444,8 @@ mod tests {
             "kiln_worker_prefix_tokens_reused_total{model=\"m\"} 2016",
             "kiln_worker_kv_blocks_free{model=\"m\"} 448",
             "kiln_worker_ssd_writes_total{model=\"m\"} 63",
+            "kiln_worker_spec_tokens_proposed_total{model=\"m\"} 96",
+            "kiln_worker_spec_tokens_accepted_total{model=\"m\"} 64",
             "kiln_worker_engine_steps_total{model=\"m\"} 1234",
         ] {
             assert!(text.contains(needle), "missing {needle} in:\n{text}");
