@@ -85,7 +85,8 @@ Correctness gates, held THROUGHOUT:
   - llama-int (pinned, warmed first): never evicted, never
     admission-rejected — its pool growth is 0 after warmup.
   - Every refusal is structured and expected: 503 insufficient_memory /
-    model_loading / model_unloading are counted outcome classes; a 502
+    model_loading / model_unloading / worker_draining (the worker-side
+    drain race) are counted outcome classes; a 502
     worker_crashed is tolerated only as the bounded-drain severed tail
     of a deliberate unload (correlated ±60 s with that model's unload
     counter, never the pinned model, ≤ SEVERED_MAX per run — SPEC §2.2:
@@ -379,7 +380,9 @@ def classify(runner: Runner, response: httpx.Response, what: str, model: str) ->
     pressure makes EXPECTED are counted, not failed: 503
     `insufficient_memory` (the part 2 admission gate), 503 `model_loading`
     (on-demand reload in progress — part 1's "rejected and retried"
-    path), and 503 `model_unloading` (routed during a drain window). A
+    path), 503 `model_unloading` (routed during a drain window), and 503
+    `worker_draining` (routed while Ready, refused worker-side after its
+    Drain RPC — the race's structured leg). A
     502 `worker_crashed` is held for post-run correlation (see
     Ctx.severed): tolerated only as the bounded-drain severed tail of a
     deliberate unload of this exact model. Anything else is a hard
@@ -400,6 +403,14 @@ def classify(runner: Runner, response: httpx.Response, what: str, model: str) ->
             return False
         if code == "model_unloading":
             runner.bump("unloading_retry")
+            runner.last_503 = response.text[:300]
+            return False
+        if code == "worker_draining":
+            # The worker-side leg of the drain race: routed while Ready,
+            # arrived after the Drain RPC; the worker refuses with a
+            # structured retriable (gateway error.rs worker_draining).
+            # First observed on CI run 29436961038.
+            runner.bump("draining_retry")
             runner.last_503 = response.text[:300]
             return False
         runner.error(f"{what}: unexpected 503 ({code}): {response.text[:200]}")
