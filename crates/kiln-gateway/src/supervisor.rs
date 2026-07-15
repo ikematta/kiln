@@ -61,6 +61,12 @@ const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 const TERM_GRACE: Duration = Duration::from_secs(5);
 /// Poll cadence while waiting for a graceful drain to empty the worker.
 const DRAIN_POLL: Duration = Duration::from_millis(250);
+/// Conservative overhead added to the on-disk-weights load projection
+/// (Phase 9 part 3 ruling: reserve high, reconcile down at the first
+/// measured heartbeat). Idle footprints measured 17-33 MB over raw
+/// weight bytes across the pinned fleet; 64 MiB covers that with margin
+/// so admissions racing a load window cannot consume unprojected bytes.
+const LOAD_OVERHEAD_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 
 fn backoff(attempt: u32) -> Duration {
     // 500ms, 1s, 2s, ... capped at 10s.
@@ -142,14 +148,26 @@ impl Supervisor {
                 _ => config.server.python_worker_argv.clone(),
             };
             // Load-time projection (SPEC §2.3): weight bytes on disk for
-            // target + draft. The first post-READY heartbeat replaces it
-            // with the measured footprint.
-            let projected_bytes = lifecycle::weights_bytes_on_disk(&entry.model_path)
+            // target + draft, plus a conservative runtime-overhead margin
+            // (Phase 9 part 3 ruling: projections reserve on the HIGH
+            // side and heartbeats release the difference). Measured idle
+            // footprints run 17-33 MB over raw weight bytes across the
+            // pinned fleet (tokenizer, runtime, small buffers); without
+            // the margin, a request admission racing this load window
+            // could consume that sliver and transiently overshoot. The
+            // first post-READY heartbeat replaces the whole projection
+            // with the measured footprint before the load permit is
+            // released.
+            let weights_bytes = lifecycle::weights_bytes_on_disk(&entry.model_path)
                 + entry
                     .draft_path
                     .as_deref()
                     .map(lifecycle::weights_bytes_on_disk)
                     .unwrap_or(0);
+            let projected_bytes = match weights_bytes {
+                0 => 0,
+                bytes => bytes + LOAD_OVERHEAD_MARGIN_BYTES,
+            };
             if projected_bytes == 0 {
                 tracing::warn!(model = %entry.id, path = %entry.model_path.display(),
                     "no *.safetensors found; load projection is 0 bytes (budget still \
@@ -401,7 +419,10 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
         _ = wait_shutdown(&mut ctx.shutdown) => return RunExit::Shutdown,
     };
     loop {
-        let used = ctx.lifecycle.used_bytes();
+        // Charged, not just used: request-admission reservations awaiting
+        // heartbeat confirmation are real obligations this load must not
+        // double-spend (Phase 9 part 3 reservation ledger).
+        let used = ctx.lifecycle.charged_bytes();
         let budget = ctx.lifecycle.budget_bytes();
         if used.saturating_add(ctx.projected_bytes) <= budget {
             break;
@@ -755,10 +776,14 @@ async fn refresh_info(ctx: &SuperviseCtx, client: &mut WorkerClient<tonic::trans
             }
             // Full-pool cost for per-request admission (SPEC §2.3/§6.4);
             // 0 (no gating) for workers that report no pool geometry.
-            ctx.lifecycle.set_pool_commitment(
-                &entry.id,
-                info.kv_bytes_per_block.saturating_mul(info.kv_pool_blocks),
-            );
+            // Prefer the whole-worker commitment (target + draft pools,
+            // Phase 9 part 3): the target-only product under-projects a
+            // draft-carrying worker by an entire draft pool.
+            let commitment = match info.kv_pool_commitment_bytes {
+                0 => info.kv_bytes_per_block.saturating_mul(info.kv_pool_blocks),
+                bytes => bytes,
+            };
+            ctx.lifecycle.set_pool_commitment(&entry.id, commitment);
             *entry.info.write().await = Some(info);
         }
         other => {

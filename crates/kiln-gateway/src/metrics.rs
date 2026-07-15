@@ -48,6 +48,15 @@ pub struct Metrics {
     pub memory_budget_bytes: IntGauge,
     /// Bytes currently charged against the budget across all workers.
     pub memory_used_bytes: IntGauge,
+    /// Admission reservations not yet confirmed by heartbeats (Phase 9
+    /// part 3): pool growth admitted but not yet visible in worker
+    /// memory reports. Transient by design — drains to 0 as heartbeats
+    /// reconcile.
+    pub memory_reserved_bytes: IntGauge,
+    /// Pool growth observed in heartbeats that NO admission reservation
+    /// covered (bytes, per model). Should stay at zero: any increment
+    /// means memory materialized without being priced — alertable.
+    pub admission_uncovered_bytes_total: IntCounterVec,
     /// Worker `Stats` mirrors, per model.
     pub worker_stats: WorkerStatGauges,
     /// Heartbeat `MemoryReport` mirrors, per model (SPEC §2.3).
@@ -238,6 +247,16 @@ impl Metrics {
             "kiln_memory_used_bytes",
             "Bytes currently charged against the machine budget",
         )?;
+        let memory_reserved_bytes = plain_gauge(
+            "kiln_memory_reserved_bytes",
+            "Admission reservations awaiting heartbeat confirmation (transient)",
+        )?;
+        let admission_uncovered_bytes_total = counter(
+            "kiln_admission_uncovered_bytes_total",
+            "Pool growth observed without a covering admission reservation \
+             (should stay zero; nonzero means unpriced memory materialized)",
+            &["model"],
+        )?;
         // Heartbeat MemoryReport mirrors (SPEC §2.3), per model.
         let mem = |name: &str, help: &str| gauge(name, help, &["model"]);
         let worker_memory = MemoryGauges {
@@ -355,6 +374,8 @@ impl Metrics {
             admission_rejects_total,
             memory_budget_bytes,
             memory_used_bytes,
+            memory_reserved_bytes,
+            admission_uncovered_bytes_total,
             worker_stats,
             worker_memory,
         })

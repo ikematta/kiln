@@ -996,6 +996,7 @@ def test_full_stack_soak():
                 "used": mval(metrics, "kiln_memory_used_bytes") or 0,
                 "budget": mval(metrics, "kiln_memory_budget_bytes") or 0,
                 "committed": committed,
+                "reserved": mval(metrics, "kiln_memory_reserved_bytes") or 0,
                 "models": {m: model_snapshot(metrics, m) for m in RUST_MODELS},
                 "py_rss": mval(metrics, "kiln_worker_process_rss_bytes", model=PYSMOL)
                 or 0,
@@ -1173,11 +1174,20 @@ def test_full_stack_soak():
             worst = max(samples, key=lambda s: s["used"] - s["budget"])
             over = [s for s in samples if s["used"] > s["budget"]]
             peak_committed = max(s["committed"] for s in samples)
+            peak_reserved = max(s.get("reserved", 0) for s in samples)
+            uncovered = sum(
+                v
+                for name, labels, v in final_metrics
+                if name == "kiln_admission_uncovered_bytes_total"
+            )
             print(
                 f"\n-- ledger vs budget --\n"
                 f"committed (weights+pools, the enforced bound): peak "
                 f"{peak_committed / 1e9:.2f} GB of {BUDGET_BYTES / 1e9:.2f} "
-                f"GB budget\nraw used (adds caches/compute buffers): above "
+                f"GB budget\nreservation ledger: peak in-flight "
+                f"{peak_reserved / 1e6:.0f} MB, uncovered growth "
+                f"{uncovered / 1e6:.1f} MB (must be 0)\n"
+                f"raw used (adds caches/compute buffers): above "
                 f"budget in {len(over)}/{len(samples)} samples, worst "
                 f"t+{worst['t']:.0f}s used={worst['used'] / 1e9:.2f} GB "
                 f"(+{(worst['used'] - worst['budget']) / 1e6:.0f} MB) — the "
@@ -1327,6 +1337,12 @@ def test_full_stack_soak():
             failures.append(
                 f"committed bytes (weights+pools) exceeded budget "
                 f"{len(ledger_violations)}x: {ledger_violations[:5]}"
+            )
+        if uncovered > 0:
+            failures.append(
+                f"{uncovered:.0f} bytes of pool growth were never covered "
+                "by an admission reservation (kiln_admission_uncovered_"
+                "bytes_total — unpriced memory materialized)"
             )
         if crashed_states:
             failures.append(f"crashed/unhealthy states: {crashed_states[:5]}")

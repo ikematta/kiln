@@ -57,15 +57,26 @@ pub(crate) struct Slot {
     /// initialized at READY, advanced by [`Lifecycle::touch`] and by the
     /// supervisor while the worker reports in-flight work.
     last_used_ms: AtomicU64,
-    /// Full KV-pool cost once materialized (`WorkerInfo.kv_bytes_per_block
-    /// × kv_pool_blocks`, set at READY): what serving traffic on this
-    /// worker will grow it to. 0 for non-paged workers (python) — no
-    /// projection is possible, so requests are not gated.
+    /// Full KV-pool cost once materialized (whole worker: target + draft
+    /// pools, `WorkerInfo.kv_pool_commitment_bytes`, set at READY): what
+    /// serving traffic on this worker will grow it to. 0 for non-paged
+    /// workers (python) — no projection is possible, so requests are not
+    /// gated.
     pool_commitment_bytes: AtomicU64,
     /// Pool bytes actually materialized so far (heartbeat
     /// `kv_pool_allocated_bytes`); the commitment minus this is the growth
     /// a request can still trigger.
     pool_materialized_bytes: AtomicU64,
+    /// Pool growth ADMITTED but not yet confirmed by a heartbeat (Phase 9
+    /// part 3 reservation ledger): charged against the budget from the
+    /// admission decision onward, so concurrent admissions price against
+    /// reserved-but-unconfirmed bytes instead of heartbeat-lagged
+    /// footprints (the run-29436961038 TOCTOU). Reconciled downward as
+    /// heartbeats report materialization; cleared with the worker. A
+    /// reservation whose request never materializes the pool (cancel,
+    /// error) lingers conservatively — it only ever under-reports
+    /// headroom, and the next served request or unload reconciles it.
+    pool_reserved_bytes: AtomicU64,
 }
 
 /// Why [`Lifecycle::admit_request`] refused a request: admitting it could
@@ -86,6 +97,11 @@ pub struct Lifecycle {
     /// so concurrent loads cannot double-spend the same headroom (and one
     /// GPU only loads one weight set at a time anyway).
     load_permit: tokio::sync::Mutex<()>,
+    /// Serializes admission check-and-reserve (and heartbeat
+    /// reconciliation) so two admissions cannot both read the same
+    /// headroom before either's reservation lands. Held only for
+    /// non-blocking arithmetic — never across await.
+    admission_lock: std::sync::Mutex<()>,
     metrics: Arc<Metrics>,
     epoch: Instant,
 }
@@ -122,6 +138,7 @@ impl Lifecycle {
                     last_used_ms: AtomicU64::new(0),
                     pool_commitment_bytes: AtomicU64::new(0),
                     pool_materialized_bytes: AtomicU64::new(0),
+                    pool_reserved_bytes: AtomicU64::new(0),
                 },
             );
             receivers.push(cmd_rx);
@@ -132,6 +149,7 @@ impl Lifecycle {
                 total_bytes,
                 slots,
                 load_permit: tokio::sync::Mutex::new(()),
+                admission_lock: std::sync::Mutex::new(()),
                 metrics,
                 epoch: Instant::now(),
             },
@@ -147,12 +165,31 @@ impl Lifecycle {
         self.total_bytes
     }
 
-    /// Sum of bytes currently charged against the budget.
+    /// Sum of bytes currently charged against the budget from measured
+    /// footprints (and load-time reservations recorded as usage).
     pub fn used_bytes(&self) -> u64 {
         self.slots
             .values()
             .map(|slot| slot.usage_bytes.load(Ordering::Acquire))
             .sum()
+    }
+
+    /// Admission reservations not yet confirmed by heartbeats.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.slots
+            .values()
+            .map(|slot| slot.pool_reserved_bytes.load(Ordering::Acquire))
+            .sum()
+    }
+
+    /// Everything the budget currently owes: measured/load-reserved usage
+    /// PLUS admitted-but-unconfirmed pool growth. This — not
+    /// [`Self::used_bytes`] — is what every admission decision (request
+    /// growth and load alike) must price against, so decisions racing on
+    /// heartbeat-stale state cannot jointly overshoot (Phase 9 part 3
+    /// ruling, run 29436961038).
+    pub fn charged_bytes(&self) -> u64 {
+        self.used_bytes().saturating_add(self.reserved_bytes())
     }
 
     fn now_ms(&self) -> u64 {
@@ -202,17 +239,19 @@ impl Lifecycle {
     pub(crate) fn record_usage(&self, model_id: &str, bytes: u64) {
         if let Some(slot) = self.slots.get(model_id) {
             slot.usage_bytes.store(bytes, Ordering::Release);
-            self.export_used();
+            self.export_gauges();
         }
     }
 
     /// Releases the model's bytes (worker exited: unload or crash),
-    /// including its pool projection state.
+    /// including its pool projection state and any pending reservation.
     pub(crate) fn clear_usage(&self, model_id: &str) {
         self.record_usage(model_id, 0);
         if let Some(slot) = self.slots.get(model_id) {
             slot.pool_commitment_bytes.store(0, Ordering::Release);
             slot.pool_materialized_bytes.store(0, Ordering::Release);
+            slot.pool_reserved_bytes.store(0, Ordering::Release);
+            self.export_gauges();
         }
     }
 
@@ -224,11 +263,49 @@ impl Lifecycle {
         }
     }
 
-    /// Records the pool bytes a heartbeat reports as materialized.
+    /// Records the pool bytes a heartbeat reports as materialized, and
+    /// reconciles the reservation ledger against the now-confirmed
+    /// reality (Phase 9 part 3 ruling):
+    /// - the reservation shrinks to the growth still outstanding
+    ///   (commitment − materialized) — confirmed bytes are in the
+    ///   footprint now, so holding them reserved would double-charge;
+    ///   over-reservations release the difference the same way;
+    /// - materialization that NO reservation covered is alertable
+    ///   (tracing::warn + kiln_admission_uncovered_bytes_total): memory
+    ///   grew without being priced by an admission, which the ledger is
+    ///   supposed to make impossible.
     pub(crate) fn record_pool_materialized(&self, model_id: &str, bytes: u64) {
-        if let Some(slot) = self.slots.get(model_id) {
-            slot.pool_materialized_bytes.store(bytes, Ordering::Release);
+        let Some(slot) = self.slots.get(model_id) else {
+            return;
+        };
+        let _guard = self
+            .admission_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let commitment = slot.pool_commitment_bytes.load(Ordering::Acquire);
+        let previous = slot.pool_materialized_bytes.load(Ordering::Acquire);
+        let reserved = slot.pool_reserved_bytes.load(Ordering::Acquire);
+        // Growth inside the commitment since the last heartbeat (heartbeat
+        // totals can exceed the commitment only if the projection is
+        // incomplete — that excess is exactly what must alert).
+        let delta = bytes.saturating_sub(previous);
+        if delta > reserved && commitment > 0 {
+            let uncovered = delta - reserved;
+            tracing::warn!(model = %model_id, uncovered_bytes = uncovered,
+                materialized_bytes = bytes, reserved_bytes = reserved,
+                commitment_bytes = commitment,
+                "pool grew beyond its admission reservation — unpriced memory");
+            self.metrics
+                .admission_uncovered_bytes_total
+                .with_label_values(&[model_id])
+                .inc_by(uncovered);
         }
+        slot.pool_materialized_bytes.store(bytes, Ordering::Release);
+        let outstanding = commitment.saturating_sub(bytes);
+        slot.pool_reserved_bytes
+            .store(reserved.min(outstanding), Ordering::Release);
+        drop(_guard);
+        self.export_gauges();
     }
 
     /// Per-request admission check (SPEC §2.3 second level / §8.2
@@ -243,20 +320,38 @@ impl Lifecycle {
     /// GetInfo not yet cached) are not gated; a fully-materialized pool
     /// projects zero growth and always passes — its bytes are already in
     /// the footprint sum.
+    /// Reservation semantics (Phase 9 part 3 ruling, Option A): a passing
+    /// admission RESERVES the projected growth against the budget under
+    /// [`Self::admission_lock`], immediately visible to every concurrent
+    /// decision through [`Self::charged_bytes`] — two admissions racing
+    /// on heartbeat-stale footprints can no longer jointly overshoot.
+    /// Growth already covered by an outstanding reservation (a second
+    /// request on the same still-cold pool) passes without re-reserving:
+    /// the pool materializes once. Heartbeats reconcile reservations in
+    /// [`Self::record_pool_materialized`].
     pub fn admit_request(&self, model_id: &str) -> Result<(), MemoryDenial> {
         let Some(slot) = self.slots.get(model_id) else {
             return Ok(());
         };
+        let _guard = self
+            .admission_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let commitment = slot.pool_commitment_bytes.load(Ordering::Acquire);
-        // The heartbeat figure sums draft pools in (proto worker totals),
-        // so it can exceed the target-only commitment: saturate to 0.
-        let growth =
-            commitment.saturating_sub(slot.pool_materialized_bytes.load(Ordering::Acquire));
+        // Saturating: a heartbeat total exceeding the commitment means an
+        // incomplete projection (alerted in record_pool_materialized) —
+        // never a negative growth.
+        let growth = commitment
+            .saturating_sub(slot.pool_materialized_bytes.load(Ordering::Acquire))
+            .saturating_sub(slot.pool_reserved_bytes.load(Ordering::Acquire));
         if growth == 0 {
             return Ok(());
         }
-        let headroom = self.budget_bytes.saturating_sub(self.used_bytes());
+        let headroom = self.budget_bytes.saturating_sub(self.charged_bytes());
         if growth <= headroom {
+            slot.pool_reserved_bytes.fetch_add(growth, Ordering::AcqRel);
+            drop(_guard);
+            self.export_gauges();
             return Ok(());
         }
         Err(MemoryDenial {
@@ -265,10 +360,13 @@ impl Lifecycle {
         })
     }
 
-    fn export_used(&self) {
+    fn export_gauges(&self) {
         self.metrics
             .memory_used_bytes
             .set(i64::try_from(self.used_bytes()).unwrap_or(i64::MAX));
+        self.metrics
+            .memory_reserved_bytes
+            .set(i64::try_from(self.reserved_bytes()).unwrap_or(i64::MAX));
     }
 
     pub(crate) fn load_permit(&self) -> &tokio::sync::Mutex<()> {
@@ -480,6 +578,7 @@ mod tests {
                     last_used_ms: AtomicU64::new(last_used_ms),
                     pool_commitment_bytes: AtomicU64::new(0),
                     pool_materialized_bytes: AtomicU64::new(0),
+                    pool_reserved_bytes: AtomicU64::new(0),
                 },
             );
             senders.push(status_tx);
@@ -490,6 +589,7 @@ mod tests {
                 total_bytes: None,
                 slots: map,
                 load_permit: tokio::sync::Mutex::new(()),
+                admission_lock: std::sync::Mutex::new(()),
                 metrics,
                 epoch: Instant::now() - Duration::from_secs(3600),
             },
@@ -568,21 +668,36 @@ mod tests {
             })
         );
 
-        // Growth within headroom passes: 250 already materialized leaves
-        // 250 to grow against 300 free.
+        // Growth within headroom passes and is RESERVED (part 3): 250
+        // already materialized leaves 250 to grow against 300 free.
         lifecycle.record_pool_materialized("m", 250);
         assert_eq!(lifecycle.admit_request("m"), Ok(()));
+        assert_eq!(lifecycle.reserved_bytes(), 250);
 
-        // Fully materialized: zero growth always passes — the bytes are in
-        // the footprint sum already, even if the machine is over budget.
+        // Fully materialized: the reservation reconciles away and zero
+        // growth always passes — the bytes are in the footprint sum
+        // already, even if the machine is over budget.
         lifecycle.record_pool_materialized("m", 500);
+        assert_eq!(lifecycle.reserved_bytes(), 0);
         lifecycle.record_usage("m", 1200);
         assert_eq!(lifecycle.admit_request("m"), Ok(()));
 
-        // Heartbeat totals include draft pools and can exceed the
-        // target-only commitment: saturates to zero growth, never wraps.
+        // A heartbeat total EXCEEDING the whole-worker commitment means
+        // the projection was incomplete: growth still saturates to zero
+        // (the admit passes; the bytes are in the footprint), but the
+        // overflow is alertable as uncovered growth. Counter total: the
+        // 250 this test materialized with no admission covering it
+        // (step above) + this 400 overflow — every unpriced byte counts.
         lifecycle.record_pool_materialized("m", 900);
         assert_eq!(lifecycle.admit_request("m"), Ok(()));
+        assert_eq!(
+            lifecycle
+                .metrics
+                .admission_uncovered_bytes_total
+                .with_label_values(&["m"])
+                .get(),
+            650
+        );
 
         // Worker gone: projection state clears with the usage.
         lifecycle.record_pool_materialized("m", 0);
@@ -611,6 +726,104 @@ mod tests {
         // The hot model unloads: headroom recovers, the same request passes.
         lifecycle.clear_usage("hot");
         assert_eq!(lifecycle.admit_request("cold"), Ok(()));
+    }
+
+    #[test]
+    fn concurrent_admissions_cannot_jointly_overshoot() {
+        // The run-29436961038 TOCTOU as arithmetic: two cold models, usage
+        // 250+250 of a 1000 budget, commitments 400 each. Pre-reservation,
+        // both admissions read headroom 500 against heartbeat-stale
+        // footprints and both passed — joint overshoot 300. Now the first
+        // admission's reservation is immediately visible to the second.
+        let (lifecycle, _senders) =
+            lifecycle_with(vec![("a", false, None, 250, 0), ("b", false, None, 250, 0)]);
+        lifecycle.set_pool_commitment("a", 400);
+        lifecycle.set_pool_commitment("b", 400);
+        assert_eq!(lifecycle.admit_request("a"), Ok(()));
+        assert_eq!(lifecycle.reserved_bytes(), 400);
+        assert_eq!(lifecycle.charged_bytes(), 900);
+        assert_eq!(
+            lifecycle.admit_request("b"),
+            Err(MemoryDenial {
+                needed_bytes: 400,
+                headroom_bytes: 100,
+            })
+        );
+        // A refusal reserves nothing.
+        assert_eq!(lifecycle.reserved_bytes(), 400);
+        // A second request on the same still-cold pool rides the
+        // outstanding reservation: admitted, no double charge.
+        assert_eq!(lifecycle.admit_request("a"), Ok(()));
+        assert_eq!(lifecycle.reserved_bytes(), 400);
+    }
+
+    #[test]
+    fn heartbeats_reconcile_reservations() {
+        let (lifecycle, _senders) = lifecycle_with(vec![("m", false, None, 300, 0)]);
+        lifecycle.set_pool_commitment("m", 400);
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+        assert_eq!(lifecycle.reserved_bytes(), 400);
+        assert_eq!(lifecycle.charged_bytes(), 700);
+
+        // Partial materialization: confirmed bytes now live in the
+        // measured footprint; the reservation shrinks to the outstanding
+        // growth — no double counting in either direction.
+        lifecycle.record_pool_materialized("m", 150);
+        lifecycle.record_usage("m", 450);
+        assert_eq!(lifecycle.reserved_bytes(), 250);
+        assert_eq!(lifecycle.charged_bytes(), 700);
+
+        // Full materialization releases the reservation entirely.
+        lifecycle.record_pool_materialized("m", 400);
+        lifecycle.record_usage("m", 700);
+        assert_eq!(lifecycle.reserved_bytes(), 0);
+        assert_eq!(lifecycle.charged_bytes(), 700);
+
+        // Every byte was priced before it materialized: nothing alerted.
+        assert_eq!(
+            lifecycle
+                .metrics
+                .admission_uncovered_bytes_total
+                .with_label_values(&["m"])
+                .get(),
+            0
+        );
+
+        // Worker exit clears usage, projection, and reservation alike.
+        lifecycle.clear_usage("m");
+        assert_eq!(lifecycle.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn uncovered_growth_is_alertable() {
+        let (lifecycle, _senders) = lifecycle_with(vec![("m", false, None, 300, 0)]);
+        lifecycle.set_pool_commitment("m", 400);
+
+        // Pool growth with NO covering reservation (an admission bypass,
+        // or an under-projection): alertable, byte-accurate.
+        lifecycle.record_pool_materialized("m", 100);
+        assert_eq!(
+            lifecycle
+                .metrics
+                .admission_uncovered_bytes_total
+                .with_label_values(&["m"])
+                .get(),
+            100
+        );
+
+        // Growth covered by a reservation is silent.
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+        assert_eq!(lifecycle.reserved_bytes(), 300);
+        lifecycle.record_pool_materialized("m", 400);
+        assert_eq!(
+            lifecycle
+                .metrics
+                .admission_uncovered_bytes_total
+                .with_label_values(&["m"])
+                .get(),
+            100
+        );
+        assert_eq!(lifecycle.reserved_bytes(), 0);
     }
 
     #[test]
