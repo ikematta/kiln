@@ -85,7 +85,7 @@ class Kiln < Formula
   def default_kiln_toml
     <<~TOML
       # Kiln configuration (Homebrew install).
-      # Field reference: #{opt_doc}/CONFIGURATION.md
+      # Field reference: #{opt_share}/doc/kiln/CONFIGURATION.md
       # Annotated example: #{etc}/kiln/kiln.toml.example
 
       [server]
