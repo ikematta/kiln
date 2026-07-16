@@ -393,7 +393,7 @@ mod tests {
             registry,
             lifecycle,
             metrics,
-            auth: Auth::from_config(&config.auth),
+            auth: Auth::from_config(&config.auth).expect("valid auth config"),
             jobs: JobsProxy::external(socket).expect("proxy"),
         });
         app::router(state)

@@ -65,12 +65,14 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_dir = expand_tilde(&config.server.runtime_dir);
     tokio::fs::create_dir_all(&runtime_dir).await?;
 
+    // Auth config errors (malformed admin_token_hash) abort before any
+    // worker process is spawned.
+    let auth = Auth::from_config(&config.auth)?;
     let metrics = Arc::new(Metrics::new()?);
     let (registry, lifecycle, supervisor) = Supervisor::start(&config, Arc::clone(&metrics))?;
     if registry.is_empty() {
         tracing::warn!("no [[model]] entries configured; chat endpoints will 404");
     }
-    let auth = Auth::from_config(&config.auth);
     let jobs = kiln_gateway::admin::JobsProxy::from_config(&config)?;
     let state = Arc::new(AppState {
         registry,
