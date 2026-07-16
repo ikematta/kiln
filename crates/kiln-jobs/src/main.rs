@@ -105,18 +105,23 @@ impl Flags {
 
 fn main() -> ExitCode {
     init_tracing();
-    let mut args = std::env::args().skip(1);
-    let command = args.next();
-    let flags = match parse_flags(args) {
+    // Flags may appear before the subcommand: the gateway's
+    // `server.jobs_argv` is a command *prefix* (e.g. ["kiln-jobs",
+    // "--venv", <dir>]) to which it appends `serve --socket ...` — the
+    // override shape kiln.toml.example documents for packaged installs.
+    let mut flags = match parse_flags(std::env::args().skip(1)) {
         Ok(flags) => flags,
         Err(message) => return usage_error(&message),
     };
-    match command.as_deref() {
-        Some("download") => run(flags, JobKind::Download),
-        Some("quantize") => run(flags, JobKind::Quantize),
-        Some("serve") => run_serve(flags),
-        Some(other) => usage_error(&format!("unknown command '{other}'")),
-        None => usage_error("a command is required"),
+    if flags.positional.is_empty() {
+        return usage_error("a command is required");
+    }
+    let command = flags.positional.remove(0);
+    match command.as_str() {
+        "download" => run(flags, JobKind::Download),
+        "quantize" => run(flags, JobKind::Quantize),
+        "serve" => run_serve(flags),
+        other => usage_error(&format!("unknown command '{other}'")),
     }
 }
 
@@ -228,4 +233,52 @@ fn init_tracing() {
         .with_current_span(false)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_flags;
+
+    fn args(list: &[&str]) -> impl Iterator<Item = String> + use<> {
+        list.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    /// The gateway prepends configured flags to its appended subcommand
+    /// (`jobs_argv = ["kiln-jobs", "--venv", dir]` + `serve --socket ...`),
+    /// so flags must parse regardless of their position relative to the
+    /// subcommand positional.
+    #[test]
+    fn flags_before_subcommand_parse() {
+        let flags = parse_flags(args(&[
+            "--venv",
+            "/opt/venv",
+            "serve",
+            "--socket",
+            "/tmp/s.sock",
+        ]))
+        .expect("flags before the subcommand must parse");
+        assert_eq!(flags.positional, vec!["serve".to_string()]);
+        assert_eq!(
+            flags.venv.as_deref(),
+            Some(std::path::Path::new("/opt/venv"))
+        );
+        assert_eq!(
+            flags.socket.as_deref(),
+            Some(std::path::Path::new("/tmp/s.sock"))
+        );
+    }
+
+    #[test]
+    fn subcommand_first_still_parses() {
+        let flags = parse_flags(args(&["download", "org/repo", "--revision", "abc"]))
+            .expect("canonical order must parse");
+        assert_eq!(
+            flags.positional,
+            vec!["download".to_string(), "org/repo".to_string()]
+        );
+        assert_eq!(flags.revision.as_deref(), Some("abc"));
+    }
 }

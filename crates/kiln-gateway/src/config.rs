@@ -177,6 +177,16 @@ impl KilnConfig {
         Ok(config)
     }
 
+    /// Like [`KilnConfig::load`], but with no config file: built-in
+    /// defaults plus `KILN_` environment overrides. Used by the `kiln`
+    /// CLI when no kiln.toml is found (e.g. `kiln models` against the
+    /// default localhost address).
+    pub fn load_env_only() -> Result<Self, ConfigError> {
+        let config: Self = Figment::new().merge(Self::env_provider()).extract()?;
+        config.validate()?;
+        Ok(config)
+    }
+
     fn env_provider() -> Env {
         Env::prefixed("KILN_")
             .filter(|key| {
@@ -438,6 +448,19 @@ mod tests {
             jail.create_file("bad.toml", "[server]\npython_worker_argv = []\n")?;
             let err = KilnConfig::load("bad.toml").unwrap_err();
             assert!(matches!(err, ConfigError::Invalid(_)));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn load_env_only_gives_defaults_plus_env() {
+        figment::Jail::expect_with(|jail| {
+            let config = KilnConfig::load_env_only().expect("defaults are valid");
+            assert_eq!(config, KilnConfig::default());
+
+            jail.set_env("KILN_SERVER__PORT", "9191");
+            let config = KilnConfig::load_env_only().expect("env override is valid");
+            assert_eq!(config.server.port, 9191);
             Ok(())
         });
     }
