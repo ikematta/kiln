@@ -29,7 +29,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+      # version pinned (like every other toolchain here): an unpinned
+      # setup-uv resolves "latest release" via the GitHub REST API at job
+      # runtime, which both floats the tool and adds an availability
+      # dependency — the 2026-07-16 "Degraded REST API Availability"
+      # incident failed this exact call (runs 29540215158/29540167586).
+      # Bump deliberately, together with the test-macos copy below.
       - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
       - run: uv sync --project python/kiln_worker_py
       - run: uv run --project python/kiln_worker_py ruff check python/ tests/e2e scripts
       - run: uv run --project python/kiln_worker_py ruff format --check python/ tests/e2e scripts
@@ -166,7 +174,10 @@ jobs:
           out=$(cargo run -p kiln-mlx --example smoke)
           echo "smoke output: $out"
           test "$out" = "3.0"
+      # Pinned in lockstep with the lint job's copy (see comment there).
       - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
       - run: uv sync --project python/kiln_worker_py
       - name: Python proto codegen is current
         run: |
