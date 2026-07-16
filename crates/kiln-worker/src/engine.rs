@@ -173,6 +173,12 @@ pub struct Shared {
     /// materializes it.
     pub kv_bytes_per_block: AtomicU64,
     pub kv_pool_blocks: AtomicU64,
+    /// Full pool cost of the WHOLE worker (target + attached draft, proto
+    /// `WorkerInfo.kv_pool_commitment_bytes`): the complete lazily-
+    /// materialized growth the gateway's reservation ledger must price at
+    /// admission (Phase 9 part 3). Target part set with the geometry
+    /// above; the draft part added at drafter attach.
+    pub kv_pool_commitment_bytes: AtomicU64,
     started_at: Instant,
 }
 
@@ -222,6 +228,7 @@ impl Shared {
             deterministic_decode_width: AtomicU32::new(0),
             kv_bytes_per_block: AtomicU64::new(0),
             kv_pool_blocks: AtomicU64::new(0),
+            kv_pool_commitment_bytes: AtomicU64::new(0),
             started_at: Instant::now(),
         }
     }
@@ -314,6 +321,10 @@ impl Shared {
             mlx_peak_bytes: kiln_mlx::memory::peak_memory().unwrap_or(0) as u64,
             process_rss_bytes: kiln_mlx::os::process_rss_bytes(),
             ssd_cache_bytes: self.ssd_cache_bytes.load(Ordering::Acquire),
+            // Debug builds only (0 in release): the CLAUDE.md leak-gate
+            // counter, surfaced so the soak harness can watch it return
+            // to baseline across the run (SPEC §11.3).
+            mlx_live_objects: kiln_mlx::debug::live_objects(),
         }
     }
 
@@ -529,6 +540,15 @@ pub fn engine_main(
     shared
         .kv_pool_blocks
         .store(config.num_blocks as u64, Ordering::Release);
+    shared.kv_pool_commitment_bytes.store(
+        kv_spec
+            .bytes_per_block(2)
+            .saturating_mul(config.num_blocks as u64),
+        Ordering::Release,
+    );
+    // Engine::new consumes config; the drafter attach below still needs
+    // the pool shape for the draft commitment.
+    let (pool_blocks, pool_block_size) = (config.num_blocks, config.block_size);
     let mut engine = match Engine::new(model, dims, config, stream) {
         Ok(engine) => engine,
         Err(err) => {
@@ -547,6 +567,25 @@ pub fn engine_main(
         shared
             .draft_weights_bytes
             .store(memory.weights_bytes, Ordering::Release);
+        // The draft's own pool materializes lazily too (same num_blocks,
+        // its geometry): fold its full cost into the worker commitment so
+        // the gateway's admission reservation prices the WHOLE growth a
+        // request can trigger — a target-only figure under-reserves by an
+        // entire draft pool on the first speculative request.
+        let draft_dims = draft.kv_dims();
+        let draft_spec = kiln_engine::KvSpec {
+            layers: draft_dims.layers,
+            kv_heads: draft_dims.kv_heads,
+            head_dim: draft_dims.head_dim,
+            num_blocks: pool_blocks,
+            block_size: pool_block_size,
+        };
+        shared.kv_pool_commitment_bytes.fetch_add(
+            draft_spec
+                .bytes_per_block(2)
+                .saturating_mul(pool_blocks as u64),
+            Ordering::AcqRel,
+        );
         tracing::info!(
             model = %shared.model_id,
             draft = %draft.model().model_type(),

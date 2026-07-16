@@ -27,6 +27,7 @@ model's drift (~486 MB warm) left only ~114 MB.
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -138,3 +139,109 @@ def test_drift_from_one_model_gates_anothers_requests():
         # never worker damage.
         _, statuses = readyz(stack)
         assert statuses == {"hot": "ready", "cold": "ready"}, statuses
+
+
+def test_concurrent_admissions_cannot_jointly_overshoot():
+    """Phase 9 part 3 addendum, Option A ruling: the admission TOCTOU.
+
+    Two cold models under a budget with headroom for exactly ONE pool
+    growth (the drift scenario's budget, fired CONCURRENTLY instead of
+    sequentially). Before the reservation ledger, both admissions priced
+    against the same heartbeat-lagged footprints and both passed — the
+    machine materialized both pools and overshot the budget by ~100 MB
+    (the CI run 29436961038 shape, +6.8 MB, made deterministic here by
+    sub-millisecond simultaneous requests vs the 1 s heartbeat cadence).
+    With the ledger, the winning admission's reservation is immediately
+    visible to the loser's check: exactly one 200, one structured 503,
+    and committed bytes (weights + materialized pools) NEVER exceed the
+    budget — including transiently, sampled at 200 ms throughout."""
+    path = require(QWEN25)
+    models = [("left", "rust", path), ("right", "rust", path)]
+    memory = f"[memory]\nbudget_bytes = {DRIFT_BUDGET}\n"
+    with running_stack(models, extra_toml=memory) as stack:
+        stack.wait_ready()
+        time.sleep(2)  # measured heartbeats replace the load reservations
+
+        results: dict[str, int] = {}
+        barrier = threading.Barrier(2)
+
+        def fire(model: str) -> None:
+            barrier.wait()
+            results[model] = complete(stack, model).status_code
+
+        committed_samples: list[float] = []
+        stop_polling = threading.Event()
+
+        def poll_committed() -> None:
+            while not stop_polling.is_set():
+                text = stack.metrics_text()
+                committed = sum(
+                    (metric_value(text, "kiln_worker_weights_bytes", model=m) or 0)
+                    + (
+                        metric_value(
+                            text, "kiln_worker_kv_pool_allocated_bytes", model=m
+                        )
+                        or 0
+                    )
+                    for m in ("left", "right")
+                )
+                committed_samples.append(committed)
+                time.sleep(0.2)
+
+        poller = threading.Thread(target=poll_committed, daemon=True)
+        poller.start()
+        threads = [
+            threading.Thread(target=fire, args=(m,), daemon=True)
+            for m in ("left", "right")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        time.sleep(6)  # heartbeats confirm materialization; reservations drain
+        stop_polling.set()
+        poller.join(timeout=10)
+
+        statuses = sorted(results.values())
+        assert statuses == [200, 503], (
+            f"exactly one concurrent admission must win: {results} "
+            "(both 200 = the pre-reservation TOCTOU; both 503 = no headroom "
+            "for even one growth, budget miscalibrated)"
+        )
+
+        # The committed ledger never exceeded the budget, transiently
+        # included — the part 2 "<= budget throughout" claim under real
+        # concurrency.
+        worst = max(committed_samples)
+        assert worst <= DRIFT_BUDGET, (
+            f"committed bytes overshot the budget: {worst:.0f} > "
+            f"{DRIFT_BUDGET} across {len(committed_samples)} samples"
+        )
+
+        # Same pair again: the winner's pool is fully materialized (zero
+        # growth -> 200); the loser still projects growth the machine
+        # cannot hold (503). Deterministic now that decisions are
+        # reservation-serialized.
+        rerun = {m: complete(stack, m).status_code for m in results}
+        for model, first_status in results.items():
+            assert rerun[model] == first_status, (
+                f"outcome flapped on retry: first={results} rerun={rerun}"
+            )
+
+        text = stack.metrics_text()
+        loser = next(m for m, s in results.items() if s == 503)
+        assert metric_value(text, "kiln_admission_rejects_total", model=loser) == 2
+        # Reservations are transient bookkeeping: fully reconciled against
+        # heartbeats once the dust settles.
+        assert metric_value(text, "kiln_memory_reserved_bytes") == 0, (
+            "reservations must drain to zero after heartbeats confirm usage"
+        )
+        # No uncovered growth: every materialized byte was priced by an
+        # admission first.
+        for model in ("left", "right"):
+            assert (
+                metric_value(text, "kiln_admission_uncovered_bytes_total", model=model)
+                is None
+            ), f"pool growth on {model} was never covered by a reservation"
+        _, ready = readyz(stack)
+        assert ready == {"left": "ready", "right": "ready"}, ready

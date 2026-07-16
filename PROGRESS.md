@@ -5665,3 +5665,463 @@
   list: §8.3 rate-limit/timeout enforcement, python-worker batching
   upgrade if straightforward, continuous-pressure eviction for
   materialized-pool cache drift.)
+
+## [2026-07-15] Phase 9 / Part 3 — DONE (closes Phase 9)
+- What:
+  - tests/e2e/test_soak.py: the SPEC §11.3 30-minute full-stack mixed-load
+    soak, run via scripts/soak.sh (the CLAUDE.md-documented interface) and
+    gated by KILN_SOAK_MINUTES so the regular e2e sweep skips it. One
+    gateway, five models, thirteen concurrent traffic classes exercising
+    Phases 4-9 together under sustained load for the first time: pinned
+    llama-3.2-1b (interactive+batch priorities, 12-stream floods, grammar,
+    prefix warm/cold, /v1/messages, client-abort cancellations, greedy
+    canary), qwen2.5-0.5b self-draft speculative pair at gamma 3,
+    TTL-leased qwen2.5 (75 s) and gemma-3-1b (90 s, touched in ~5-min
+    pressure bursts), and the python worker on smollm2-135m-bf16. Budget
+    3.9 GB deliberately over-subscribes the fleet (all-warm ≈ 4.2 GB) so
+    LRU eviction, TTL cycles, and per-request admission 503s run all
+    30 minutes; warmup retries ride the system's own TTL recovery instead
+    of assuming dev-machine margins.
+  - Leak gates tracked THROUGHOUT, not endpoint-compared: 10 s memory
+    samples; quiesced checkpoints every ~6 min asserting the mlx
+    live-object counter back at its drained floor per worker generation
+    (bounded interior excursions only — see below), mlx_active flat
+    (±2 MB), mlx_cache capped; gateway RSS gated on its working set
+    (160 MB cap = 2× measured plateau + bounded second-half delta),
+    worker RSS on one-sided final-third slopes; committed bytes
+    (weights+pools) ≤ budget at every sample.
+  - Correctness gates held throughout: fixed greedy canaries on llama
+    (~60 s) and the speculating model (~75 s) bit-identical every time;
+    zero crash-restarts; pinned model never unloaded/rejected; grammar
+    100% schema-valid; every 503 structured (insufficient_memory |
+    model_loading); interactive < 90 s mid-flood; every gemma burst
+    recovers to a 200.
+  - Wire/metrics support: additive proto field
+    MemoryReport.mlx_live_objects = 9 (the CLAUDE.md debug-build leak
+    counter; 0 in release and the python worker) filled by kiln-worker
+    from kiln_mlx::debug::live_objects() and re-exported as
+    kiln_worker_mlx_live_objects; also re-exported the two WorkerStats
+    speculation counters the gateway polled but dropped
+    (kiln_worker_spec_tokens_{proposed,accepted}_total). Python gen code
+    regenerated.
+  - ci.yml: scripts/soak.sh --minutes 30 as a BLOCKING step at the end of
+    test-macos — in the existing matrix, not a nightly; the ~30 min/PR is
+    the accepted tradeoff per this task's ruling (the ci.yml comment says
+    so and forbids quietly demoting it).
+- Decisions:
+  - Soak speculation pair: qwen2.5-0.5b-4bit self-draft at gamma 3, not
+    the e2e suite's qwen3 8bit←4bit pair. Measured (probe, this date):
+    the qwen3 pair fully warm is 5.03 GB — two 1.88 GB 512-block KV pools
+    (28 layers × 8 KV heads × head_dim 128) on top of 969 MB weights —
+    which cannot coexist with a multi-model fleet inside a CI-runner-
+    sized budget. qwen2.5-0.5b@gamma 3 is inside the ADR 0005 envelope
+    (the ADR itself records its clamp: gqa_factor 7 ⇒ gamma+1 ≤ 4;
+    quantized trunk, head_dim 64, fused SDPA) and self-draft is the
+    standard spec_decode gate shape; fully warm it is 0.98 GB.
+    Speculation is greedy-requests-only by design (Phase 8), so the
+    self-pair's 100% acceptance is expected; draft/verify/rollback
+    machinery still runs on every greedy spec request (4,334 proposals
+    in the acceptance run).
+  - Ledger gate = committed bytes (Σ weights + materialized pools) ≤
+    budget — the invariant load/pool-growth admission actually enforces —
+    NOT raw used ≤ budget. The first soak iteration proved the raw ledger
+    oscillates past budget through MLX cache growth on ~1k-token
+    prefills: exactly the residual gap parts 1-2 recorded (cache-only
+    drift has no admission lever; continuous-pressure eviction still
+    open). The soak quantifies the gap instead of mis-gating it.
+  - Three gate calibrations, each from a diagnosed failure, none a
+    product bug (full narrative in commits 99eaf56/998df53):
+    (a) CI run 29398308457 refused the third warmup with a CORRECT
+    insufficient_memory 503 — the runner's idle footprints are fatter
+    than the dev box's — so warmup retries up to 240 s, riding TTL
+    expiry (gemma's 90 s lease frees ~0.75 GB); 503 model_loading
+    (on-demand reload) and empty-text/finish="stop" (EOS-first) are
+    legitimate outcomes, classified as such.
+    (b) Gateway RSS: two 30-min runs converged on the same ~80 MB
+    saturating working set (+19 MB/3min early collapsing to +1-2), but
+    a macOS page-reclaim dip (-26 MB mid-run) and its re-climb blew a
+    fixed-window slope gate (+667 KiB/min) — so the gateway is gated on
+    the working set itself (160 MB absolute + ≤20 MB second-half
+    delta); worker slope gates were stable (>2.5× margin) and stay.
+    (c) One quiesced checkpoint read llama's live objects at 439 vs the
+    437 floor, returning to 437 at every later checkpoint: engine-thread
+    SSD-flush maintenance (engine.rs flush_entries → read_block_bytes)
+    holds exactly 2 handles (K+V gather) per block mid-copy and drains
+    after traffic stops; the heartbeat thread can sample mid-drain. The
+    gate now requires return-to-floor at each group's last checkpoint
+    with interior excursions ≤ 8 handles — a real leak still fails the
+    floor check. Spec counters are accumulated across worker
+    generations in the sampler (the final generation alone under-counted
+    against 17-21 evictions per run).
+- Deviations: none. SPEC §11.3 "RSS slope ~0 + MLX allocation counter
+  stable" is implemented as the composite above; on the MLX side
+  (bit-flat live objects and mlx_active at drained quiesce) it is
+  strictly stronger than "not obviously growing".
+- Acceptance (local, Metal dev machine — 30-minute acceptance run,
+  PASS all gates; third 30-min run of the session, on the final gates):
+  ```
+  $ ./scripts/soak.sh --minutes 30
+  duration: 1814s   PASSED (1836.49s total)
+  -- quiesced checkpoints (live objects / mlx_active / gen) --
+    llama-int    437 / 1232.1 MB at ALL SIX checkpoints (t+8s ->
+                 t+1814s), generation 0 throughout — bit-flat.
+    spec-qwen25  1401 / 965.0 MB at every warm checkpoint across
+                 generations g0 -> g17 (17 evict/reload cycles,
+                 identical drained baseline every time).
+  -- RSS (report window last 2/3; gates: working-set / final-third) --
+    gateway   74.8 -> 82.2 MB final (cap 160 MB), late delta +3.0 MB
+              (cap +20); slopes +346 (2/3) / +281 (1/3) KiB/min reported
+    llama-int 64.1 -> 69.7 MB, gated slope +114.4 KiB/min (cap +1024)
+    py-smollm gated slope negative (page reclaim; one-sided gate)
+  -- ledger vs budget --
+    committed (weights+pools) peak 3.67 / 3.90 GB — never exceeded
+    raw used worst +539 MB over budget (35/177 samples above) — the
+    recorded continuous-pressure-eviction gap, quantified
+  -- correctness --
+    canary llama 31/31 identical; canary spec 20/20 identical
+    restarts 0 on all five models; pinned llama: 0 unloads, 0 rejects
+    evictions: spec 17, ttl-qwen25 1, burst-gemma 1, py-smollm 24 (all
+    unpinned); idle_ttl unloads: ttl-qwen25 14, burst-gemma 5
+    admission rejects (insufficient_memory): 52, never the pinned model;
+    on-demand reload retries (model_loading): 95; gemma bursts 6/6
+    recovered; preemptions 5; worker-side cancellations 86
+    prefix tokens reused 120,936; SSD writes 2,848
+    speculation run total 4,334 proposed / 4,334 accepted (self-draft
+    greedy accept-all, per ADR 0005/0006 expectations)
+    interactive latency: normal p50 0.29s p95 0.48s; during-flood
+    p50 3.74s p95 8.38s max 8.49s (gate 90s)
+  $ cargo test --workspace                     -> green (exit 0)
+  $ uv run --project python/kiln_worker_py pytest ... -> 35 passed
+  $ cargo fmt --all --check                    -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings           -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> clean
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- CI verification (PR #28): two runs, both part of the record.
+  - First run (commit 99eaf56, run 29398308457): the soak step FAILED at
+    warmup — the CI runner's fatter idle footprints made the third warm
+    request a CORRECT insufficient_memory refusal (the admission gate
+    working as built); lint/compile-linux/test-macos-release all passed,
+    and every pre-soak step of test-macos (workspace tests, model-gated
+    suites, python, full e2e with test_soak properly SKIPPED env-less)
+    was green. Diagnosed as harness calibration, fixed in 998df53
+    (retry warmup + working-set gateway gate + cross-generation spec
+    accounting; Decisions above).
+  - Second run (commit 998df53, run 29404814236): ALL FOUR checks pass —
+    lint 1m13s, compile-linux 46s, test-macos-release 5m09s, test-macos
+    57m53s with the 30-minute soak BLOCKING and green on the runner:
+    ```
+    duration: 1815s   PASS: all gates held
+    live objects: llama-int 437 at ALL SIX checkpoints (gen 0);
+      spec-qwen25 1401 at every warm checkpoint across g0 -> g15 —
+      the SAME drained baselines as the dev machine, device-independent
+    mlx_active: 1232.1 / 965.0 MB flat — identical to dev to 0.1 MB
+    gateway working set: 63.5 MB final (cap 160), late delta +0.1 MB
+    committed peak 3.71 / 3.90 GB; raw worst +601 MB over (same
+      cache-drift gap class as dev: +539..+711 MB across all runs)
+    canaries 28/28 and 17/17 bit-identical; restarts 0; pinned llama
+      0 unloads / 0 rejects; evictions spec 15, py-smollm 14, gemma 1;
+      idle_ttl 20; admission rejects 133 (fatter footprints -> more
+      pressure, all structured, never the pinned model); gemma bursts
+      6/6 recovered; preemptions 3; cancellations 97; prefix reused
+      103,109; SSD writes 2,249; spec run total 3,826/3,826
+    interactive: normal p95 1.39s; during-flood p95 16.25s (slower
+      paravirtual GPU; gate 90s)
+    ```
+    Threshold-margin note: the ttl class landed exactly at its >=8
+    success minimum on CI (slower reloads convert more touches into
+    model_loading retries) — a margin to watch, not a failure.
+    Advisory golden lane (ADR 0004, permanently non-blocking): the ONLY
+    divergence remains gemma-3-1b-it-4bit/chat-basic — same fixture and
+    class as recorded in the ADR and the P8/P9 closeouts; no pattern
+    change -> no action, noted per its protocol.
+- Phase 9 closeout: parts 1-3 delivered machine memory budgeting from
+  real heartbeats, LRU eviction with drain + pinning + TTL leases,
+  crash-loop backoff, INTERACTIVE/BATCH priority classes with
+  preemption-ordered admission, per-request pool-growth admission, and
+  this soak as the standing full-stack leak/correctness gate. Still open
+  (recorded, not silently dropped): §8.3 rate-limit/timeout enforcement
+  BACKLOG; python-worker batching upgrade; continuous-pressure eviction
+  for materialized-pool cache drift — now with a measured magnitude
+  (+539 to +711 MB worst across three 30-min runs under this scenario).
+  With this task the Phase 4-9 correctness arc closes: batching, paging,
+  prefix cache, SSD tier, speculative decoding, structured output,
+  priorities, and memory governance have now run COMPOSED under
+  sustained concurrent multi-tenant load, holding greedy determinism
+  bit-exact and returning every leak counter to its baseline.
+- Next: Phase 10 (jobs, admin UI, packaging, docs) — not started in this
+  session per the task instruction.
+
+## [2026-07-15] Phase 9 / Part 3 addendum — BLOCKED (soak outcome contract; admission race needs a ruling)
+- What: the CI run of the previous entry's own recording commit
+  (283749a — docs-only, code identical to the run that passed) FAILED
+  the soak, and the fix cycle surfaced two further findings on the next
+  CI run. Every failure across six 30-min runs (5 local + 2 CI soaks)
+  has been taken to root cause. Harness contract fixes shipped
+  (fe877d9 + follow-up); ONE product-side finding needs a PM ruling
+  before Phase 9's closure stands — see DECISION NEEDED.
+- Finding 1 — bounded-drain severed tail (CI run 29408682271 → fixed
+  contract in fe877d9): one in-flight spec-qwen25 request died with a
+  retriable 502 worker_crashed while restarts stayed 0 (8 deliberate
+  evictions that run). Mechanism pinned in code: routing refuses
+  Draining workers (503 model_unloading) so this was no routing race;
+  tonic Unknown on a streaming RPC = stream severed MID-FLIGHT;
+  eviction's drain is bounded (supervisor.rs DRAIN_DEADLINE 30 s →
+  SIGTERM → SIGKILL, the SPEC §2.2 contract), so a request outliving
+  its evicted worker's drain window is severed, and the dead stream
+  maps to §2.2's retriable 502. Composition of two specced behaviors;
+  once in ~20k requests, slowest runner only. Soak contract: a 502
+  worker_crashed is tolerated ONLY correlated (±60 s) with an unload
+  of that model, never the pinned model, ≤3/run, every instance
+  printed; uncorrelated → hard failure; restarts==0 still gates.
+- Finding 2 — worker_draining, the race's structured leg (CI run
+  29436961038): a request routed while Ready, refused worker-side
+  after its Drain RPC, surfaces 503 worker_draining (gateway
+  error.rs:152). Correct, structured, retriable — added to the counted
+  expected-outcome classes (insufficient_memory, model_loading,
+  model_unloading, worker_draining).
+- Finding 3 — ADMISSION TOCTOU: committed bytes exceeded budget
+  (CI run 29436961038; the subject of the DECISION NEEDED):
+  - Observed: Σ(weights + materialized pools) = 3,906,848,078 >
+    budget 3,900,000,000 (+6.8 MB) for 3 consecutive 10 s samples
+    (~t+1491..1511s), then self-healed by the next unload. State:
+    llama warm (1232.2 MB) + gemma warm (1168.8) + spec warm (958.3)
+    + ttl idle-resident (278.1) + smollm (269.1).
+  - Why this is a real race and not measurement noise: used (ledger) ≥
+    committed always, and every admission requires used + growth ≤
+    budget at decision time — so NO sequence of correctly-priced
+    admissions can produce committed > budget. The state above can
+    only arise because admission priced against HEARTBEAT-LAGGED
+    footprints (1 s cadence, plus load/materialization latency before
+    the next heartbeat lands): rapid admissions across workers jointly
+    overshot. Worst-case schedule bound: one pool commitment + one
+    load footprint (~0.9 GB with this fleet), not the 6.8 MB observed.
+  - This contradicts part 2's recorded acceptance ("ledger stays <=
+    budget throughout" — measured there under sequential scenarios
+    only) and was invisible until this soak measured committed-vs-
+    budget continuously under concurrency. The soak's committed gate
+    remains STRICT pending the ruling: weakening it to tolerate the
+    race would be weakening a test to make it pass (CLAUDE.md).
+- Harness gate corrections (design errors mine, same fix cycle):
+  - py-smollm RSS slope → 700 MB working-set cap: cross-generation
+    slope on an EVICTABLE python worker (11-24 evictions/run, each
+    fresh process ramping ~50 → ~470 MB) measures churn phase, not
+    leaks (read -17,490 and +4,716 KiB/min on adjacent clean runs).
+    Pinned llama keeps its slope gate: one process generation.
+  - ttl class: retries through 503 model_loading (a slow CI runner's
+    reloads ate 26 attempts leaving 3 successes) but BACKS OFF on
+    insufficient_memory — local run D proved retrying through pressure
+    keeps the TTL lease alive and removes the lease-expiry release
+    valve gemma-burst recovery depends on (one burst starved its full
+    120 s window; ttl rejects 2 → 50).
+- Corroborations across the fix-cycle runs, all machines: live objects
+  drained to exactly 437/1401 at final checkpoints everywhere (CI run 4
+  showed two interior 439s that DRAINED — the SSD-flush transient
+  reproduced and returned to floor on a second machine, validating that
+  characterization); canaries bit-identical in every run (llama 27-31
+  samples, spec 17-21); zero crash-restarts in ~120k total requests;
+  pinned model never unloaded/rejected; victim selection unpinned-only
+  throughout.
+- Acceptance (local run E, 30 min, PASS all gates, on the shipped
+  contract):
+  ```
+  $ ./scripts/soak.sh --minutes 30
+  duration: 1822s   PASSED (0:30:36)
+  live objects: llama-int 437 at ALL SIX checkpoints (gen 0);
+    spec-qwen25 1401 at every warm checkpoint through g11
+  gateway 59.2 MB final (cap 160), late delta -11.4 MB (cap +20)
+  llama-int gated slope -288.6 KiB/min; py-smollm working set ~457 MB
+    (cap 700; its window slope read +2,077 KiB/min — would have
+    false-failed the old gate)
+  committed peak 3.84 / 3.90 GB (no overshoot this run); raw used
+    worst +512 MB over (cache-drift gap; six-run envelope +479..+711)
+  canaries 29/29 and 21/21 identical; restarts 0; severed 0;
+  evictions spec 11 + smollm 11; idle_ttl 19; rejects 87;
+  preemptions 8; cancellations 93; prefix 114,441; SSD 2,736;
+  spec totals 4,685/4,685
+  $ ruff check / ruff format --check python/ tests/e2e -> clean
+  ```
+- CI verification: run 29404814236 (998df53) remains the fully-green
+  matrix proof (all four checks, soak blocking, 57m53s test-macos).
+  Run 29436961038 (fe877d9) passed lint/compile-linux/
+  test-macos-release and failed ONLY the soak on findings 2 and 3
+  above; finding 2's classification is shipped, finding 3 is the open
+  ruling. The next CI run reds or greens with the race's dice until
+  the ruling lands.
+- Deviations: none beyond the open item below.
+- DECISION NEEDED: how to close the admission TOCTOU (finding 3) —
+  Phase 9's "closed" status from the previous entry is qualified until
+  one of these is picked:
+  - Option A (fix product-side): reservation-based ledger — admission
+    atomically reserves the priced growth/load against the budget and
+    releases the reservation when the heartbeat reflects it
+    (lifecycle.rs; moderate change to the part 2 machinery, needs its
+    own tests). Soak gate stays strict and becomes the regression
+    proof. Cost: new engineering on closed part 2 code; benefit: the
+    recorded "ledger <= budget" guarantee becomes true under
+    concurrency.
+  - Option B (accept bounded transience): record the staleness window
+    as a designed property alongside the cache-drift gap; the soak
+    gates SUSTAINED committed-overshoot (leak-shaped, e.g. > 60 s)
+    and counts+reports transients with their magnitude. Cost: the
+    part 2 acceptance line is weakened from "always" to "except
+    ~heartbeat-window transients bounded by one admission's
+    footprint"; benefit: no new code, CI deterministic.
+  - Option C (strict + tolerate red): keep the strict gate and accept
+    occasional CI failures until Option A is scheduled (e.g. as the
+    Phase 10 opener). Honest but makes a blocking gate
+    non-deterministic, which invites alert fatigue.
+  No option is picked. The branch is otherwise complete: PR #28 holds
+  the soak harness, the outcome contract, and this ledger.
+- Next: the ruling above; then Phase 10 (jobs, admin UI, packaging,
+  docs). Also still open from earlier parts: §8.3 rate-limit/timeout
+  BACKLOG, python-worker batching upgrade, continuous-pressure
+  eviction for cache drift (envelope now +479..+711 MB measured).
+
+## [2026-07-15] Phase 9 / Part 3 ruling — DONE (Option A: reservation ledger; Phase 9 closed)
+- Ruling (PM, this date): Option A from the previous entry's DECISION
+  NEEDED — fix the admission TOCTOU product-side with a
+  reservation-based ledger; the soak's strict committed-bytes gate
+  stands and becomes the regression proof. This entry closes that
+  DECISION NEEDED and, with the deterministic CI pass below, closes
+  Phase 9.
+- What (commit 5c7d73d):
+  - Red first: tests/e2e/test_admission.py::
+    test_concurrent_admissions_cannot_jointly_overshoot fires two cold
+    models' first requests simultaneously under the existing
+    DRIFT_BUDGET — the run-29436961038 race as a deterministic repro
+    (sub-ms concurrent admissions vs the 1 s heartbeat cadence).
+    Pre-fix: both admitted (200/200), joint pool materialization
+    overshot the budget. The red run is part of this ledger.
+  - lifecycle.rs reservation ledger: admit_request now RESERVES the
+    projected growth at decision time under an admission lock
+    (non-blocking arithmetic only, never held across await), and every
+    admission decision — request growth and load alike — prices against
+    charged_bytes() = measured usage + outstanding reservations. A
+    racing admission sees the winner's obligation immediately; refusals
+    reserve nothing; a second request on the same still-cold pool rides
+    the outstanding reservation (the pool materializes once). A
+    reservation whose request never materializes (cancel/error) lingers
+    conservatively — it only under-reports headroom — and reconciles on
+    the next served request or unload.
+  - Heartbeat reconciliation (record_pool_materialized, same lock):
+    confirmed bytes shift to the measured footprint and the reservation
+    shrinks to the still-outstanding growth (commitment −
+    materialized), releasing over-reservation difference exactly as the
+    ruling prescribed. Materialization that NO reservation covered is
+    the alertable condition: tracing::warn +
+    kiln_admission_uncovered_bytes_total{model} (bytes), never silent.
+    kiln_memory_reserved_bytes gauges the in-flight total; the soak
+    reports its peak and gates uncovered == 0.
+  - Complete projections, so actual > reserved is truly exceptional:
+    - WorkerInfo.kv_pool_commitment_bytes (additive field 16; python
+      regen included): the WHOLE worker's lazily-materialized pool cost
+      — target + attached draft. The gateway prefers it over the
+      target-only kv_bytes_per_block × kv_pool_blocks product, which
+      under-projected draft-carrying workers by an entire draft pool
+      (201 MB on the soak's qwen2.5 self-pair; the likely main
+      contributor to the observed CI overshoot).
+    - Load projections carry LOAD_OVERHEAD_MARGIN_BYTES = 64 MiB over
+      raw on-disk weight bytes (idle footprints measured 17-33 MB over
+      weights across the pinned fleet), so an admission racing a load
+      window cannot consume unprojected bytes; the first measured
+      heartbeat replaces the whole projection before the load permit
+      releases — reserve high, reconcile down.
+- Deviations: none.
+- Acceptance:
+  ```
+  RED (pre-fix, this session):
+    test_concurrent_admissions_cannot_jointly_overshoot FAILED:
+    "exactly one concurrent admission must win: {'right': 200,
+     'left': 200}" — the TOCTOU, reproduced in 17 s.
+  GREEN (post-fix, local):
+    $ uv run --project tests/e2e pytest tests/e2e/test_admission.py
+    4 passed in 44.19s   (race repro: one 200 / one 503; committed
+    <= budget at every 200 ms sample; reservations drain to 0;
+    kiln_admission_uncovered_bytes_total absent on both models)
+    $ cargo test -p kiln-gateway --lib -> 58 passed (new: joint-
+      overshoot arithmetic, heartbeat reconciliation incl. no-double-
+      count, uncovered-growth alerting byte-accuracy)
+    $ cargo test --workspace -> green (exit 0, 50 suites)
+    $ uv run --project tests/e2e pytest tests/e2e (minus soak)
+      -> 87 passed, 2 skipped in 271 s — the measured-bounds
+      lifecycle/admission budgets all held under the new projections
+      (no recalibration needed: the 64 MiB margin sits inside every
+      calibrated boundary)
+    $ uv run --project python/kiln_worker_py pytest -> 35 passed
+    $ fmt / clippy (default + --no-default-features) / ruff -> clean
+  30-minute soak (local run F, the reservation ledger live), PASS all
+  gates:
+    reservation ledger: peak in-flight 201 MB; uncovered growth 0.0 MB
+    committed (weights+pools) peak 3.64 / 3.90 GB — LOWER than every
+      pre-fix run (3.71-3.84): admissions now price complete
+      obligations, and pool-side races no longer contribute to the raw
+      cache-drift overshoot either (worst +384 MB vs +479..+711 across
+      the six pre-fix runs; that residual is pure mlx-cache drift, the
+      separately-recorded open item)
+    live objects 437 at all six checkpoints (llama, gen 0); spec model
+      flat per generation across 26 evict/reload cycles (churn is up
+      from ~11-17: spec re-warms now honestly need 402 MB, so pressure
+      refuses/evicts them more — sane, and every cycle recovered)
+    canaries 29/29 and 20/20 bit-identical; restarts 0; severed 0;
+    bursts 6/6 recovered; preemptions 8; cancellations 93; prefix
+    reused 114,489; SSD writes 2,713; spec totals 4,073/4,073
+  ```
+- Post-ruling calibration (commit 11cc55e), from the ledger's first CI
+  run (29449124438 — the ledger itself was flawless there: peak
+  in-flight 403 MB, uncovered 0, committed 3.67/3.90; the soak step
+  failed on scenario dynamics):
+  - The spec class stands down 20-30 s after an insufficient_memory
+    refusal: under honest pricing a spec re-warm needs its whole 402 MB
+    double pool, and its 4-8 s retry cadence beat the gemma burst to
+    every headroom slot the TTL valve opened — a harness livelock that
+    starved one burst on the slow runner. Burst windows widened to
+    180 s (a slow-runner recovery legitimately chains eviction ack
+    45 s + TTL expiry ≤75 s + load 10-30 s).
+  - RSS gates are now absolute working-set caps ONLY (gateway 160 MB,
+    pinned worker 1.2 GB, python 700 MB): ten 30-min runs established
+    that every derivative measure aliases macOS page-reclaim timing —
+    fixed-window slopes read -47,308..+3,370 KiB/min and a mid-run-
+    referenced delta -46..+23 MB across runs with identical workloads
+    and bit-flat mlx counters; the pinned worker's RSS breathes
+    36..846 MB with page cache over its 695 MB weight mmap. Slopes and
+    deltas remain computed and reported; fine-grained leak detection
+    is owned by the bit-exact live-object gate, flat mlx_active, the
+    committed/reservation ledgers, and the 1k-iteration leak suites.
+- CI verification (PR #28, commit 11cc55e, run 29456964198): ALL FOUR
+  checks pass — test-macos 61m15s with the 30-minute soak BLOCKING and
+  green on the runner, the race-repro e2e in the blocking sweep, and
+  the reservation ledger live:
+  ```
+  duration: 1816s   PASS: all gates held
+  reservation ledger: peak in-flight 201 MB, uncovered growth 0.0 MB
+  committed (weights+pools) peak 3.67 / 3.90 GB — never exceeded
+  live objects: llama-int 437 at ALL SIX checkpoints (gen 0);
+    spec-qwen25 flat per generation through g11
+  raw used worst +575 MB over (mlx-cache drift, the separate open item)
+  canaries 28/28 and 16/16 bit-identical; restarts 0; bursts 5/5
+  one severed-by-drain 502 at t+724.7s ACCEPTED by its unload-counter
+    correlation — the part 3 outcome contract exercised end-to-end on
+    real hardware and classified correctly
+  interactive during-flood p95 14.77s (slow runner; gate 90 s)
+  Advisory golden lane: the ONLY divergence remains
+    gemma-3-1b-it-4bit/chat-basic (ADR 0004 pattern; no change).
+  ```
+  This is the deterministic pass the ruling demanded: the TOCTOU is
+  structurally impossible (reservations serialize admission decisions),
+  the race repro is a permanent blocking e2e test, and every remaining
+  soak outcome class is contract-classified rather than
+  timing-dependent.
+- Phase 9 closeout (superseding the qualification in the addendum
+  entry): parts 1-3 delivered machine memory budgeting, LRU eviction
+  with drain + pinning + TTL leases, crash-loop backoff,
+  INTERACTIVE/BATCH priorities with preemption-ordered admission,
+  per-request admission now backed by a reservation ledger that holds
+  "committed <= budget" under real concurrency, and the 30-minute
+  full-stack soak as the standing blocking gate proving it all
+  composes. Still open, recorded: §8.3 rate-limit/timeout BACKLOG;
+  python-worker batching upgrade; continuous-pressure eviction for
+  mlx-cache drift (envelope +384 MB worst under the soak scenario with
+  pool races eliminated). The Phase 4-9 correctness arc stands closed.
+- Next: Phase 10 (jobs, admin UI, packaging, docs) — not started, per
+  the task instruction.

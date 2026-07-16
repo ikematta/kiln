@@ -174,3 +174,15 @@ jobs:
         run: |
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
           uv run --project tests/e2e pytest tests/e2e -v
+      # Phase 9 closeout (SPEC §11.3): the 30-minute full-stack mixed-load
+      # soak — leak gates (RSS slope, mlx live-object counter) + periodic
+      # greedy-determinism canaries under sustained multi-tenant pressure.
+      # BLOCKING by decision: the ~30 extra minutes per PR are an accepted
+      # tradeoff at this stage (PROGRESS 2026-07-15); do not move this to a
+      # scheduled/nightly workflow without a PM ruling. Debug binaries on
+      # purpose — the live-object counter is compiled out of release.
+      - name: Full-stack soak (30 min mixed load, SPEC §11.3, blocking)
+        timeout-minutes: 55
+        run: |
+          export KILN_TEST_MODELS="$HOME/.kiln/test-models"
+          ./scripts/soak.sh --minutes 30

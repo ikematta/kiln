@@ -95,6 +95,13 @@ message WorkerInfo {
   // receivers must skip the projection then.
   uint64 kv_bytes_per_block = 14;   // bytes one block occupies across all layers (K+V)
   uint64 kv_pool_blocks = 15;       // total pool capacity in blocks
+  // Full lazily-materialized KV pool cost of the WHOLE worker in bytes:
+  // target pool plus, when a draft model is attached, its pool too —
+  // what serving traffic can grow this worker by beyond its weights.
+  // Supersedes the target-only kv_bytes_per_block × kv_pool_blocks
+  // product for admission projections; receivers should prefer it when
+  // nonzero. Added Phase 9 part 3 (reservation ledger) — additive.
+  uint64 kv_pool_commitment_bytes = 16;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +127,11 @@ message MemoryReport {
   uint64 mlx_peak_bytes = 6;
   uint64 process_rss_bytes = 7;
   uint64 ssd_cache_bytes = 8;       // current cold-tier footprint on disk
+  // Live wrapper-owned mlx-c handles (kiln_mlx::debug::live_objects).
+  // Debug-build rust workers only; 0 in release builds and the python
+  // worker. Signed: a negative value means a double-free and is itself
+  // a reportable fault. Added Phase 9 part 3 (soak leak gate) — additive.
+  int64 mlx_live_objects = 9;
 }
 
 message HealthStatus {

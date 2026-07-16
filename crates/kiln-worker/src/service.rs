@@ -108,6 +108,9 @@ impl Worker for WorkerService {
             // §2.3/§6.4); set by the engine thread before Ready.
             kv_bytes_per_block: self.shared.kv_bytes_per_block.load(Ordering::Acquire),
             kv_pool_blocks: self.shared.kv_pool_blocks.load(Ordering::Acquire),
+            // Whole-worker pool cost (target + draft): the figure the
+            // gateway's reservation ledger prices at admission.
+            kv_pool_commitment_bytes: self.shared.kv_pool_commitment_bytes.load(Ordering::Acquire),
         }))
     }
 
