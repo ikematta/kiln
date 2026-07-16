@@ -6,6 +6,7 @@
 #
 # Layout it installs:
 #   bin/            kiln, kiln-gateway, kiln-worker, kiln-jobs
+#                   + mlx.metallib (MLX's Metal kernels, loaded colocated)
 #   etc/kiln/       kiln.toml (live config; preserved across reinstalls),
 #                   kiln.toml.example (annotated reference)
 #   libexec/        kiln_worker_py/ + kiln_jobs_py/ (uv-synced venvs from the
@@ -64,6 +65,16 @@ class Kiln < Formula
     %w[kiln-cli kiln-gateway kiln-worker kiln-jobs].each do |crate|
       system "cargo", "install", *std_cargo_args(path: "crates/#{crate}")
     end
+
+    # MLX loads its Metal kernel library at runtime by searching next to
+    # the executable first (vendored mlx device.cpp, load_default_library);
+    # its compiled-in fallback path points into this ephemeral build tree.
+    # Without the colocated copy the worker dies on its first array
+    # (`mlx_array_new_data returned a null array`) once the build dir is
+    # gone — found by the first end-to-end install of this formula.
+    metallib = Dir[buildpath/"target/**/mlx.metallib"].first
+    odie "mlx.metallib not found in the cargo build tree" if metallib.nil?
+    bin.install metallib
 
     # Python environments, synced from the repo's committed uv.lock so the
     # installed pins are byte-identical to the tested ones (mlx/mlx-lm pins
