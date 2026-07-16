@@ -80,7 +80,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(anthropic_api)
         .merge(admin)
         // Unauthenticated by design: the gateway binds localhost by default
-        // (SPEC §8.1); operators exposing it terminate auth upstream.
+        // (SPEC §8.1); operators exposing it terminate auth upstream. The
+        // /ui shell is static code — all data behind it rides the
+        // bearer-gated /admin API above.
+        .route("/ui", get(crate::ui::index))
+        .route("/ui/", get(crate::ui::index))
+        .route("/ui/{*path}", get(crate::ui::asset))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_endpoint))
