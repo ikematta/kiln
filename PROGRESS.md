@@ -5977,3 +5977,151 @@
   docs). Also still open from earlier parts: §8.3 rate-limit/timeout
   BACKLOG, python-worker batching upgrade, continuous-pressure
   eviction for cache drift (envelope now +479..+711 MB measured).
+
+## [2026-07-15] Phase 9 / Part 3 ruling — DONE (Option A: reservation ledger; Phase 9 closed)
+- Ruling (PM, this date): Option A from the previous entry's DECISION
+  NEEDED — fix the admission TOCTOU product-side with a
+  reservation-based ledger; the soak's strict committed-bytes gate
+  stands and becomes the regression proof. This entry closes that
+  DECISION NEEDED and, with the deterministic CI pass below, closes
+  Phase 9.
+- What (commit 5c7d73d):
+  - Red first: tests/e2e/test_admission.py::
+    test_concurrent_admissions_cannot_jointly_overshoot fires two cold
+    models' first requests simultaneously under the existing
+    DRIFT_BUDGET — the run-29436961038 race as a deterministic repro
+    (sub-ms concurrent admissions vs the 1 s heartbeat cadence).
+    Pre-fix: both admitted (200/200), joint pool materialization
+    overshot the budget. The red run is part of this ledger.
+  - lifecycle.rs reservation ledger: admit_request now RESERVES the
+    projected growth at decision time under an admission lock
+    (non-blocking arithmetic only, never held across await), and every
+    admission decision — request growth and load alike — prices against
+    charged_bytes() = measured usage + outstanding reservations. A
+    racing admission sees the winner's obligation immediately; refusals
+    reserve nothing; a second request on the same still-cold pool rides
+    the outstanding reservation (the pool materializes once). A
+    reservation whose request never materializes (cancel/error) lingers
+    conservatively — it only under-reports headroom — and reconciles on
+    the next served request or unload.
+  - Heartbeat reconciliation (record_pool_materialized, same lock):
+    confirmed bytes shift to the measured footprint and the reservation
+    shrinks to the still-outstanding growth (commitment −
+    materialized), releasing over-reservation difference exactly as the
+    ruling prescribed. Materialization that NO reservation covered is
+    the alertable condition: tracing::warn +
+    kiln_admission_uncovered_bytes_total{model} (bytes), never silent.
+    kiln_memory_reserved_bytes gauges the in-flight total; the soak
+    reports its peak and gates uncovered == 0.
+  - Complete projections, so actual > reserved is truly exceptional:
+    - WorkerInfo.kv_pool_commitment_bytes (additive field 16; python
+      regen included): the WHOLE worker's lazily-materialized pool cost
+      — target + attached draft. The gateway prefers it over the
+      target-only kv_bytes_per_block × kv_pool_blocks product, which
+      under-projected draft-carrying workers by an entire draft pool
+      (201 MB on the soak's qwen2.5 self-pair; the likely main
+      contributor to the observed CI overshoot).
+    - Load projections carry LOAD_OVERHEAD_MARGIN_BYTES = 64 MiB over
+      raw on-disk weight bytes (idle footprints measured 17-33 MB over
+      weights across the pinned fleet), so an admission racing a load
+      window cannot consume unprojected bytes; the first measured
+      heartbeat replaces the whole projection before the load permit
+      releases — reserve high, reconcile down.
+- Deviations: none.
+- Acceptance:
+  ```
+  RED (pre-fix, this session):
+    test_concurrent_admissions_cannot_jointly_overshoot FAILED:
+    "exactly one concurrent admission must win: {'right': 200,
+     'left': 200}" — the TOCTOU, reproduced in 17 s.
+  GREEN (post-fix, local):
+    $ uv run --project tests/e2e pytest tests/e2e/test_admission.py
+    4 passed in 44.19s   (race repro: one 200 / one 503; committed
+    <= budget at every 200 ms sample; reservations drain to 0;
+    kiln_admission_uncovered_bytes_total absent on both models)
+    $ cargo test -p kiln-gateway --lib -> 58 passed (new: joint-
+      overshoot arithmetic, heartbeat reconciliation incl. no-double-
+      count, uncovered-growth alerting byte-accuracy)
+    $ cargo test --workspace -> green (exit 0, 50 suites)
+    $ uv run --project tests/e2e pytest tests/e2e (minus soak)
+      -> 87 passed, 2 skipped in 271 s — the measured-bounds
+      lifecycle/admission budgets all held under the new projections
+      (no recalibration needed: the 64 MiB margin sits inside every
+      calibrated boundary)
+    $ uv run --project python/kiln_worker_py pytest -> 35 passed
+    $ fmt / clippy (default + --no-default-features) / ruff -> clean
+  30-minute soak (local run F, the reservation ledger live), PASS all
+  gates:
+    reservation ledger: peak in-flight 201 MB; uncovered growth 0.0 MB
+    committed (weights+pools) peak 3.64 / 3.90 GB — LOWER than every
+      pre-fix run (3.71-3.84): admissions now price complete
+      obligations, and pool-side races no longer contribute to the raw
+      cache-drift overshoot either (worst +384 MB vs +479..+711 across
+      the six pre-fix runs; that residual is pure mlx-cache drift, the
+      separately-recorded open item)
+    live objects 437 at all six checkpoints (llama, gen 0); spec model
+      flat per generation across 26 evict/reload cycles (churn is up
+      from ~11-17: spec re-warms now honestly need 402 MB, so pressure
+      refuses/evicts them more — sane, and every cycle recovered)
+    canaries 29/29 and 20/20 bit-identical; restarts 0; severed 0;
+    bursts 6/6 recovered; preemptions 8; cancellations 93; prefix
+    reused 114,489; SSD writes 2,713; spec totals 4,073/4,073
+  ```
+- Post-ruling calibration (commit 11cc55e), from the ledger's first CI
+  run (29449124438 — the ledger itself was flawless there: peak
+  in-flight 403 MB, uncovered 0, committed 3.67/3.90; the soak step
+  failed on scenario dynamics):
+  - The spec class stands down 20-30 s after an insufficient_memory
+    refusal: under honest pricing a spec re-warm needs its whole 402 MB
+    double pool, and its 4-8 s retry cadence beat the gemma burst to
+    every headroom slot the TTL valve opened — a harness livelock that
+    starved one burst on the slow runner. Burst windows widened to
+    180 s (a slow-runner recovery legitimately chains eviction ack
+    45 s + TTL expiry ≤75 s + load 10-30 s).
+  - RSS gates are now absolute working-set caps ONLY (gateway 160 MB,
+    pinned worker 1.2 GB, python 700 MB): ten 30-min runs established
+    that every derivative measure aliases macOS page-reclaim timing —
+    fixed-window slopes read -47,308..+3,370 KiB/min and a mid-run-
+    referenced delta -46..+23 MB across runs with identical workloads
+    and bit-flat mlx counters; the pinned worker's RSS breathes
+    36..846 MB with page cache over its 695 MB weight mmap. Slopes and
+    deltas remain computed and reported; fine-grained leak detection
+    is owned by the bit-exact live-object gate, flat mlx_active, the
+    committed/reservation ledgers, and the 1k-iteration leak suites.
+- CI verification (PR #28, commit 11cc55e, run 29456964198): ALL FOUR
+  checks pass — test-macos 61m15s with the 30-minute soak BLOCKING and
+  green on the runner, the race-repro e2e in the blocking sweep, and
+  the reservation ledger live:
+  ```
+  duration: 1816s   PASS: all gates held
+  reservation ledger: peak in-flight 201 MB, uncovered growth 0.0 MB
+  committed (weights+pools) peak 3.67 / 3.90 GB — never exceeded
+  live objects: llama-int 437 at ALL SIX checkpoints (gen 0);
+    spec-qwen25 flat per generation through g11
+  raw used worst +575 MB over (mlx-cache drift, the separate open item)
+  canaries 28/28 and 16/16 bit-identical; restarts 0; bursts 5/5
+  one severed-by-drain 502 at t+724.7s ACCEPTED by its unload-counter
+    correlation — the part 3 outcome contract exercised end-to-end on
+    real hardware and classified correctly
+  interactive during-flood p95 14.77s (slow runner; gate 90 s)
+  Advisory golden lane: the ONLY divergence remains
+    gemma-3-1b-it-4bit/chat-basic (ADR 0004 pattern; no change).
+  ```
+  This is the deterministic pass the ruling demanded: the TOCTOU is
+  structurally impossible (reservations serialize admission decisions),
+  the race repro is a permanent blocking e2e test, and every remaining
+  soak outcome class is contract-classified rather than
+  timing-dependent.
+- Phase 9 closeout (superseding the qualification in the addendum
+  entry): parts 1-3 delivered machine memory budgeting, LRU eviction
+  with drain + pinning + TTL leases, crash-loop backoff,
+  INTERACTIVE/BATCH priorities with preemption-ordered admission,
+  per-request admission now backed by a reservation ledger that holds
+  "committed <= budget" under real concurrency, and the 30-minute
+  full-stack soak as the standing blocking gate proving it all
+  composes. Still open, recorded: §8.3 rate-limit/timeout BACKLOG;
+  python-worker batching upgrade; continuous-pressure eviction for
+  mlx-cache drift (envelope +384 MB worst under the soak scenario with
+  pool races eliminated). The Phase 4-9 correctness arc stands closed.
+- Next: Phase 10 (jobs, admin UI, packaging, docs) — not started, per
+  the task instruction.
