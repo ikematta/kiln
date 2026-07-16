@@ -7,3 +7,6 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+
+# bench.sh output (CLAUDE.md: results are per-machine measurements, not sources)
+bench/results/
