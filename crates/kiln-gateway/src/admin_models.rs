@@ -247,14 +247,23 @@ async fn stats_snapshot(state: &AppState) -> Value {
 /// `GET /admin/stats`: SSE stream of 1s-tick snapshots. The browser
 /// `EventSource` API cannot set an `Authorization` header, so the admin UI
 /// consumes this with a streaming `fetch` instead — same frames.
+///
+/// The stream ends itself when graceful shutdown begins: it is the one
+/// response that never finishes on its own, and axum's connection drain
+/// waits for it — an open dashboard must not wedge a SIGTERM into the
+/// hard-kill path.
 pub async fn stats_sse(State(state): State<Arc<AppState>>) -> Response {
+    let mut shutdown = state.shutdown.clone();
     let stream = async_stream::stream! {
         loop {
             let snapshot = stats_snapshot(&state).await;
             yield Ok::<Event, Infallible>(
                 Event::default().event("stats").data(snapshot.to_string()),
             );
-            tokio::time::sleep(STATS_TICK).await;
+            tokio::select! {
+                _ = tokio::time::sleep(STATS_TICK) => {}
+                _ = shutdown.wait_for(|v| *v) => return,
+            }
         }
     };
     Sse::new(stream)
@@ -314,6 +323,7 @@ mod tests {
             auth: Auth::from_config(&config.auth).expect("auth"),
             jobs: crate::admin::JobsProxy::external(PathBuf::from("/tmp/kiln-admin-models.sock"))
                 .expect("proxy"),
+            shutdown: watch::channel(false).1,
         });
         (state, senders.remove(0), receivers.remove(0), dir)
     }

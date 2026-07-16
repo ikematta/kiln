@@ -395,6 +395,7 @@ mod tests {
             metrics,
             auth: Auth::from_config(&config.auth).expect("valid auth config"),
             jobs: JobsProxy::external(socket).expect("proxy"),
+            shutdown: tokio::sync::watch::channel(false).1,
         });
         app::router(state)
     }

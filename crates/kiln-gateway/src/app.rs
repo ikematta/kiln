@@ -25,6 +25,12 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub auth: Auth,
     pub jobs: crate::admin::JobsProxy,
+    /// Flips true when graceful shutdown begins. Endpoints holding
+    /// never-ending responses (the /admin/stats SSE stream) must end them
+    /// on this signal, or axum's connection drain waits forever — an open
+    /// admin dashboard would turn every SIGTERM into the supervisor-less
+    /// hard kill (observed as leaked workers in the e2e teardown guard).
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Per-request UUIDv7, generated in [`observe`]; reused as the worker
