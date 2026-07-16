@@ -24,6 +24,7 @@ pub struct AppState {
     pub lifecycle: Arc<Lifecycle>,
     pub metrics: Arc<Metrics>,
     pub auth: Auth,
+    pub jobs: crate::admin::JobsProxy,
 }
 
 /// Per-request UUIDv7, generated in [`observe`]; reused as the worker
@@ -48,10 +49,22 @@ pub fn router(state: Arc<AppState>) -> Router {
             Arc::clone(&state),
             crate::auth::require_api_key_anthropic,
         ));
+    // Admin surface (SPEC §8.1): separate bearer token, fail-closed when
+    // unconfigured. Phase 10 part 1 ships only the jobs proxy.
+    let admin = Router::new()
+        .route("/admin/jobs/download", post(crate::admin::submit_download))
+        .route("/admin/jobs/quantize", post(crate::admin::submit_quantize))
+        .route("/admin/jobs", get(crate::admin::list_jobs))
+        .route("/admin/jobs/{id}", get(crate::admin::get_job))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::auth::require_admin,
+        ));
 
     Router::new()
         .merge(api)
         .merge(anthropic_api)
+        .merge(admin)
         // Unauthenticated by design: the gateway binds localhost by default
         // (SPEC §8.1); operators exposing it terminate auth upstream.
         .route("/healthz", get(healthz))

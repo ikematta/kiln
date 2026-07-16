@@ -24,6 +24,13 @@ pub struct Auth {
     keys: Vec<(String, String)>,
     /// sha256(raw key) → key name for keys that already verified.
     cache: RwLock<HashMap<[u8; 32], String>>,
+    /// PHC hash of the admin bearer token (SPEC §8.1: separate from API
+    /// keys). None = admin surface disabled — unlike API keys, admin
+    /// endpoints fail CLOSED when unconfigured (they trigger downloads and
+    /// subprocesses).
+    admin_hash: Option<String>,
+    /// sha256(raw admin token) once it has verified.
+    admin_cache: RwLock<Option<[u8; 32]>>,
 }
 
 impl Auth {
@@ -51,14 +58,63 @@ impl Auth {
                  (add [[auth.api_keys]] entries; hash keys with `kiln-gateway hash-key`)"
             );
         }
+        let admin_hash = match config.admin_token_hash.as_deref() {
+            None | Some("") => None,
+            Some(hash) => match PasswordHash::new(hash) {
+                Ok(_) => Some(hash.to_string()),
+                Err(err) => {
+                    tracing::warn!(error = %err,
+                        "auth.admin_token_hash is not a valid PHC string; admin API disabled");
+                    None
+                }
+            },
+        };
+        if admin_hash.is_none() {
+            tracing::info!(
+                "admin API disabled (no auth.admin_token_hash); /admin endpoints return 403"
+            );
+        }
         Self {
             keys,
             cache: RwLock::new(HashMap::new()),
+            admin_hash,
+            admin_cache: RwLock::new(None),
         }
     }
 
     pub fn enabled(&self) -> bool {
         !self.keys.is_empty()
+    }
+
+    pub fn admin_enabled(&self) -> bool {
+        self.admin_hash.is_some()
+    }
+
+    /// Verifies a presented admin bearer token. API keys never grant admin.
+    pub async fn verify_admin(&self, presented: &str) -> bool {
+        let Some(hash) = &self.admin_hash else {
+            return false;
+        };
+        let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+        if *self.admin_cache.read().await == Some(digest) {
+            return true;
+        }
+        let presented = presented.to_string();
+        let hash = hash.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            let Ok(parsed) = PasswordHash::new(&hash) else {
+                return false;
+            };
+            Argon2::default()
+                .verify_password(presented.as_bytes(), &parsed)
+                .is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        if verified {
+            *self.admin_cache.write().await = Some(digest);
+        }
+        verified
     }
 
     /// Verifies a presented key; returns the key's configured name.
@@ -147,6 +203,27 @@ pub async fn require_api_key_anthropic(
     }
 }
 
+/// Route-layer middleware for `/admin/*` (SPEC §8.1: bearer-token gated,
+/// separate token from API keys). Fail-closed: 403 when unconfigured, 401 on
+/// a wrong or missing token.
+pub async fn require_admin(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !state.auth.admin_enabled() {
+        return ApiError::admin_disabled().into_response();
+    }
+    let Some(presented) = presented_key(&request) else {
+        return ApiError::invalid_api_key().into_response();
+    };
+    if state.auth.verify_admin(presented).await {
+        next.run(request).await
+    } else {
+        ApiError::invalid_api_key().into_response()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +254,39 @@ mod tests {
         // Second call hits the cache (still must succeed).
         assert_eq!(auth.verify("s3cret").await.as_deref(), Some("alice"));
         assert_eq!(auth.verify("wrong").await, None);
+    }
+
+    #[tokio::test]
+    async fn admin_token_verifies_and_api_keys_never_grant_admin() {
+        let auth = Auth::from_config(&AuthConfig {
+            admin_token_hash: Some(hash("admin-secret")),
+            api_keys: vec![ApiKeyConfig {
+                name: "alice".into(),
+                key_hash: hash("s3cret"),
+                rpm: None,
+                tpm: None,
+            }],
+        });
+        assert!(auth.admin_enabled());
+        assert!(auth.verify_admin("admin-secret").await);
+        assert!(auth.verify_admin("admin-secret").await); // cached path
+        assert!(!auth.verify_admin("wrong").await);
+        // A valid API key is not an admin token.
+        assert!(!auth.verify_admin("s3cret").await);
+        // And the admin token is not an API key.
+        assert_eq!(auth.verify("admin-secret").await, None);
+    }
+
+    #[tokio::test]
+    async fn missing_empty_or_malformed_admin_hash_disables_admin() {
+        for hash in [None, Some(String::new()), Some("not-a-phc".to_string())] {
+            let auth = Auth::from_config(&AuthConfig {
+                admin_token_hash: hash,
+                api_keys: vec![],
+            });
+            assert!(!auth.admin_enabled());
+            assert!(!auth.verify_admin("anything").await);
+        }
     }
 
     #[tokio::test]

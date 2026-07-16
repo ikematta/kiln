@@ -169,6 +169,16 @@ jobs:
         run: |
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
           uv run --project python/kiln_worker_py pytest python/kiln_worker_py/tests -v
+      # The jobs venv (SPEC §9.1): mlx_lm convert for kiln-jobs quantize.
+      - run: uv sync --project python/kiln_jobs_py
+      # Real quantization on the runner: BF16 SmolLM2 -> 4-bit affine via the
+      # jobs venv, output verified through kiln-models config parsing. The
+      # download/resume suite needs no gating — it runs against a local stub
+      # hub inside `cargo test --workspace` above.
+      - name: kiln-jobs quantize (real mlx_lm convert, BF16 -> 4-bit)
+        run: |
+          export KILN_TEST_MODELS="$HOME/.kiln/test-models"
+          cargo test -p kiln-jobs --test quantize -- --nocapture
       - run: uv sync --project tests/e2e
       - name: E2E suite (full stacks; openai + anthropic SDKs)
         run: |

@@ -6125,3 +6125,95 @@
   pool races eliminated). The Phase 4-9 correctness arc stands closed.
 - Next: Phase 10 (jobs, admin UI, packaging, docs) — not started, per
   the task instruction.
+
+## [2026-07-15] Phase 10 / Part 1 — kiln-jobs + gateway admin jobs API — DONE
+- What:
+  - `crates/kiln-jobs` implemented (was a stub): `download <hf_repo>`
+    (resumable HF download, progress as JSON lines on stdout), `quantize
+    <path> --bits N --group-size N` (wraps `python -m mlx_lm convert` in the
+    new jobs venv `python/kiln_jobs_py` — quantization is not reimplemented),
+    `serve --socket <uds>` (long-running job server). Job state in SQLite
+    (`~/.kiln/jobs.sqlite` default), per SPEC §9.1.
+  - The downloader is a Rust port of the fetch-test-model.sh hardened logic
+    with semantics preserved: 30s per-read stall timeout, 4 attempts with
+    linear backoff, retryable set {408,425,429,500,502,503,504} vs fatal
+    statuses, `.part` resume via HTTP Range with banked bytes (read1
+    semantics), restart on Range-ignoring 200, 416 discard, LFS sha256
+    verification that never retries atop a corrupt prefix, verified skip of
+    present files, `.kiln-revision` marker, HF_ENDPOINT override.
+    Extensions: ref→commit-sha resolution up front (interrupt/resume stays
+    revision-coherent) and Link-header tree pagination.
+  - New additive proto `proto/kiln/v1/jobs.proto` (Jobs: SubmitDownload/
+    SubmitQuantize/GetJob/ListJobs) compiled into kiln-proto alongside
+    worker.proto — worker.proto wire semantics untouched.
+  - Gateway admin API, bare minimum for part 2's UI: POST
+    /admin/jobs/download, POST /admin/jobs/quantize, GET /admin/jobs,
+    GET /admin/jobs/{id}. Admin bearer auth activates the previously
+    parsed-but-unused `auth.admin_token_hash`; kiln-jobs is spawned on
+    demand (`server.jobs_argv`, `server.jobs_db`; socket under runtime_dir)
+    and proxied over gRPC/UDS with the existing channel plumbing.
+- Decisions:
+  - Gateway↔jobs IPC = gRPC over UDS via a NEW proto file: SPEC §3 names
+    tonic gRPC/UDS as THE IPC layer and protobuf as the IPC serialization;
+    zero new gateway dependencies. jobs.proto follows the worker.proto
+    freeze discipline (additive only) once shipped.
+  - New deps, justified in the commit: rusqlite 0.40 `bundled` (SPEC §9.1
+    SQLite state; no system lib), reqwest 0.13 rustls-only (per-read stall
+    timeout via read_timeout + Range + redirects; no openssl). Jobs venv
+    pins mlx==0.31.1/mlx-lm==0.31.2 — identical to the worker venv pins
+    (2026-07-03 option B1) so converter outputs come from the same MLX core.
+  - Admin surface fails CLOSED (403 `admin_disabled`) when no
+    admin_token_hash is set — deliberate departure from the API-key
+    warn-and-stay-open precedent: admin endpoints trigger downloads and
+    subprocesses, and SPEC §8.1 says bearer-token gated. API keys never
+    grant admin.
+  - Jobs execute sequentially (single runner task). Crash recovery: store
+    open marks `running` jobs failed ("interrupted; resubmit to resume"),
+    `queued` jobs re-enqueue at serve start; resume is file-level via .part.
+- Deviations: none.
+- Acceptance:
+  ```
+  Real download, deliberately interrupted + resumed (pinned repo):
+    $ kiln-jobs download mlx-community/Qwen3-0.6B-4bit --dest /tmp/kiln-accept-dl
+      kill -9 mid-safetensors; banked .part = 53,107,712 bytes
+    resubmit, JSON lines:
+      {"event":"skip","path":"config.json"}  (+2 more verified skips)
+      {"event":"file","path":"model.safetensors","size":335450584,"resume_from":53107712}
+      {"event":"done","dest":"/tmp/kiln-accept-dl"}   exit=0
+    sha256(model.safetensors) bit-identical to the pinned fetch-script copy
+    (main still resolves to the pinned 73e3e38d9813; LFS oid also verified
+    in-band before rename). Job store: run1 failed{"interrupted...resubmit
+    to resume"}; run2 succeeded{"event":"done"}.
+  Real quantization (BF16 -> 4-bit) + loadable:
+    $ kiln-jobs quantize ~/.kiln/test-models/smollm2-135m-bf16 --bits 4 --group-size 64
+      {"event":"log","line":"[INFO] Quantized model with 4.503 bits per weight."}
+      {"event":"done","dest":"/tmp/kiln-accept-quant"}   exit=0
+    config.json: model_type=llama, quantization {group_size:64, bits:4}
+    (parses via kiln_models::ArchConfig — the gated quantize test);
+    served by the REAL stack: gateway + rust worker on the converted dir,
+    /readyz 200, POST /v1/chat/completions -> 200, 24 completion tokens,
+    finish_reason "length".
+  Suites (local, M-series):
+    cargo test --workspace -> exit 0 (54 suites, incl. the 8-case stub-hub
+      download suite: interrupt+Range-resume, Range-ignored restart, 416
+      discard, sha-mismatch discard, retryable-vs-fatal statuses, verified
+      skip; store crash recovery; gateway admin auth + proxy translation)
+    uv run --project tests/e2e pytest tests/e2e -> 90 passed, 3 skipped
+      (new test_admin_jobs.py: gateway spawns kiln-jobs, download job runs
+      end-to-end against a local stub hub, files land, queued->succeeded)
+    uv run --project python/kiln_worker_py pytest -> 35 passed
+    cargo build --workspace --no-default-features -> clean
+    fmt / clippy (default and --no-default-features, --all-targets) /
+      ruff check + format -> clean
+  CI (PR #29, run 29467795313): ALL FOUR checks pass —
+    lint 1m37s, compile-linux 1m59s, test-macos-release 6m16s,
+    test-macos 1h1m20s with the new steps live on the runner:
+      stub-hub download suite in the workspace step (8 tests ok)
+      "kiln-jobs quantize (real mlx_lm convert, BF16 -> 4-bit)":
+        [INFO] Quantized model with 4.503 bits per weight. -> 1 passed
+      E2E incl. test_admin_jobs.py 3/3 PASSED -> 90 passed, 3 skipped
+      30-min soak: duration 1812s, PASS all gates
+  ```
+- Next: Phase 10 part 2 — minimal admin UI (SvelteKit static, embedded via
+  rust-embed: models table, load/unload/pin, live stats via SSE, job
+  launcher calling /admin/jobs/*), per SPEC §12 Phase 10.

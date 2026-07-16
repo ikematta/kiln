@@ -1,0 +1,19 @@
+# The "jobs venv" (SPEC §9.1): `kiln-jobs quantize` shells out to
+# `python -m mlx_lm convert` inside this environment — quantization is never
+# reimplemented in Rust in v1, and never monkey-patched here. No Kiln code
+# lives in this project; it exists only to pin the converter's environment,
+# separately from the serving worker's venv so worker dependency changes
+# cannot silently change quantization outputs.
+[project]
+name = "kiln-jobs-py"
+version = "0.0.1"
+description = "Pinned environment for the kiln-jobs quantization wrapper (mlx_lm convert)"
+requires-python = ">=3.12"
+dependencies = [
+    # Same pins as python/kiln_worker_py (PROGRESS.md 2026-07-03, option B1):
+    # mlx core matches the version vendored mlx-c v0.6.0 builds, so quantized
+    # outputs are produced by the same MLX the Rust worker serves them with.
+    # Revisit all three pins (here, worker, mlx-c submodule) together.
+    "mlx==0.31.1 ; sys_platform == 'darwin'",
+    "mlx-lm==0.31.2 ; sys_platform == 'darwin'",
+]

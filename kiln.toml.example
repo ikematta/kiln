@@ -22,6 +22,13 @@ model_dir = "~/.kiln/models"
 # `--model <path> --socket <path> --model-id <id>`. The default assumes the
 # gateway runs from a Kiln checkout.
 python_worker_argv = ["uv", "run", "--project", "python/kiln_worker_py", "python", "-m", "kiln_worker_py"]
+# Job runner (SPEC §9.1), spawned on demand for /admin/jobs/*; the gateway
+# appends `serve --socket <path> --db <path> --dest-root <model_dir>`.
+# Default: a `kiln-jobs` binary next to the gateway binary. Uncomment to
+# override (e.g. to add `--venv <dir>` for a non-checkout jobs venv).
+#jobs_argv = ["kiln-jobs"]
+# SQLite job store used by the spawned kiln-jobs server.
+jobs_db = "~/.kiln/jobs.sqlite"
 
 [memory]
 # Fraction of unified memory the gateway may hand out across all workers.
@@ -93,7 +100,10 @@ draft = "mlx-community/Qwen3-0.6B-4bit" # HF repo id or local path; tokenizer mu
 gamma = 4                               # tokens proposed per round (clamped per ADR 0005)
 
 [auth]
-# argon2 hash of the admin bearer token — never the raw token.
+# argon2 hash of the admin bearer token — never the raw token. Generate with
+# `kiln-gateway hash-key <token>`. The /admin/* endpoints (job submission,
+# Phase 10) are DISABLED (403) until this is set — unlike API keys, the
+# admin surface fails closed. API keys never grant admin access.
 admin_token_hash = ""
 
 [[auth.api_keys]]

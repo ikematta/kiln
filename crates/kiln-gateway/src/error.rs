@@ -123,6 +123,40 @@ impl ApiError {
         }
     }
 
+    /// Admin surface is configured off: no `auth.admin_token_hash` set.
+    /// Deliberately fail-closed (unlike API keys, admin endpoints trigger
+    /// downloads and subprocesses — SPEC §8.1 says "bearer-token gated").
+    pub fn admin_disabled() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            error_type: "invalid_request_error",
+            code: "admin_disabled",
+            message: "The admin API is disabled: set auth.admin_token_hash in kiln.toml \
+                      (hash a token with `kiln-gateway hash-key`)."
+                .into(),
+        }
+    }
+
+    /// A named admin resource (e.g. a job id) does not exist.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            error_type: "invalid_request_error",
+            code: "not_found",
+            message: message.into(),
+        }
+    }
+
+    /// The kiln-jobs runner is unreachable or errored below the proxy.
+    pub fn jobs_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            error_type: "server_error",
+            code: "jobs_unavailable",
+            message: message.into(),
+        }
+    }
+
     /// Maps a worker `Finished{finish_reason=ERROR}` event.
     pub fn from_worker_finished(finished: &Finished) -> Self {
         let detail = &finished.error_detail;
