@@ -105,12 +105,24 @@ fn resolve_config(explicit: Option<PathBuf>) -> Option<PathBuf> {
     }
     // Installed layout: <prefix>/bin/kiln → <prefix>/etc/kiln/kiln.toml
     // (the path the Homebrew formula writes).
-    let etc = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .parent()?
-        .join("etc/kiln/kiln.toml");
-    etc.is_file().then_some(etc)
+    exe_relative("etc/kiln/kiln.toml")
+}
+
+/// `<exe dir>/../<rel>`, from the invoked path and then from the
+/// symlink-resolved one. Homebrew splits the two: `<prefix>/bin/kiln` is a
+/// symlink into the keg, config lives at the *prefix* (`<prefix>/etc/...`,
+/// raw path) while libexec is unlinked and exists only in the *keg*
+/// (resolved path).
+fn exe_relative(rel: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    for base in [Some(exe.clone()), std::fs::canonicalize(&exe).ok()] {
+        if let Some(path) = base.and_then(|exe| Some(exe.parent()?.parent()?.join(rel)))
+            && path.is_file()
+        {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// The named binary next to this executable, else bare (a `$PATH` lookup) —
@@ -170,12 +182,7 @@ fn find_bench_script() -> Option<PathBuf> {
     if checkout.is_file() {
         return Some(checkout);
     }
-    let installed = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .parent()?
-        .join("libexec/scripts/bench.sh");
-    installed.is_file().then_some(installed)
+    exe_relative("libexec/scripts/bench.sh")
 }
 
 fn models(config: Option<PathBuf>, json: bool) -> ExitCode {
