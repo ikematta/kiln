@@ -72,7 +72,8 @@ class Stack:
     def worker_pids(self) -> list[int]:
         """PIDs of worker processes, identified by the unique runtime dir in
         their --socket argument. Matches the python worker (uv wrapper and
-        python module alike) and the rust worker binary."""
+        python module alike), the rust worker binary, and the on-demand
+        kiln-jobs server (which must die with the gateway too)."""
         result = subprocess.run(
             ["pgrep", "-f", str(self.runtime_dir)],
             capture_output=True,
@@ -90,7 +91,7 @@ class Stack:
                 text=True,
                 check=False,
             ).stdout
-            if "kiln_worker_py" in cmd or "kiln-worker" in cmd:
+            if "kiln_worker_py" in cmd or "kiln-worker" in cmd or "kiln-jobs" in cmd:
                 pids.append(pid)
         return pids
 
@@ -137,12 +138,22 @@ def tail(path: pathlib.Path, lines: int = 40) -> str:
 
 
 def build_binaries() -> pathlib.Path:
-    """Builds kiln-gateway + kiln-worker; returns the gateway binary path
-    (the worker is found by the gateway as its sibling)."""
+    """Builds kiln-gateway + kiln-worker + kiln-jobs; returns the gateway
+    binary path (the worker and job runner are found by the gateway as its
+    siblings)."""
     binary = REPO / "target" / "debug" / "kiln-gateway"
     try:
         subprocess.run(
-            ["cargo", "build", "-p", "kiln-gateway", "-p", "kiln-worker"],
+            [
+                "cargo",
+                "build",
+                "-p",
+                "kiln-gateway",
+                "-p",
+                "kiln-worker",
+                "-p",
+                "kiln-jobs",
+            ],
             cwd=REPO,
             check=True,
             capture_output=True,
@@ -194,6 +205,7 @@ host = "127.0.0.1"
 port = {port}
 runtime_dir = "{runtime_dir}"
 cache_dir = "{runtime_dir}/cache"
+jobs_db = "{runtime_dir}/jobs.sqlite"
 {extra_toml}
 {blocks}
 [[auth.api_keys]]
@@ -213,8 +225,9 @@ key_hash = "{key_hash}"
     stack = Stack(
         base_url=f"http://127.0.0.1:{port}",
         api_key=API_KEY,
-        model_id=models[0][0],
-        worker_kind=models[0][1],
+        # Model-less stacks are legal (admin/jobs tests drive no model).
+        model_id=models[0][0] if models else "",
+        worker_kind=models[0][1] if models else "",
         runtime_dir=runtime_dir,
         gateway=gateway,
         log_path=log_path,

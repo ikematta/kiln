@@ -67,6 +67,15 @@ pub struct ServerConfig {
     /// cargo target dirs and packaged installs alike.
     #[serde(default = "defaults::rust_worker_argv")]
     pub rust_worker_argv: Vec<String>,
+    /// Command prefix for the job runner; the gateway appends
+    /// `serve --socket <path> --db <path> --dest-root <model_dir>` when it
+    /// spawns kiln-jobs on demand for `/admin/jobs/*` (SPEC §2.1, §9.1).
+    /// Default: a `kiln-jobs` binary next to the running gateway binary.
+    #[serde(default = "defaults::jobs_argv")]
+    pub jobs_argv: Vec<String>,
+    /// SQLite job store handed to the spawned kiln-jobs server.
+    #[serde(default = "defaults::jobs_db")]
+    pub jobs_db: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -192,6 +201,9 @@ impl KilnConfig {
         if self.server.rust_worker_argv.is_empty() || self.server.rust_worker_argv[0].is_empty() {
             return invalid("server.rust_worker_argv must name an executable".into());
         }
+        if self.server.jobs_argv.is_empty() || self.server.jobs_argv[0].is_empty() {
+            return invalid("server.jobs_argv must name an executable".into());
+        }
         let fraction = self.memory.budget_fraction;
         if !(fraction > 0.0 && fraction <= 1.0) {
             return invalid(format!(
@@ -257,6 +269,8 @@ impl Default for ServerConfig {
             model_dir: defaults::model_dir(),
             python_worker_argv: defaults::python_worker_argv(),
             rust_worker_argv: defaults::rust_worker_argv(),
+            jobs_argv: defaults::jobs_argv(),
+            jobs_db: defaults::jobs_db(),
         }
     }
 }
@@ -317,12 +331,21 @@ mod defaults {
     }
     pub(super) fn rust_worker_argv() -> Vec<String> {
         // Sibling of the gateway binary; falls back to $PATH lookup.
-        let sibling = std::env::current_exe()
+        vec![sibling_binary("kiln-worker")]
+    }
+    pub(super) fn jobs_argv() -> Vec<String> {
+        vec![sibling_binary("kiln-jobs")]
+    }
+    pub(super) fn jobs_db() -> PathBuf {
+        PathBuf::from("~/.kiln/jobs.sqlite")
+    }
+    fn sibling_binary(name: &str) -> String {
+        std::env::current_exe()
             .ok()
-            .and_then(|exe| Some(exe.parent()?.join("kiln-worker")))
+            .and_then(|exe| Some(exe.parent()?.join(name)))
             .filter(|path| path.is_file())
-            .map(|path| path.to_string_lossy().into_owned());
-        vec![sibling.unwrap_or_else(|| "kiln-worker".to_string())]
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.to_string())
     }
     pub(super) fn budget_fraction() -> f64 {
         0.80

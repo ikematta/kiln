@@ -71,11 +71,13 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("no [[model]] entries configured; chat endpoints will 404");
     }
     let auth = Auth::from_config(&config.auth);
+    let jobs = kiln_gateway::admin::JobsProxy::from_config(&config)?;
     let state = Arc::new(AppState {
         registry,
         lifecycle,
         metrics,
         auth,
+        jobs,
     });
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
