@@ -1,0 +1,74 @@
+// Job-runner control plane (SPEC §9.1): the gateway's /admin/jobs/*
+// endpoints proxy to this service, served by `kiln-jobs serve` over a Unix
+// domain socket. Separate file from worker.proto — the worker contract's
+// freeze (additive-only after Phase 2) is not affected by this addition;
+// once shipped, this file follows the same discipline: additive changes
+// only, never renumber/retype/repurpose fields.
+syntax = "proto3";
+
+package kiln.v1;
+
+service Jobs {
+  rpc SubmitDownload(DownloadSpec) returns (JobStatus);
+  rpc SubmitQuantize(QuantizeSpec) returns (JobStatus);
+  rpc GetJob(JobRef) returns (JobStatus);
+  rpc ListJobs(ListJobsRequest) returns (JobList);
+}
+
+message DownloadSpec {
+  // Hugging Face repo id, e.g. "mlx-community/Qwen3-0.6B-4bit".
+  string repo = 1;
+  // Branch, tag, or commit; empty = "main". Resolved to a commit sha at
+  // job start so resume-after-interruption stays revision-coherent.
+  string revision = 2;
+  // Target directory; empty = "<dest_root>/<repo with '/' -> '--'>".
+  string dest = 3;
+}
+
+message QuantizeSpec {
+  // Local model directory (or HF id, passed through to mlx_lm convert).
+  string src = 1;
+  // Bits per weight; 0 = default 4 (SPEC §9.1).
+  uint32 bits = 2;
+  // Quantization group size; 0 = default 64 (SPEC §9.1).
+  uint32 group_size = 3;
+  // Output directory; empty = "<dest_root>/<basename(src)>-<bits>bit-g<gs>".
+  string out = 4;
+}
+
+message JobRef {
+  string id = 1;
+}
+
+message ListJobsRequest {}
+
+enum JobKind {
+  JOB_KIND_UNSPECIFIED = 0;
+  JOB_KIND_DOWNLOAD = 1;
+  JOB_KIND_QUANTIZE = 2;
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_QUEUED = 1;
+  JOB_STATE_RUNNING = 2;
+  JOB_STATE_SUCCEEDED = 3;
+  JOB_STATE_FAILED = 4;
+}
+
+message JobStatus {
+  string id = 1;
+  JobKind kind = 2;
+  JobState state = 3;
+  // The job's parameters as JSON (shape per kind; defaults filled in).
+  string spec_json = 4;
+  // Latest progress event / final result / error as JSON — the same
+  // JSON-line events `kiln-jobs download` emits on stdout.
+  string detail_json = 5;
+  int64 created_unix = 6;
+  int64 updated_unix = 7;
+}
+
+message JobList {
+  repeated JobStatus jobs = 1;
+}

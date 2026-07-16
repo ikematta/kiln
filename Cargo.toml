@@ -76,6 +76,17 @@ async-stream = "0.3"
 # llguidance project (github.com/guidance-ai/llguidance).
 llguidance = "1.7"
 toktrie_hf_tokenizers = "1.7"
+# kiln-jobs (SPEC §9.1): job state persisted in a SQLite file. rusqlite is
+# the canonical Rust embedding; `bundled` compiles the vendored SQLite
+# amalgamation so there is no system-library dependency. MIT (SQLite itself
+# is public domain).
+rusqlite = { version = "0.40", features = ["bundled"] }
+# kiln-jobs (SPEC §9.1): resumable HF downloads need an HTTP client with a
+# per-read stall timeout (`read_timeout` — the same dead-socket detection the
+# fetch-test-model.sh hardening proved out), Range resume, and redirect
+# following. rustls only (CLAUDE.md: no openssl); the hyper stack underneath
+# is already in-tree via axum/tonic. MIT/Apache-2.0.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Property-based testing (dev-only): model-based invariant suites for the
 # engine's block manager (SPEC §12 Phase 4, "block manager (+proptests)").
 proptest = "1"
