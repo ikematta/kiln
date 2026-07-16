@@ -31,8 +31,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --project python/kiln_worker_py
-      - run: uv run --project python/kiln_worker_py ruff check python/ tests/e2e
-      - run: uv run --project python/kiln_worker_py ruff format --check python/ tests/e2e
+      - run: uv run --project python/kiln_worker_py ruff check python/ tests/e2e scripts
+      - run: uv run --project python/kiln_worker_py ruff format --check python/ tests/e2e scripts
 
   # Linux compile-check without Metal (SPEC §3): no mlx-c build.
   compile-linux:
@@ -70,6 +70,16 @@ jobs:
           path: target/mlx-c-build
           key: mlx-c-build-${{ runner.os }}-${{ hashFiles('crates/kiln-mlx/vendor/mlx-c/CMakeLists.txt', 'crates/kiln-mlx/build.rs') }}
       - run: cargo test --workspace --release
+      # Packaging shapes that CI *can* check (SPEC §12 Phase 10). The real
+      # gate — `brew install --build-from-source ./Formula/kiln.rb` → serve
+      # → completion — is a full pinned-toolchain download + release build
+      # + venv sync (~30 min, needs developer-mode brew and a Metal
+      # compiler): manual-verify-only, performed and recorded in
+      # PROGRESS.md at the Phase 10 closeout.
+      - name: Packaging lint (Homebrew formula + launchd plist)
+        run: |
+          HOMEBREW_DEVELOPER=1 brew style --formula Formula/kiln.rb
+          plutil -lint packaging/dev.kiln.gateway.plist
 
   # Full build + tests on Apple Silicon, including the vendored mlx-c build.
   test-macos:

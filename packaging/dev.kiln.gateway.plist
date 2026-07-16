@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd template for a non-Homebrew Kiln install (SPEC §12 Phase 10).
+  Homebrew users should prefer `brew services start kiln`, which generates
+  the equivalent plist from the formula's service block.
+
+  Adjust the three /opt/homebrew paths to your install prefix, then:
+    cp packaging/dev.kiln.gateway.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/dev.kiln.gateway.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.kiln.gateway</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/kiln</string>
+        <string>serve</string>
+        <string>--config</string>
+        <string>/opt/homebrew/etc/kiln/kiln.toml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/opt/homebrew/var/log/kiln.log</string>
+    <key>StandardErrorPath</key>
+    <string>/opt/homebrew/var/log/kiln.log</string>
+</dict>
+</plist>

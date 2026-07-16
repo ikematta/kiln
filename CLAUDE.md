@@ -51,7 +51,8 @@ file and SPEC.md conflict, SPEC.md wins; flag the conflict in PROGRESS.md.
   outputs — several tests assert exactly this; treat a violation as a correctness
   bug in your change, not in the test.
 - Formatting/lint gates: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`,
-  `ruff check python/ tests/e2e`, `ruff format --check python/ tests/e2e`. Run before every commit.
+  `ruff check python/ tests/e2e scripts`, `ruff format --check python/ tests/e2e scripts`.
+  Run before every commit.
 - Commits: small, one logical change, imperative subject, body explains why.
   Reference the phase/task, e.g. `P4: block manager COW path (task 4.2)`.
 
@@ -135,7 +136,9 @@ crates/kiln-gateway          binary: axum, API adapters, router, supervisor, met
 crates/kiln-tokenize         tokenizer, chat templates (minijinja), tool-call parsers
 crates/kiln-proto            prost codegen + shared enums
 crates/kiln-jobs             download/quantize job runner (wraps `mlx_lm convert`)
+crates/kiln-cli              binary `kiln`: serve/models/bench wrappers over the above
 python/kiln_worker_py        mlx-lm fallback worker (same proto; no monkey-patching)
+Formula/kiln.rb              Homebrew formula       packaging/  launchd plist template
 tests/golden                 parity fixtures        tests/e2e   black-box HTTP suite
 docs/SPEC.md                 the spec               docs/decisions/  ADRs (read-only)
 ```
