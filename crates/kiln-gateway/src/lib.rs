@@ -3,6 +3,7 @@
 //! and the axum HTTP surface (SPEC §8).
 
 pub mod admin;
+pub mod admin_models;
 pub mod anthropic;
 pub mod app;
 pub mod auth;

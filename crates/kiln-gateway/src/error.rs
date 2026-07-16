@@ -137,6 +137,17 @@ impl ApiError {
         }
     }
 
+    /// An admin action conflicts with the model's current lifecycle state
+    /// (e.g. loading a FAILED model, unloading one that is still starting).
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            error_type: "invalid_request_error",
+            code,
+            message: message.into(),
+        }
+    }
+
     /// A named admin resource (e.g. a job id) does not exist.
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
