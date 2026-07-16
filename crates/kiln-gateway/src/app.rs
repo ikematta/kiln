@@ -25,6 +25,12 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub auth: Auth,
     pub jobs: crate::admin::JobsProxy,
+    /// Flips true when graceful shutdown begins. Endpoints holding
+    /// never-ending responses (the /admin/stats SSE stream) must end them
+    /// on this signal, or axum's connection drain waits forever — an open
+    /// admin dashboard would turn every SIGTERM into the supervisor-less
+    /// hard kill (observed as leaked workers in the e2e teardown guard).
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Per-request UUIDv7, generated in [`observe`]; reused as the worker
@@ -50,12 +56,26 @@ pub fn router(state: Arc<AppState>) -> Router {
             crate::auth::require_api_key_anthropic,
         ));
     // Admin surface (SPEC §8.1): separate bearer token, fail-closed when
-    // unconfigured. Phase 10 part 1 ships only the jobs proxy.
+    // unconfigured. Jobs proxy (part 1) + models/stats (part 2).
     let admin = Router::new()
         .route("/admin/jobs/download", post(crate::admin::submit_download))
         .route("/admin/jobs/quantize", post(crate::admin::submit_quantize))
         .route("/admin/jobs", get(crate::admin::list_jobs))
         .route("/admin/jobs/{id}", get(crate::admin::get_job))
+        .route("/admin/models", get(crate::admin_models::list_models))
+        .route(
+            "/admin/models/{id}/load",
+            post(crate::admin_models::load_model),
+        )
+        .route(
+            "/admin/models/{id}/unload",
+            post(crate::admin_models::unload_model),
+        )
+        .route(
+            "/admin/models/{id}/pin",
+            post(crate::admin_models::pin_model),
+        )
+        .route("/admin/stats", get(crate::admin_models::stats_sse))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::auth::require_admin,
@@ -66,7 +86,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(anthropic_api)
         .merge(admin)
         // Unauthenticated by design: the gateway binds localhost by default
-        // (SPEC §8.1); operators exposing it terminate auth upstream.
+        // (SPEC §8.1); operators exposing it terminate auth upstream. The
+        // /ui shell is static code — all data behind it rides the
+        // bearer-gated /admin API above.
+        .route("/ui", get(crate::ui::index))
+        .route("/ui/", get(crate::ui::index))
+        .route("/ui/{*path}", get(crate::ui::asset))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_endpoint))

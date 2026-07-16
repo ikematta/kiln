@@ -87,6 +87,12 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # following. rustls only (CLAUDE.md: no openssl); the hyper stack underneath
 # is already in-tree via axum/tonic. MIT/Apache-2.0.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# Admin SPA embedding (SPEC §3: "SvelteKit (static adapter) served by
+# gateway from embedded assets (rust-embed)"). Debug builds read
+# admin/build from disk at runtime (UI iterates without recompiling the
+# gateway); release builds embed the files into the binary — the SPEC §1.1
+# "single static gateway binary". MIT.
+rust-embed = { version = "8", features = ["mime-guess"] }
 # Property-based testing (dev-only): model-based invariant suites for the
 # engine's block manager (SPEC §12 Phase 4, "block manager (+proptests)").
 proptest = "1"

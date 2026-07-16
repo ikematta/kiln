@@ -45,6 +45,8 @@ pub enum UnloadReason {
     IdleTtl,
     /// Its own load was rejected: over budget with no evictable model.
     OverBudget,
+    /// Operator asked for it via `POST /admin/models/{id}/unload`.
+    Admin,
 }
 
 impl UnloadReason {
@@ -54,6 +56,7 @@ impl UnloadReason {
             Self::Evicted => "evicted",
             Self::IdleTtl => "idle_ttl",
             Self::OverBudget => "over_budget",
+            Self::Admin => "admin",
         }
     }
 }
@@ -73,6 +76,9 @@ impl fmt::Display for WorkerStatus {
             Self::Unloaded {
                 reason: UnloadReason::OverBudget,
             } => write!(f, "unloaded (over budget)"),
+            Self::Unloaded {
+                reason: UnloadReason::Admin,
+            } => write!(f, "unloaded (admin)"),
             Self::Restarting { attempt } => write!(f, "restarting (attempt {attempt})"),
             Self::Failed => write!(f, "failed"),
             Self::Stopped => write!(f, "stopped"),

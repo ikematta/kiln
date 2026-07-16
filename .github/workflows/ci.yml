@@ -179,10 +179,31 @@ jobs:
         run: |
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
           cargo test -p kiln-jobs --test quantize -- --nocapture
+      # Admin UI (SPEC §12 Phase 10): built once here — debug gateways read
+      # admin/build from disk at runtime, so only the e2e steps need it.
+      # Cheap: setup-node ~5s, npm ci ~20s (cached thereafter), vite build
+      # ~2s on a 1-page app — noise against this job's ~1h runtime.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: admin/package-lock.json
+      - name: Build admin UI
+        run: npm ci --prefix admin && npm run build --prefix admin
       - run: uv sync --project tests/e2e
-      - name: E2E suite (full stacks; openai + anthropic SDKs)
+      # The admin-UI flow test drives the runner image's Google Chrome (no
+      # download); the fallback install only runs if the image drops it.
+      - name: Ensure a browser for the admin UI e2e
+        run: |
+          if [ ! -d "/Applications/Google Chrome.app" ]; then
+            uv run --project tests/e2e playwright install chromium
+          fi
+      - name: E2E suite (full stacks; openai + anthropic SDKs + admin UI browser flow)
         run: |
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
+          # The browser-driven admin UI test must run, not skip (its skip
+          # path is for dev machines without any automatable browser).
+          export KILN_E2E_REQUIRE_BROWSER=1
           uv run --project tests/e2e pytest tests/e2e -v
       # Phase 9 closeout (SPEC §11.3): the 30-minute full-stack mixed-load
       # soak — leak gates (RSS slope, mlx live-object counter) + periodic

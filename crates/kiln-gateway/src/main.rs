@@ -65,19 +65,25 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_dir = expand_tilde(&config.server.runtime_dir);
     tokio::fs::create_dir_all(&runtime_dir).await?;
 
+    // Auth config errors (malformed admin_token_hash) abort before any
+    // worker process is spawned.
+    let auth = Auth::from_config(&config.auth)?;
     let metrics = Arc::new(Metrics::new()?);
     let (registry, lifecycle, supervisor) = Supervisor::start(&config, Arc::clone(&metrics))?;
     if registry.is_empty() {
         tracing::warn!("no [[model]] entries configured; chat endpoints will 404");
     }
-    let auth = Auth::from_config(&config.auth);
     let jobs = kiln_gateway::admin::JobsProxy::from_config(&config)?;
+    // Signals never-ending responses (the stats SSE stream) to finish so
+    // axum's graceful connection drain can complete.
+    let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
         registry,
         lifecycle,
         metrics,
         auth,
         jobs,
+        shutdown: http_shutdown_rx,
     });
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -85,7 +91,10 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(addr = %addr, config = %config_path, "kiln-gateway listening");
 
     axum::serve(listener, app::router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = http_shutdown_tx.send(true);
+        })
         .await?;
 
     tracing::info!("http server stopped; shutting down workers");

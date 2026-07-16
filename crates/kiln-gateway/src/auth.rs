@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::app::AppState;
-use crate::config::AuthConfig;
+use crate::config::{AuthConfig, ConfigError};
 use crate::error::ApiError;
 
 pub struct Auth {
@@ -34,11 +34,20 @@ pub struct Auth {
 }
 
 impl Auth {
-    /// Builds the verifier from config. Entries with empty or unparseable
-    /// hashes are skipped with a warning. With no usable keys, auth is
-    /// DISABLED (the gateway binds localhost by default; real deployments
-    /// must configure keys).
-    pub fn from_config(config: &AuthConfig) -> Self {
+    /// Builds the verifier from config. API-key entries with empty or
+    /// unparseable hashes are skipped with a warning. With no usable keys,
+    /// auth is DISABLED (the gateway binds localhost by default; real
+    /// deployments must configure keys).
+    ///
+    /// The admin token is stricter: an unset (or empty — the
+    /// kiln.toml.example placeholder) `auth.admin_token_hash` disables the
+    /// admin surface fail-closed (403), but a present, non-empty hash that
+    /// is not a valid PHC string is a hard startup error, matching the
+    /// other malformed-config rejections (non-power-of-two block_size,
+    /// unsupported quantization). Silently disabling admin over a typo'd
+    /// hash would leave an operator who thinks they enabled it with a
+    /// surface that never accepts their token.
+    pub fn from_config(config: &AuthConfig) -> Result<Self, ConfigError> {
         let mut keys = Vec::new();
         for entry in &config.api_keys {
             if entry.key_hash.is_empty() {
@@ -63,9 +72,10 @@ impl Auth {
             Some(hash) => match PasswordHash::new(hash) {
                 Ok(_) => Some(hash.to_string()),
                 Err(err) => {
-                    tracing::warn!(error = %err,
-                        "auth.admin_token_hash is not a valid PHC string; admin API disabled");
-                    None
+                    return Err(ConfigError::Invalid(format!(
+                        "auth.admin_token_hash is not a valid PHC string ({err}); \
+                         hash a token with `kiln-gateway hash-key`"
+                    )));
                 }
             },
         };
@@ -74,12 +84,12 @@ impl Auth {
                 "admin API disabled (no auth.admin_token_hash); /admin endpoints return 403"
             );
         }
-        Self {
+        Ok(Self {
             keys,
             cache: RwLock::new(HashMap::new()),
             admin_hash,
             admin_cache: RwLock::new(None),
-        }
+        })
     }
 
     pub fn enabled(&self) -> bool {
@@ -248,7 +258,8 @@ mod tests {
                 rpm: None,
                 tpm: None,
             }],
-        });
+        })
+        .expect("valid config");
         assert!(auth.enabled());
         assert_eq!(auth.verify("s3cret").await.as_deref(), Some("alice"));
         // Second call hits the cache (still must succeed).
@@ -266,7 +277,8 @@ mod tests {
                 rpm: None,
                 tpm: None,
             }],
-        });
+        })
+        .expect("valid config");
         assert!(auth.admin_enabled());
         assert!(auth.verify_admin("admin-secret").await);
         assert!(auth.verify_admin("admin-secret").await); // cached path
@@ -278,15 +290,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_empty_or_malformed_admin_hash_disables_admin() {
-        for hash in [None, Some(String::new()), Some("not-a-phc".to_string())] {
+    async fn missing_or_empty_admin_hash_disables_admin_fail_closed() {
+        for hash in [None, Some(String::new())] {
             let auth = Auth::from_config(&AuthConfig {
                 admin_token_hash: hash,
                 api_keys: vec![],
-            });
+            })
+            .expect("unset admin hash is a valid (disabled) config");
             assert!(!auth.admin_enabled());
             assert!(!auth.verify_admin("anything").await);
         }
+    }
+
+    /// Behavior correction (Phase 10 part 2): a present-but-malformed
+    /// admin hash used to warn and silently disable the admin surface;
+    /// it is now a hard startup error like other malformed config values.
+    #[test]
+    fn malformed_admin_hash_is_a_startup_error() {
+        let Err(err) = Auth::from_config(&AuthConfig {
+            admin_token_hash: Some("not-a-phc".to_string()),
+            api_keys: vec![],
+        }) else {
+            panic!("malformed admin hash must fail startup");
+        };
+        assert!(matches!(err, ConfigError::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("admin_token_hash"), "{err}");
+        assert!(err.to_string().contains("hash-key"), "{err}");
     }
 
     #[tokio::test]
@@ -307,7 +336,8 @@ mod tests {
                     tpm: None,
                 },
             ],
-        });
+        })
+        .expect("bad api keys skip, they do not fail startup");
         assert!(!auth.enabled());
     }
 }

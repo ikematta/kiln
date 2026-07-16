@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kiln_proto::v1::MemoryReport;
@@ -49,7 +49,9 @@ pub(crate) enum Command {
 pub(crate) struct Slot {
     cmd_tx: mpsc::UnboundedSender<Command>,
     status: watch::Receiver<WorkerStatus>,
-    pinned: bool,
+    /// Seeded from `[[model]] pinned`; toggled at runtime by
+    /// `POST /admin/models/{id}/pin` (not persisted back to kiln.toml).
+    pinned: AtomicBool,
     ttl: Option<Duration>,
     /// Bytes currently charged against the machine budget; 0 = not loaded.
     usage_bytes: AtomicU64,
@@ -129,7 +131,7 @@ impl Lifecycle {
                 Slot {
                     cmd_tx,
                     status: entry.status.clone(),
-                    pinned: entry.config.pinned,
+                    pinned: AtomicBool::new(entry.config.pinned),
                     ttl: match entry.config.ttl_seconds {
                         0 => None,
                         secs => Some(Duration::from_secs(secs)),
@@ -232,6 +234,50 @@ impl Lifecycle {
         if let Some(slot) = self.slots.get(model_id) {
             let _ = slot.cmd_tx.send(Command::Load);
         }
+    }
+
+    /// Asks the supervision task to unload the model on operator request
+    /// (`POST /admin/models/{id}/unload`). Fire-and-forget — the drain →
+    /// SIGTERM → SIGKILL ladder takes up to ~35s and progress is
+    /// observable through the status watch; false = unknown model or the
+    /// supervision task is gone.
+    pub fn request_unload(&self, model_id: &str) -> bool {
+        let Some(slot) = self.slots.get(model_id) else {
+            return false;
+        };
+        let (done_tx, _done_rx) = oneshot::channel();
+        slot.cmd_tx
+            .send(Command::Unload {
+                reason: UnloadReason::Admin,
+                done: done_tx,
+            })
+            .is_ok()
+    }
+
+    /// Whether the model is pinned (never LRU-evicted); None = unknown id.
+    pub fn pinned(&self, model_id: &str) -> Option<bool> {
+        self.slots
+            .get(model_id)
+            .map(|slot| slot.pinned.load(Ordering::Acquire))
+    }
+
+    /// Toggles eviction pinning at runtime (`POST /admin/models/{id}/pin`).
+    /// Not persisted: kiln.toml remains the boot-time source of truth.
+    /// False = unknown id.
+    pub fn set_pinned(&self, model_id: &str, pinned: bool) -> bool {
+        let Some(slot) = self.slots.get(model_id) else {
+            return false;
+        };
+        slot.pinned.store(pinned, Ordering::Release);
+        true
+    }
+
+    /// Bytes currently charged for one model (0 = not loaded / unknown).
+    pub fn model_usage_bytes(&self, model_id: &str) -> u64 {
+        self.slots
+            .get(model_id)
+            .map(|slot| slot.usage_bytes.load(Ordering::Acquire))
+            .unwrap_or(0)
     }
 
     /// Charges `bytes` for the model (reservation at load, measured
@@ -382,7 +428,7 @@ impl Lifecycle {
             .iter()
             .filter(|(id, slot)| {
                 id.as_str() != exclude
-                    && !slot.pinned
+                    && !slot.pinned.load(Ordering::Acquire)
                     && slot.usage_bytes.load(Ordering::Acquire) > 0
                     && *slot.status.borrow() == WorkerStatus::Ready
                     && slot.ttl.is_none_or(|ttl| {
@@ -572,7 +618,7 @@ mod tests {
                 Slot {
                     cmd_tx,
                     status: status_rx,
-                    pinned,
+                    pinned: AtomicBool::new(pinned),
                     ttl,
                     usage_bytes: AtomicU64::new(usage),
                     last_used_ms: AtomicU64::new(last_used_ms),
@@ -636,6 +682,23 @@ mod tests {
         ]);
         // Only pinned/leased candidates left: the load must be rejected.
         assert_eq!(lifecycle.pick_victim("loader"), None);
+    }
+
+    #[test]
+    fn runtime_pin_toggle_changes_eviction_candidacy() {
+        let (lifecycle, _senders) = lifecycle_with(vec![("m", false, None, 400, 0)]);
+        assert_eq!(lifecycle.pinned("m"), Some(false));
+        assert_eq!(lifecycle.pick_victim("loader").as_deref(), Some("m"));
+        assert!(lifecycle.set_pinned("m", true));
+        assert_eq!(lifecycle.pinned("m"), Some(true));
+        assert_eq!(lifecycle.pick_victim("loader"), None);
+        assert!(lifecycle.set_pinned("m", false));
+        assert_eq!(lifecycle.pick_victim("loader").as_deref(), Some("m"));
+        // Unknown ids are reported, not silently absorbed.
+        assert!(!lifecycle.set_pinned("ghost", true));
+        assert_eq!(lifecycle.pinned("ghost"), None);
+        assert_eq!(lifecycle.model_usage_bytes("m"), 400);
+        assert_eq!(lifecycle.model_usage_bytes("ghost"), 0);
     }
 
     #[test]

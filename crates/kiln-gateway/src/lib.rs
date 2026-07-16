@@ -3,6 +3,7 @@
 //! and the axum HTTP surface (SPEC §8).
 
 pub mod admin;
+pub mod admin_models;
 pub mod anthropic;
 pub mod app;
 pub mod auth;
@@ -17,3 +18,4 @@ pub mod openai;
 pub mod registry;
 pub mod supervisor;
 pub mod uds;
+pub mod ui;
