@@ -6217,3 +6217,122 @@
 - Next: Phase 10 part 2 — minimal admin UI (SvelteKit static, embedded via
   rust-embed: models table, load/unload/pin, live stats via SSE, job
   launcher calling /admin/jobs/*), per SPEC §12 Phase 10.
+
+## [2026-07-16] Phase 10 / Part 2 — admin UI + models/stats API + admin-hash hard-fail — DONE
+- What:
+  - Task A (behavior correction): a present-but-malformed
+    `auth.admin_token_hash` is now a hard startup `ConfigError::Invalid`
+    (was: warn + silently disable admin), matching the existing
+    malformed-config rejections (non-power-of-two block_size, unsupported
+    quantization). Unset/empty (the kiln.toml.example placeholder) is
+    unchanged: fail-closed 403 `admin_disabled` naming the fix. The unit
+    test asserting warn-and-disable now asserts the startup failure — a
+    deliberate correction of the tested contract, NOT a weakened test; the
+    missing/empty fail-closed assertions are retained unchanged. Auth is
+    built before `Supervisor::start`, so the failure spawns no workers.
+  - Admin models/stats API (SPEC §8.1): `GET /admin/models` (table +
+    machine memory ledger), `POST /admin/models/{id}/load|unload|pin`,
+    `GET /admin/stats` (1s SSE snapshots = lifecycle ledger + live worker
+    Health/Stats RPCs over the existing UDS channels). Runtime-mutable
+    pinning (AtomicBool on the lifecycle slot; not persisted — kiln.toml
+    stays boot-time truth); `UnloadReason::Admin`; Failed models refuse
+    load/unload with 409 naming the manual reset (admin reset stays out
+    of part 2 scope).
+  - Admin UI (SPEC §12 Phase 10, §3): `admin/` — one prerendered
+    SvelteKit page (static adapter, base `/ui`, no framework beyond
+    SvelteKit): models table with load/unload/pin, memory ledger, live
+    per-model stats via the SSE stream (streaming fetch — EventSource
+    cannot send Authorization), download/quantize job launcher on the
+    part 1 API. API 401/403 messages render VERBATIM — the fail-closed
+    admin_disabled 403 already names the fix, so "admin token not
+    configured" is a visible state, not a silent failure. Served by the
+    gateway at `/ui` via rust-embed: debug builds read `admin/build/`
+    from disk, release builds embed (single static binary, SPEC §1.1);
+    kiln-gateway build.rs creates the gitignored folder so cargo-only
+    checkouts compile, `/ui` then 503s naming the npm build command. The
+    /ui shell is unauthenticated static code; all data rides the
+    bearer-gated /admin API.
+  - Browser e2e (`tests/e2e/test_admin_ui.py`, playwright, Chrome
+    channel with chromium fallback; `KILN_E2E_REQUIRE_BROWSER=1` in CI
+    forbids the skip path): full operator flow through the ACTUAL UI —
+    connect → ready → an API completion moves the UI token counter with
+    no reload (live-SSE proof, exact-count match) → unload → "unloaded
+    (admin)" → load → ready → pin/unpin (cross-checked via API) →
+    download job launched in the UI runs to succeeded against the local
+    stub hub, files verified on disk. Plus verbatim-403 rendering and an
+    embedded-shell check.
+  - Found & fixed by that test's first run: the never-ending
+    /admin/stats SSE stream wedged axum's graceful shutdown — an open
+    dashboard turned SIGTERM into the 20s hard kill, leaking the worker
+    process group (caught by the conftest leaked-worker guard). AppState
+    now carries an http-shutdown watch flipped when graceful shutdown
+    begins; the stats stream ends on it. Verified: SIGTERM with an open
+    stream exits rc=0 in <1s; the e2e keeps the dashboard open through
+    stack teardown, pinning the regression.
+  - CI (test-macos): setup-node (npm cache) + `npm ci && npm run build`
+    for admin/ before the e2e step; guarded `playwright install
+    chromium` only if the runner image lacks Chrome; e2e step exports
+    KILN_E2E_REQUIRE_BROWSER=1.
+- Decisions:
+  - Empty-string admin_token_hash ≡ unset (disabled fail-closed), only
+    non-empty unparseable is the hard error: kiln.toml.example ships
+    `admin_token_hash = ""` as the placeholder, and an empty value is
+    the TOML idiom for "not set" — the dangerous case is a typo'd real
+    hash, which is exactly what now fails loudly.
+  - Model actions as POST subroutes (`/admin/models/{id}/load` etc.)
+    within SPEC §8.1's "GET/POST /admin/models" latitude; 202 +
+    observe-via-status rather than blocking the HTTP call on a ~35s
+    drain ladder.
+  - Stats SSE assembles live Health/Stats RPCs per tick (500ms per-RPC
+    timeout) instead of re-reading prometheus gauges: simpler, truly
+    live, and only costs RPCs while a dashboard is open.
+  - rust-embed default mode (debug = disk, release = embed): UI
+    iteration without gateway recompiles in dev, single binary in
+    release. Embedding named by SPEC §3 — not a discretionary dep.
+  - Browser = installed Chrome first (present on dev machines + GitHub
+    macOS runners; zero download), playwright chromium fallback; skip
+    only outside CI.
+- Deviations: none.
+- Acceptance:
+  ```
+  Task A:
+    $ kiln-gateway --config bad-admin.toml   (admin_token_hash = "not-a-phc")
+      kiln-gateway: invalid configuration: auth.admin_token_hash is not a
+      valid PHC string (password hash string missing field); hash a token
+      with `kiln-gateway hash-key`        exit=1, before any worker spawn
+    unset case unchanged: GET /admin/jobs -> 403
+      {"code":"admin_disabled","message":"The admin API is disabled: set
+       auth.admin_token_hash in kiln.toml (hash a token with `kiln-gateway
+       hash-key`)."}
+  Operator flow through the real UI (browser e2e, run twice locally):
+    tests/e2e/test_admin_ui.py::test_admin_ui_full_operator_flow PASSED
+    tests/e2e/test_admin_ui.py::test_admin_ui_surfaces_disabled_admin_verbatim PASSED
+    tests/e2e/test_admin_ui.py::test_ui_shell_is_served_embedded PASSED
+    (first run of the flow test failed ONLY in teardown — the leaked-worker
+     guard caught the SSE/graceful-shutdown bug above; green after the fix)
+  Shutdown regression check (manual, debug build):
+    SIGTERM with an open /admin/stats stream -> "gateway exited rc=0
+    after 0s with SSE stream open"
+  Suites (local, M-series):
+    cargo test --workspace (KILN_TEST_MODELS set, model-gated tiers incl.)
+      -> exit 0, all suites ok (73 gateway lib tests incl. new
+         admin_models/ui/auth coverage)
+    uv run --project tests/e2e pytest tests/e2e -> 93 passed, 3 skipped
+      (was 90 passed in part 1; +3 = the new admin-UI browser tests)
+    uv run --project python/kiln_worker_py pytest -> 35 passed
+    cargo build --workspace --no-default-features -> clean
+    fmt / clippy (default + --no-default-features, --all-targets) /
+      ruff check + format -> clean
+    npm ci + npm run build (admin/) -> 2.8s warm
+  CI (PR #30): ALL FOUR checks pass (run 29477773950) —
+    lint 1m6s, compile-linux 1m56s, test-macos-release 5m26s,
+    test-macos 1h4m18s (part 1 baseline 1h1m20s: the UI adds ~3 min,
+    dominated by browser startup inside the new e2e tests, not the build):
+      "Build admin UI": npm ci 50 packages in 1s + vite build ~2s
+      "Ensure a browser": runner Chrome present, no chromium download
+      E2E with KILN_E2E_REQUIRE_BROWSER=1: test_admin_ui.py 3/3 PASSED
+        -> 93 passed, 3 skipped in 9m42s
+      30-min soak: PASS (blocking gate)
+  ```
+- Next: Phase 10 part 3 — packaging + docs (Homebrew formula + launchd
+  plist, `kiln` CLI, README/config/API docs), the phase and build close.
