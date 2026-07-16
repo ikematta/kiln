@@ -1466,6 +1466,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-cli"
+version = "0.0.1"
+dependencies = [
+ "kiln-gateway",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "kiln-engine"
 version = "0.0.1"
 dependencies = [
