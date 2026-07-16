@@ -6336,3 +6336,161 @@
   ```
 - Next: Phase 10 part 3 — packaging + docs (Homebrew formula + launchd
   plist, `kiln` CLI, README/config/API docs), the phase and build close.
+
+## [2026-07-16] Phase 10 / Part 3 — packaging, CLI, docs — DONE; **BUILD CLOSEOUT** (final phase per SPEC §12)
+- What:
+  - `kiln` CLI (`crates/kiln-cli`, binary `kiln`; zero new external deps —
+    reqwest/tokio/serde_json were already workspace deps): `kiln serve`
+    execs the sibling `kiln-gateway` with resolved config (`--config` >
+    `$KILN_CONFIG` > `./kiln.toml` > `<prefix>/etc/kiln/kiln.toml`);
+    `kiln models` is a CLI view of the admin API's `GET /admin/models` —
+    the models table (id/worker/status/pinned/ttl/memory) plus the machine
+    memory ledger, bearer token from `$KILN_ADMIN_TOKEN`, host/port via
+    kiln-gateway's own config loader (new `KilnConfig::load_env_only`) so
+    resolution can't drift; `kiln bench` execs `scripts/bench.sh`, args
+    passed through verbatim.
+  - `scripts/bench.sh` + `bench.py` — the SPEC §11.3 load harness
+    CLAUDE.md has referenced since Phase 4 (flagged missing at every gate
+    review since): stdlib-only HTTP lanes (single-stream TTFT p50/p95 +
+    decode tok/s; batch aggregate tok/s at configurable width) against a
+    self-spawned release stack or `--url` a running gateway, results JSON
+    to `bench/results/` (gitignored); `--engine` reruns the committed
+    ADR 0003 release gate (`kiln-models --test throughput`). Prompts embed
+    the request index so the radix cache can't fake prefill; token counts
+    come from the server's own usage blocks.
+  - `Formula/kiln.rb` + launchd: rustup-pinned toolchain build (the
+    rust-toolchain.toml 1.96.1 pin is load-bearing — rust-lang/rust#158830
+    — so brew's floating `rust` is deliberately NOT used), admin UI
+    npm-built before cargo so rust-embed embeds it, `cargo install
+    --locked` for all four binaries off one shared target dir, worker+jobs
+    venvs `uv sync --frozen --no-dev` from the repo's committed uv.lock
+    pins into libexec, `mlx.metallib` installed next to the binaries,
+    starter `etc/kiln/kiln.toml` with venv-pointed argvs, `service do`
+    block (brew services) + `packaging/dev.kiln.gateway.plist` template
+    for non-brew installs (plutil-linted in CI).
+  - User docs: `README.md` (what/install/quickstart-to-completion/CLI/
+    admin/doc map), `docs/CONFIGURATION.md` (every kiln.toml field with
+    defaults; ADR cross-refs for the non-obvious knobs — kernel flag ↔
+    ADR 0002 context, speculative gamma ↔ ADR 0005, deployment-shape
+    precondition ↔ ADR 0006; §8.3 rate-limit gap stated plainly),
+    `docs/API_COMPAT.md` (per-endpoint supported surface + the recorded
+    gaps: forced tool_choice, logprobs, /v1/embeddings, rpm/tpm
+    parsed-not-enforced, structured output rust-only, determinism scope).
+  - Three real bugs found ONLY by executing the packaging end to end:
+    (1) `jobs_argv = ["kiln-jobs", "--venv", <dir>]` — documented in
+    kiln.toml.example since part 1 — never parsed (first arg was consumed
+    as the subcommand); flags now parse before the subcommand, both orders
+    unit-tested. (2) Installed workers died on their first array
+    (`mlx_array_new_data returned a null array`): MLX resolves
+    mlx.metallib colocated-with-executable then via a compiled-in path
+    into the (deleted) build tree; checkout builds never see this because
+    target/mlx-c-build/ persists. Formula now installs the metallib into
+    bin/. (3) `kiln bench` missed the keg: brew links bin/ (symlinks) but
+    not libexec/, and current_exe() is the unresolved symlink;
+    exe_relative() now tries raw then canonicalized paths.
+  - CI: packaging lint (`HOMEBREW_DEVELOPER=1 brew style` + `plutil
+    -lint`) added to test-macos-release; ruff gates extended to scripts/
+    (bench.py lives there); CLAUDE.md gates + repo map updated.
+- Decisions:
+  - `kiln models` surfaces the ADMIN API's list (status/memory ledger),
+    not `/v1/models` (ids only) — the operator CLI wants operator data;
+    the 403-until-configured admin discipline (part 1) applies unchanged.
+  - `kiln bench` wraps scripts/bench.sh (per the task instruction) with a
+    dual search path so it works from a checkout and from the installed
+    libexec copy; bench.py is stdlib-only so an installed kiln needs no
+    venv to benchmark.
+  - Formula stable `url` tracks `main` (no tagged release exists;
+    version = workspace 0.0.1); a tagged release should pin
+    `tag:`/`revision:`. Homebrew ≥4.6 refuses path formulas outside taps
+    unless `HOMEBREW_DEVELOPER=1` (HOMEBREW_FORBID_PACKAGES_FROM_PATHS
+    defaults true) — the acceptance command runs in developer mode, and
+    README documents both that and the `brew tap` route.
+  - SPEC §4's layout gains crates/kiln-cli, Formula/, packaging/ — §12
+    Phase 10 names the CLI/formula without placing them; recorded here as
+    within-latitude, SPEC text untouched.
+  - launchd = the formula `service` block (brew services generates and
+    loads the plist); the standalone template plist is provided for
+    non-brew installs rather than being the primary path.
+- Deviations: none in this part. Flagged for the record (SPEC-internal
+  inconsistency, no action): §8.1 lists `POST /v1/embeddings` in the API
+  surface but no §12 phase ever scheduled it (Phase 11 stretch =
+  "embeddings-native"); it is documented as not-implemented in
+  API_COMPAT.md rather than silently absent.
+- Acceptance (the §12 Phase 10 gate, executed for real on this machine):
+  ```
+  $ HOMEBREW_DEVELOPER=1 brew install --build-from-source ./Formula/kiln.rb
+    (formula = the committed file with url branch: main substituted to this
+     PR's branch — the only delta, verified by diff — since the code was
+     not yet on main; brew clones the repo, so the local tree is unused)
+    ==> rustup toolchain install            (1.96.1 per rust-toolchain.toml)
+    ==> npm ci --prefix admin && npm run build --prefix admin
+    ==> cargo install --locked x {kiln-cli, kiln-gateway, kiln-worker, kiln-jobs}
+    ==> uv sync --frozen --no-dev x {kiln_worker_py, kiln_jobs_py}  (mlx 0.31.1 pins)
+    🍺  /opt/homebrew/Cellar/kiln/0.0.1: 11,008 files, 625.9MB, built in 8 minutes
+  $ brew test kiln -> pass (kiln --version, hash-key argon2 round-trip, jobs usage)
+  Real kiln.toml (pristine etc/kiln/kiln.toml + admin hash + one [[model]]
+  block: llama-3.2-1b -> ~/.kiln/test-models/llama-3.2-1b-4bit, worker auto):
+  $ kiln serve                              (config resolved from <prefix>/etc)
+    /readyz -> 200 {"status":"ready","models":{"llama-3.2-1b":"ready"}}
+    POST /v1/chat/completions (greedy, max_tokens 48) -> 200:
+      "A kiln is a type of oven or furnace that uses high heat to
+       transform and harden various materials..." finish_reason stop,
+      usage 46+39 — byte-identical across both install acceptance runs
+      (greedy determinism holding through a from-scratch rebuild).
+  $ KILN_ADMIN_TOKEN=... kiln models
+      ID            WORKER  STATUS  PINNED  TTL  MEMORY
+      llama-3.2-1b  rust    ready   no      -    1.2 GiB
+      memory: 1.2 GiB used / 12.8 GiB budget (0 B reserved, 16.0 GiB machine)
+  GET /ui -> 200 text/html (rust-embed release embed, no admin/ on disk)
+  $ kiln bench --model llama-3.2-1b --url http://127.0.0.1:8080 (installed
+    libexec harness): single-stream decode 123.8 tok/s — matching the
+    Phase 6 recorded post-B' single-stream number exactly; results JSON
+    written.
+  launchd cycle: brew services start kiln -> launchctl list shows
+    homebrew.mxcl.kiln exit-code 0 -> /readyz 200 -> completion "ok"
+    served by the service -> brew services stop -> label gone, port
+    closed. var/log/kiln.log populated.
+  Suites (local, M-series):
+    cargo test --workspace (KILN_TEST_MODELS set) -> exit 0
+    uv run --project tests/e2e pytest tests/e2e -> 93 passed, 3 skipped
+    uv run --project python/kiln_worker_py pytest -> 35 passed
+    fmt / clippy (default + --no-default-features, --all-targets) clean;
+    cargo build --workspace --no-default-features clean;
+    ruff check/format (python/ tests/e2e scripts) clean;
+    brew style --formula Formula/kiln.rb -> no offenses; plutil -lint OK
+  CI (PR #31, head f944f7c): ALL FOUR checks pass —
+    lint 42s, compile-linux 1m2s, test-macos-release 3m57s with the
+    new packaging-lint step live on the runner, test-macos 1h6m52s
+    (workspace + model-gated suites + quantize + e2e incl. admin-UI
+    browser flow + 30-min soak, all green; run 29536246532).
+  ```
+- **BUILD CLOSEOUT** (SPEC §12: Phase 10 is the last phase; Phase 11 is
+  stretch, separate approval — NOT started):
+  - Phases 0-10 all closed: 0 scaffold/contract; 1 python worker E2E;
+    2 gateway tracer bullet; 3 rust Llama worker + golden harness;
+    4 paged KV + continuous batching; 5 radix prefix cache + SSD tier;
+    6 Qwen/Gemma + routing (ADR 0002/0003 determinism+throughput bars);
+    7 structured output, tools, /v1/messages, paged-attention kernel
+    (passed both bars, ships default-off by ruling); 8 speculative
+    decoding (ADR 0005 envelope, ADR 0006 deployment shape); 9 memory
+    governance + priorities + reservation-ledger admission + standing
+    30-min soak gate; 10 jobs + admin UI + packaging + docs (this entry).
+  - The keystone guarantees, as they stand at closeout: golden parity
+    exact same-device for every fixture model incl. batched/width-16
+    (ADR 0004 scope; the sole standing advisory divergence remains
+    gemma-3-1b-it-4bit/chat-basic on the FOREIGN-device CI lane, the
+    ADR 0004 pattern); greedy determinism invariant under batching,
+    prefix cache, preemption, and speculation — enforced by blocking CI
+    suites and 28/28+16/16 soak canaries; leak gates (RSS slope + mlx
+    live-object counter) blocking on every PR via the 30-min soak.
+  - Standing open items, all recorded, none blocking the §12 gate:
+    §8.3 rate limits/timeouts parsed-not-enforced (BACKLOG since Phase 2;
+    now user-visible in API_COMPAT.md); python-worker batching upgrade
+    (SPEC §9.2 "Phase 9 improvement", never scheduled); continuous-
+    pressure eviction for mlx-cache drift (Phase 9 soak envelope
+    +384 MB worst); /v1/embeddings (Phase 11); ADR 0006 BACKLOG
+    weights-byte-ratio guard at drafter attachment; Formula bottling +
+    tagged release when the repo cuts one.
+- Next: nothing — the SPEC §12 build plan is complete. Phase 11
+  (embeddings-native, VLM via python worker, MTP self-draft, distributed
+  exploration) requires separate human approval per SPEC.
