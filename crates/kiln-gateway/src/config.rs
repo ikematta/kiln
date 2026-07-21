@@ -121,6 +121,18 @@ pub enum WorkerKind {
     Auto,
 }
 
+impl WorkerKind {
+    /// The kiln.toml spelling (the serde `lowercase` names), used when the
+    /// add-model flow writes a `[[model]]` block back to disk.
+    pub fn as_config_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelConfig {
     pub id: String,
@@ -183,6 +195,15 @@ impl KilnConfig {
     /// default localhost address).
     pub fn load_env_only() -> Result<Self, ConfigError> {
         let config: Self = Figment::new().merge(Self::env_provider()).extract()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Parses and validates TOML text with NO environment overrides: the
+    /// re-verification gate the add-model config write runs before it
+    /// replaces kiln.toml on disk.
+    pub fn parse_str(text: &str) -> Result<Self, ConfigError> {
+        let config: Self = Figment::new().merge(Toml::string(text)).extract()?;
         config.validate()?;
         Ok(config)
     }

@@ -21,7 +21,16 @@ import subprocess
 
 import httpx
 import pytest
-from conftest import API_KEY, MODEL_ID, build_binaries, model_dir, running_stack
+from conftest import (
+    API_KEY,
+    MODEL_ID,
+    QWEN_MODEL_ID,
+    build_binaries,
+    model_dir,
+    pinned_model_dir,
+    running_stack,
+)
+from test_add_model import add_stack, assert_only_inserted, dir_hub
 from test_admin_jobs import STUB_FILES, STUB_SHA, stub_hub  # noqa: F401 (fixture)
 
 ADMIN_TOKEN = "kiln-e2e-ui-admin-token"
@@ -166,6 +175,86 @@ def test_admin_ui_full_operator_flow(browser_page, stub_hub):  # noqa: F811
         for name, data in STUB_FILES.items():
             assert (dest / name).read_bytes() == data
         assert (dest / ".kiln-revision").read_text() == f"stub/tiny@{STUB_SHA}\n"
+
+
+def test_admin_ui_add_model_full_flow(browser_page):
+    """The whole Add Model story through the real UI: HF repo id in, memory
+    estimate against the machine's live budget, download progress from the
+    job launcher, auto-registration, "load now", and a completion served on
+    the new model — all on one gateway process (zero restarts), with
+    kiln.toml gaining exactly one [[model]] block and nothing else."""
+    from playwright.sync_api import expect
+    from test_add_model import ADMIN_TOKEN as ADD_ADMIN_TOKEN
+
+    if model_dir() is None:
+        pytest.skip(
+            f"pinned test model '{MODEL_ID}' not found; run ./scripts/fetch-test-model.sh"
+        )
+    qwen_dir = pinned_model_dir(QWEN_MODEL_ID)
+    if qwen_dir is None:
+        pytest.skip(
+            f"pinned test model '{QWEN_MODEL_ID}' not found; run "
+            "./scripts/fetch-test-model.sh"
+        )
+    page = browser_page
+    # A stub hub serving the REAL qwen model from disk: the download is a
+    # genuine multi-hundred-MB transfer and the result genuinely serves.
+    with dir_hub("stub/qwen3", qwen_dir) as hub_url:
+        with add_stack([(MODEL_ID, "rust")], hub_url) as (stack, _dest_root):
+            config_path = stack.runtime_dir / "kiln.toml"
+            before = config_path.read_text()
+
+            connect(page, stack.base_url, ADD_ADMIN_TOKEN)
+            expect(page.get_by_test_id("connected")).to_be_visible()
+
+            # Memory estimate before committing to the download: hub-listed
+            # weight bytes against the live budget ledger.
+            page.get_by_test_id("add-path").fill("stub/qwen3")
+            page.get_by_test_id("add-estimate").click()
+            estimate = page.get_by_test_id("add-estimate-text")
+            expect(estimate).to_be_visible(timeout=15_000)
+            expect(estimate).to_contain_text("needs ~")
+            expect(estimate).to_contain_text("free of")
+
+            # Add: not downloaded yet, so the download-job flow runs first
+            # (progress visible), then auto-registers — one continuous flow.
+            page.get_by_test_id("add-id").fill("qwen-added")
+            page.get_by_test_id("add-submit").click()
+            expect(page.get_by_test_id("add-progress")).to_be_visible(timeout=30_000)
+            status_line = page.get_by_test_id("add-status")
+            expect(status_line).to_contain_text(
+                "registered — persisted to", timeout=180_000
+            )
+
+            # The new model appears in the live table, never loaded yet.
+            row_status = page.get_by_test_id("status-qwen-added")
+            expect(row_status).to_have_text("unloaded (registered)", timeout=15_000)
+
+            # "Load now" → ready via the existing lifecycle machinery.
+            page.get_by_test_id("add-load-now").click()
+            expect(row_status).to_have_text("ready", timeout=300_000)
+
+            # Servable through the API — same gateway process throughout.
+            completion = httpx.post(
+                f"{stack.base_url}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {API_KEY}"},
+                json={
+                    "model": "qwen-added",
+                    "messages": [{"role": "user", "content": "Say hello."}],
+                    "max_tokens": 16,
+                },
+                timeout=120,
+            )
+            assert completion.status_code == 200, completion.text
+            assert completion.json()["usage"]["completion_tokens"] > 0
+            assert stack.gateway.poll() is None, "gateway must not have restarted"
+
+            # kiln.toml: every pre-existing line intact, exactly one block
+            # added, and it points at the downloaded local dir.
+            after = config_path.read_text()
+            inserted = assert_only_inserted(before, after)
+            assert any('id = "qwen-added"' in line for line in inserted), inserted
+            assert any("stub--qwen3" in line for line in inserted), inserted
 
 
 def test_admin_ui_surfaces_disabled_admin_verbatim(browser_page):

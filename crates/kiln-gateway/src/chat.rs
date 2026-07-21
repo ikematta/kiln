@@ -75,7 +75,6 @@ pub(crate) fn ready_entry(state: &AppState, model: &str) -> Result<Arc<ModelEntr
     let entry = state
         .registry
         .get(model)
-        .cloned()
         .ok_or_else(|| ApiError::model_not_found(model))?;
     match entry.status() {
         WorkerStatus::Ready => {

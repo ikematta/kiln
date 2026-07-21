@@ -45,7 +45,8 @@ fn worker_label(kind: WorkerKind) -> &'static str {
 }
 
 /// One row of the models table (the static part; live numbers ride SSE).
-fn model_json(state: &AppState, entry: &ModelEntry) -> Value {
+/// Shared with the add-model 201 response (crate::admin_register).
+pub(crate) fn model_json(state: &AppState, entry: &ModelEntry) -> Value {
     json!({
         "id": entry.id,
         "path": entry.model_path.display().to_string(),
@@ -71,13 +72,14 @@ fn memory_json(state: &AppState) -> Value {
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     let models: Vec<Value> = state
         .registry
+        .entries()
         .iter()
         .map(|entry| model_json(&state, entry))
         .collect();
     Json(json!({ "models": models, "memory": memory_json(&state) }))
 }
 
-fn entry_or_404<'a>(state: &'a AppState, id: &str) -> Result<&'a Arc<ModelEntry>, ApiError> {
+fn entry_or_404(state: &AppState, id: &str) -> Result<Arc<ModelEntry>, ApiError> {
     state
         .registry
         .get(id)
@@ -229,11 +231,11 @@ async fn live_worker_json(entry: &ModelEntry) -> (Value, Value) {
 /// worker numbers.
 async fn stats_snapshot(state: &AppState) -> Value {
     let mut models = Vec::new();
-    for entry in state.registry.iter() {
-        let mut row = model_json(state, entry);
+    for entry in state.registry.entries() {
+        let mut row = model_json(state, &entry);
         let status = entry.status();
         let (health, stats) = if matches!(status, WorkerStatus::Ready | WorkerStatus::Draining) {
-            live_worker_json(entry).await
+            live_worker_json(&entry).await
         } else {
             (Value::Null, Value::Null)
         };
@@ -316,13 +318,27 @@ mod tests {
         let registry = Arc::new(registry);
         let (lifecycle, mut receivers) =
             Lifecycle::new(&config, &registry, Arc::clone(&metrics)).expect("lifecycle");
+        let lifecycle = Arc::new(lifecycle);
+        let config_path = dir.join("kiln.toml");
+        std::fs::write(&config_path, "").expect("test config");
+        let registrar = crate::admin_register::Registrar::new(
+            crate::supervisor::ModelSpawner::test_stub(
+                Arc::new(config.clone()),
+                Arc::clone(&metrics),
+                Arc::clone(&lifecycle),
+            ),
+            &config,
+            config_path,
+        )
+        .expect("registrar");
         let state = Arc::new(AppState {
             registry,
-            lifecycle: Arc::new(lifecycle),
+            lifecycle,
             metrics,
             auth: Auth::from_config(&config.auth).expect("auth"),
             jobs: crate::admin::JobsProxy::external(PathBuf::from("/tmp/kiln-admin-models.sock"))
                 .expect("proxy"),
+            registrar,
             shutdown: watch::channel(false).1,
         });
         (state, senders.remove(0), receivers.remove(0), dir)

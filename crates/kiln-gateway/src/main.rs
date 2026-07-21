@@ -74,6 +74,11 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("no [[model]] entries configured; chat endpoints will 404");
     }
     let jobs = kiln_gateway::admin::JobsProxy::from_config(&config)?;
+    let registrar = kiln_gateway::admin_register::Registrar::new(
+        supervisor.spawner(),
+        &config,
+        std::path::PathBuf::from(config_path),
+    )?;
     // Signals never-ending responses (the stats SSE stream) to finish so
     // axum's graceful connection drain can complete.
     let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::watch::channel(false);
@@ -83,6 +88,7 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         metrics,
         auth,
         jobs,
+        registrar,
         shutdown: http_shutdown_rx,
     });
 

@@ -88,6 +88,12 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # following. rustls only (CLAUDE.md: no openssl); the hyper stack underneath
 # is already in-tree via axum/tonic. MIT/Apache-2.0.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# Gateway add-model persistence (SPEC §8.1 admin surface): edits kiln.toml
+# in place — comments, formatting, and unrelated entries byte-preserved —
+# when POST /admin/models appends a [[model]] block. Already in the tree
+# transitively (figment's toml backend); this makes the edit API direct.
+# MIT/Apache-2.0.
+toml_edit = "0.22"
 # Admin SPA embedding (SPEC §3: "SvelteKit (static adapter) served by
 # gateway from embedded assets (rust-embed)"). Debug builds read
 # admin/build from disk at runtime (UI iterates without recompiling the

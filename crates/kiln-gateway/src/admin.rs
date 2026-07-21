@@ -387,14 +387,23 @@ mod tests {
         let mut config = KilnConfig::default();
         config.auth.admin_token_hash = admin_hash;
         let metrics = Arc::new(Metrics::new().expect("metrics"));
-        let (registry, lifecycle, _supervisor) =
+        let (registry, lifecycle, supervisor) =
             Supervisor::start(&config, Arc::clone(&metrics)).expect("supervisor with no models");
+        let config_path = std::env::temp_dir().join(format!(
+            "kiln-admin-test-config-{}.toml",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(&config_path, "").expect("test config");
+        let registrar =
+            crate::admin_register::Registrar::new(supervisor.spawner(), &config, config_path)
+                .expect("registrar");
         let state = Arc::new(AppState {
             registry,
             lifecycle,
             metrics,
             auth: Auth::from_config(&config.auth).expect("valid auth config"),
             jobs: JobsProxy::external(socket).expect("proxy"),
+            registrar,
             shutdown: tokio::sync::watch::channel(false).1,
         });
         app::router(state)

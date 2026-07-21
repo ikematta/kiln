@@ -47,6 +47,10 @@ pub enum UnloadReason {
     OverBudget,
     /// Operator asked for it via `POST /admin/models/{id}/unload`.
     Admin,
+    /// Registered at runtime via `POST /admin/models` and never yet
+    /// loaded. Behaves as any deliberate unload: /readyz counts it
+    /// settled, and a request (or the admin load action) starts the load.
+    Registered,
 }
 
 impl UnloadReason {
@@ -57,6 +61,7 @@ impl UnloadReason {
             Self::IdleTtl => "idle_ttl",
             Self::OverBudget => "over_budget",
             Self::Admin => "admin",
+            Self::Registered => "registered",
         }
     }
 }
@@ -79,6 +84,9 @@ impl fmt::Display for WorkerStatus {
             Self::Unloaded {
                 reason: UnloadReason::Admin,
             } => write!(f, "unloaded (admin)"),
+            Self::Unloaded {
+                reason: UnloadReason::Registered,
+            } => write!(f, "unloaded (registered)"),
             Self::Restarting { attempt } => write!(f, "restarting (attempt {attempt})"),
             Self::Failed => write!(f, "failed"),
             Self::Stopped => write!(f, "stopped"),
@@ -121,7 +129,15 @@ impl ModelEntry {
     }
 }
 
+/// Interior-mutable so `POST /admin/models` can register models after
+/// boot; the boot-time set comes from `[[model]]` config entries. Entries
+/// are only ever added — removal stays a restart-scoped operation.
 pub struct Registry {
+    inner: std::sync::RwLock<RegistryInner>,
+}
+
+#[derive(Default)]
+struct RegistryInner {
     by_id: HashMap<String, Arc<ModelEntry>>,
     ordered: Vec<Arc<ModelEntry>>,
 }
@@ -167,6 +183,8 @@ pub enum RegistryError {
          fetch it first"
     )]
     DraftNotLocal { id: String, path: String },
+    #[error("a model with id '{0}' is already registered")]
+    Duplicate(String),
 }
 
 impl Registry {
@@ -176,84 +194,120 @@ impl Registry {
         config: &KilnConfig,
     ) -> Result<(Self, Vec<watch::Sender<WorkerStatus>>), RegistryError> {
         let runtime_dir = expand_tilde(&config.server.runtime_dir);
-        let created_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let mut by_id = HashMap::new();
-        let mut ordered = Vec::new();
+        let mut inner = RegistryInner::default();
         let mut senders = Vec::new();
 
         for model in &config.models {
-            let model_path = expand_tilde(Path::new(&model.path));
-            if !model_path.join("config.json").is_file() {
-                return Err(RegistryError::NotLocal {
-                    id: model.id.clone(),
-                    path: model.path.clone(),
-                });
-            }
-
-            let (worker_kind, tokenizer) = resolve_worker(model, &model_path)?;
-            let draft_path = resolve_draft(model, worker_kind)?;
-
-            let template = match ChatTemplate::from_model_dir(&model_path) {
-                Ok(t) => Some(t),
-                Err(err) => {
-                    tracing::warn!(model = %model.id, error = %err,
-                        "no usable chat template; chat completions will be rejected");
-                    None
-                }
-            };
-
-            let socket_path = socket_path_for(&runtime_dir, &model.id);
-            // macOS sun_path is 104 bytes; a longer path fails at bind time
-            // with a confusing error, so reject it up front.
-            let socket_str = socket_path.to_string_lossy();
-            if socket_str.len() > 100 {
-                return Err(RegistryError::SocketPathTooLong(socket_str.into_owned()));
-            }
-
-            let channel =
-                uds_channel(socket_path.clone()).map_err(|source| RegistryError::Channel {
-                    id: model.id.clone(),
-                    source,
-                })?;
-
-            let (status_tx, status_rx) = watch::channel(WorkerStatus::Starting);
-            let entry = Arc::new(ModelEntry {
-                id: model.id.clone(),
-                model_path,
-                draft_path,
-                socket_path,
-                config: model.clone(),
-                worker_kind,
-                tokenizer,
-                template,
-                channel,
-                status: status_rx,
-                info: RwLock::new(None),
-                created_unix,
-            });
-            by_id.insert(model.id.clone(), Arc::clone(&entry));
-            ordered.push(entry);
+            let (entry, status_tx) = build_entry(model, &runtime_dir, WorkerStatus::Starting)?;
+            inner.by_id.insert(model.id.clone(), Arc::clone(&entry));
+            inner.ordered.push(entry);
             senders.push(status_tx);
         }
 
-        Ok((Self { by_id, ordered }, senders))
+        Ok((
+            Self {
+                inner: std::sync::RwLock::new(inner),
+            },
+            senders,
+        ))
     }
 
-    pub fn get(&self, id: &str) -> Option<&Arc<ModelEntry>> {
-        self.by_id.get(id)
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, RegistryInner> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Arc<ModelEntry>> {
-        self.ordered.iter()
+    pub fn get(&self, id: &str) -> Option<Arc<ModelEntry>> {
+        self.read().by_id.get(id).cloned()
+    }
+
+    /// Snapshot of every entry in registration order (config order first,
+    /// then runtime adds).
+    pub fn entries(&self) -> Vec<Arc<ModelEntry>> {
+        self.read().ordered.clone()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ordered.is_empty()
+        self.read().ordered.is_empty()
     }
+
+    /// Registers a runtime-added entry (`POST /admin/models`). The
+    /// duplicate check and the insert are one atomic step under the write
+    /// lock — a duplicate id is rejected, never overwritten.
+    pub fn insert(&self, entry: Arc<ModelEntry>) -> Result<(), RegistryError> {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if inner.by_id.contains_key(&entry.id) {
+            return Err(RegistryError::Duplicate(entry.id.clone()));
+        }
+        inner.by_id.insert(entry.id.clone(), Arc::clone(&entry));
+        inner.ordered.push(entry);
+        Ok(())
+    }
+}
+
+/// Builds one registry entry: path locality check, worker resolution,
+/// tokenizer/template load, socket path, lazy channel. Shared by the
+/// boot-time `from_config` (initial status `Starting`; the bootstrap task
+/// loads in config order) and the runtime add path (initial status
+/// `Unloaded(Registered)`: nothing is running and nothing loads until
+/// asked).
+pub(crate) fn build_entry(
+    model: &ModelConfig,
+    runtime_dir: &Path,
+    initial_status: WorkerStatus,
+) -> Result<(Arc<ModelEntry>, watch::Sender<WorkerStatus>), RegistryError> {
+    let model_path = expand_tilde(Path::new(&model.path));
+    if !model_path.join("config.json").is_file() {
+        return Err(RegistryError::NotLocal {
+            id: model.id.clone(),
+            path: model.path.clone(),
+        });
+    }
+
+    let (worker_kind, tokenizer) = resolve_worker(model, &model_path)?;
+    let draft_path = resolve_draft(model, worker_kind)?;
+
+    let template = match ChatTemplate::from_model_dir(&model_path) {
+        Ok(t) => Some(t),
+        Err(err) => {
+            tracing::warn!(model = %model.id, error = %err,
+                "no usable chat template; chat completions will be rejected");
+            None
+        }
+    };
+
+    let socket_path = socket_path_for(runtime_dir, &model.id);
+    // macOS sun_path is 104 bytes; a longer path fails at bind time
+    // with a confusing error, so reject it up front.
+    let socket_str = socket_path.to_string_lossy();
+    if socket_str.len() > 100 {
+        return Err(RegistryError::SocketPathTooLong(socket_str.into_owned()));
+    }
+
+    let channel = uds_channel(socket_path.clone()).map_err(|source| RegistryError::Channel {
+        id: model.id.clone(),
+        source,
+    })?;
+
+    let created_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (status_tx, status_rx) = watch::channel(initial_status);
+    let entry = Arc::new(ModelEntry {
+        id: model.id.clone(),
+        model_path,
+        draft_path,
+        socket_path,
+        config: model.clone(),
+        worker_kind,
+        tokenizer,
+        template,
+        channel,
+        status: status_rx,
+        info: RwLock::new(None),
+        created_unix,
+    });
+    Ok((entry, status_tx))
 }
 
 /// SPEC §10 `worker` resolution, plus the gateway-side tokenizer that a Rust

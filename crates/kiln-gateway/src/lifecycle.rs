@@ -93,7 +93,11 @@ pub struct MemoryDenial {
 pub struct Lifecycle {
     budget_bytes: u64,
     total_bytes: Option<u64>,
-    slots: HashMap<String, Slot>,
+    /// Interior-mutable so `POST /admin/models` can add slots after boot.
+    /// Lock order: [`Self::admission_lock`] may take the slots read lock
+    /// (via `charged_bytes`) but never the reverse — [`Self::add_slot`]'s
+    /// write lock is taken with no other lock held.
+    slots: std::sync::RwLock<HashMap<String, Arc<Slot>>>,
     /// One model (re)load at a time, machine-wide: budget acquisition,
     /// eviction, spawn, and wait-for-READY all happen under this permit,
     /// so concurrent loads cannot double-spend the same headroom (and one
@@ -124,24 +128,16 @@ impl Lifecycle {
 
         let mut slots = HashMap::new();
         let mut receivers = Vec::new();
-        for entry in registry.iter() {
+        for entry in registry.entries() {
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
             slots.insert(
                 entry.id.clone(),
-                Slot {
+                Arc::new(make_slot(
                     cmd_tx,
-                    status: entry.status.clone(),
-                    pinned: AtomicBool::new(entry.config.pinned),
-                    ttl: match entry.config.ttl_seconds {
-                        0 => None,
-                        secs => Some(Duration::from_secs(secs)),
-                    },
-                    usage_bytes: AtomicU64::new(0),
-                    last_used_ms: AtomicU64::new(0),
-                    pool_commitment_bytes: AtomicU64::new(0),
-                    pool_materialized_bytes: AtomicU64::new(0),
-                    pool_reserved_bytes: AtomicU64::new(0),
-                },
+                    entry.status.clone(),
+                    entry.config.pinned,
+                    entry.config.ttl_seconds,
+                )),
             );
             receivers.push(cmd_rx);
         }
@@ -149,7 +145,7 @@ impl Lifecycle {
             Self {
                 budget_bytes,
                 total_bytes,
-                slots,
+                slots: std::sync::RwLock::new(slots),
                 load_permit: tokio::sync::Mutex::new(()),
                 admission_lock: std::sync::Mutex::new(()),
                 metrics,
@@ -157,6 +153,45 @@ impl Lifecycle {
             },
             receivers,
         ))
+    }
+
+    /// Adds the slot for a runtime-registered model (`POST /admin/models`)
+    /// and returns the command receiver for its supervision task. `None`
+    /// when the id already has a slot — the caller's registry insert is
+    /// the authoritative duplicate gate, so this is a belt-and-braces
+    /// refusal, never an overwrite.
+    pub(crate) fn add_slot(
+        &self,
+        model: &crate::config::ModelConfig,
+        status: watch::Receiver<WorkerStatus>,
+    ) -> Option<mpsc::UnboundedReceiver<Command>> {
+        let mut slots = self.slots.write().unwrap_or_else(|e| e.into_inner());
+        if slots.contains_key(&model.id) {
+            return None;
+        }
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        slots.insert(
+            model.id.clone(),
+            Arc::new(make_slot(cmd_tx, status, model.pinned, model.ttl_seconds)),
+        );
+        Some(cmd_rx)
+    }
+
+    fn slot(&self, model_id: &str) -> Option<Arc<Slot>> {
+        self.slots
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(model_id)
+            .cloned()
+    }
+
+    fn slots_snapshot(&self) -> Vec<(String, Arc<Slot>)> {
+        self.slots
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, slot)| (id.clone(), Arc::clone(slot)))
+            .collect()
     }
 
     pub fn budget_bytes(&self) -> u64 {
@@ -171,6 +206,8 @@ impl Lifecycle {
     /// footprints (and load-time reservations recorded as usage).
     pub fn used_bytes(&self) -> u64 {
         self.slots
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|slot| slot.usage_bytes.load(Ordering::Acquire))
             .sum()
@@ -179,6 +216,8 @@ impl Lifecycle {
     /// Admission reservations not yet confirmed by heartbeats.
     pub fn reserved_bytes(&self) -> u64 {
         self.slots
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|slot| slot.pool_reserved_bytes.load(Ordering::Acquire))
             .sum()
@@ -202,14 +241,14 @@ impl Lifecycle {
     /// reported in-flight work): resets both the LRU position and the TTL
     /// idle clock.
     pub fn touch(&self, model_id: &str) {
-        if let Some(slot) = self.slots.get(model_id) {
+        if let Some(slot) = self.slot(model_id) {
             slot.last_used_ms.store(self.now_ms(), Ordering::Release);
         }
     }
 
     /// Idle time since last use (for the supervisor's TTL sweep).
     pub(crate) fn idle(&self, model_id: &str) -> Duration {
-        let Some(slot) = self.slots.get(model_id) else {
+        let Some(slot) = self.slot(model_id) else {
             return Duration::ZERO;
         };
         let last = slot.last_used_ms.load(Ordering::Acquire);
@@ -220,7 +259,7 @@ impl Lifecycle {
     /// on-demand path behind TTL unloads and evictions. Cheap and
     /// non-blocking; a no-op unless the model is currently `Unloaded`.
     pub fn request_load(&self, model_id: &str) {
-        if let Some(slot) = self.slots.get(model_id)
+        if let Some(slot) = self.slot(model_id)
             && matches!(*slot.status.borrow(), WorkerStatus::Unloaded { .. })
         {
             let _ = slot.cmd_tx.send(Command::Load);
@@ -231,7 +270,7 @@ impl Lifecycle {
     /// status is still the registry-initial `Starting` (so `request_load`'s
     /// `Unloaded` gate would drop it).
     pub(crate) fn boot_load(&self, model_id: &str) {
-        if let Some(slot) = self.slots.get(model_id) {
+        if let Some(slot) = self.slot(model_id) {
             let _ = slot.cmd_tx.send(Command::Load);
         }
     }
@@ -242,7 +281,7 @@ impl Lifecycle {
     /// observable through the status watch; false = unknown model or the
     /// supervision task is gone.
     pub fn request_unload(&self, model_id: &str) -> bool {
-        let Some(slot) = self.slots.get(model_id) else {
+        let Some(slot) = self.slot(model_id) else {
             return false;
         };
         let (done_tx, _done_rx) = oneshot::channel();
@@ -256,8 +295,7 @@ impl Lifecycle {
 
     /// Whether the model is pinned (never LRU-evicted); None = unknown id.
     pub fn pinned(&self, model_id: &str) -> Option<bool> {
-        self.slots
-            .get(model_id)
+        self.slot(model_id)
             .map(|slot| slot.pinned.load(Ordering::Acquire))
     }
 
@@ -265,7 +303,7 @@ impl Lifecycle {
     /// Not persisted: kiln.toml remains the boot-time source of truth.
     /// False = unknown id.
     pub fn set_pinned(&self, model_id: &str, pinned: bool) -> bool {
-        let Some(slot) = self.slots.get(model_id) else {
+        let Some(slot) = self.slot(model_id) else {
             return false;
         };
         slot.pinned.store(pinned, Ordering::Release);
@@ -274,8 +312,7 @@ impl Lifecycle {
 
     /// Bytes currently charged for one model (0 = not loaded / unknown).
     pub fn model_usage_bytes(&self, model_id: &str) -> u64 {
-        self.slots
-            .get(model_id)
+        self.slot(model_id)
             .map(|slot| slot.usage_bytes.load(Ordering::Acquire))
             .unwrap_or(0)
     }
@@ -283,7 +320,7 @@ impl Lifecycle {
     /// Charges `bytes` for the model (reservation at load, measured
     /// footprint on every heartbeat).
     pub(crate) fn record_usage(&self, model_id: &str, bytes: u64) {
-        if let Some(slot) = self.slots.get(model_id) {
+        if let Some(slot) = self.slot(model_id) {
             slot.usage_bytes.store(bytes, Ordering::Release);
             self.export_gauges();
         }
@@ -293,7 +330,7 @@ impl Lifecycle {
     /// including its pool projection state and any pending reservation.
     pub(crate) fn clear_usage(&self, model_id: &str) {
         self.record_usage(model_id, 0);
-        if let Some(slot) = self.slots.get(model_id) {
+        if let Some(slot) = self.slot(model_id) {
             slot.pool_commitment_bytes.store(0, Ordering::Release);
             slot.pool_materialized_bytes.store(0, Ordering::Release);
             slot.pool_reserved_bytes.store(0, Ordering::Release);
@@ -304,7 +341,7 @@ impl Lifecycle {
     /// Records the worker's full-pool cost (READY-time `WorkerInfo`
     /// geometry) for [`Lifecycle::admit_request`] projections.
     pub(crate) fn set_pool_commitment(&self, model_id: &str, bytes: u64) {
-        if let Some(slot) = self.slots.get(model_id) {
+        if let Some(slot) = self.slot(model_id) {
             slot.pool_commitment_bytes.store(bytes, Ordering::Release);
         }
     }
@@ -321,7 +358,7 @@ impl Lifecycle {
     ///   grew without being priced by an admission, which the ledger is
     ///   supposed to make impossible.
     pub(crate) fn record_pool_materialized(&self, model_id: &str, bytes: u64) {
-        let Some(slot) = self.slots.get(model_id) else {
+        let Some(slot) = self.slot(model_id) else {
             return;
         };
         let _guard = self
@@ -376,7 +413,7 @@ impl Lifecycle {
     /// the pool materializes once. Heartbeats reconcile reservations in
     /// [`Self::record_pool_materialized`].
     pub fn admit_request(&self, model_id: &str) -> Result<(), MemoryDenial> {
-        let Some(slot) = self.slots.get(model_id) else {
+        let Some(slot) = self.slot(model_id) else {
             return Ok(());
         };
         let _guard = self
@@ -424,8 +461,8 @@ impl Lifecycle {
     /// keep-alive lease. `None` = the load must be rejected.
     pub(crate) fn pick_victim(&self, exclude: &str) -> Option<String> {
         let now = self.now_ms();
-        self.slots
-            .iter()
+        self.slots_snapshot()
+            .into_iter()
             .filter(|(id, slot)| {
                 id.as_str() != exclude
                     && !slot.pinned.load(Ordering::Acquire)
@@ -437,14 +474,16 @@ impl Lifecycle {
                     })
             })
             .min_by_key(|(_, slot)| slot.last_used_ms.load(Ordering::Acquire))
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| id)
     }
 
     /// Evicts `victim` and waits for its memory to be released. False =
     /// the eviction could not be confirmed (task gone or ack timed out);
     /// the caller must not assume the bytes came back.
     pub(crate) async fn evict(&self, victim: &str) -> bool {
-        let Some(slot) = self.slots.get(victim) else {
+        // Clone the slot handle out of the map first: the ack wait below
+        // must not hold the slots lock.
+        let Some(slot) = self.slot(victim) else {
             return false;
         };
         let (done_tx, done_rx) = oneshot::channel();
@@ -462,6 +501,30 @@ impl Lifecycle {
             tokio::time::timeout(EVICT_ACK_TIMEOUT, done_rx).await,
             Ok(Ok(()))
         )
+    }
+}
+
+/// One fresh slot with nothing charged; shared by the boot-time build and
+/// [`Lifecycle::add_slot`] so both populate the ledger identically.
+fn make_slot(
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    status: watch::Receiver<WorkerStatus>,
+    pinned: bool,
+    ttl_seconds: u64,
+) -> Slot {
+    Slot {
+        cmd_tx,
+        status,
+        pinned: AtomicBool::new(pinned),
+        ttl: match ttl_seconds {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        },
+        usage_bytes: AtomicU64::new(0),
+        last_used_ms: AtomicU64::new(0),
+        pool_commitment_bytes: AtomicU64::new(0),
+        pool_materialized_bytes: AtomicU64::new(0),
+        pool_reserved_bytes: AtomicU64::new(0),
     }
 }
 
@@ -615,7 +678,7 @@ mod tests {
             // The receiver end is dropped; these tests never send commands.
             map.insert(
                 id.to_string(),
-                Slot {
+                Arc::new(Slot {
                     cmd_tx,
                     status: status_rx,
                     pinned: AtomicBool::new(pinned),
@@ -625,7 +688,7 @@ mod tests {
                     pool_commitment_bytes: AtomicU64::new(0),
                     pool_materialized_bytes: AtomicU64::new(0),
                     pool_reserved_bytes: AtomicU64::new(0),
-                },
+                }),
             );
             senders.push(status_tx);
         }
@@ -633,7 +696,7 @@ mod tests {
             Lifecycle {
                 budget_bytes: 1000,
                 total_bytes: None,
-                slots: map,
+                slots: std::sync::RwLock::new(map),
                 load_permit: tokio::sync::Mutex::new(()),
                 admission_lock: std::sync::Mutex::new(()),
                 metrics,

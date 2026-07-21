@@ -19,6 +19,10 @@ kiln-models = { workspace = true, default-features = false }
 kiln-proto.workspace = true
 kiln-tokenize.workspace = true
 prometheus.workspace = true
+# Hub size probe for the add-model memory estimate (GET
+# /admin/models/estimate): same client crate kiln-jobs already uses for
+# downloads, same rustls-only configuration.
+reqwest.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,6 +30,9 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+# In-place kiln.toml editing for POST /admin/models persistence (preserves
+# comments/formatting; figment stays the read path).
+toml_edit.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

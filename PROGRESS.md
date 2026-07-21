@@ -6494,3 +6494,99 @@
 - Next: nothing — the SPEC §12 build plan is complete. Phase 11
   (embeddings-native, VLM via python worker, MTP self-draft, distributed
   exploration) requires separate human approval per SPEC.
+
+## [2026-07-21] Post-closeout / Add-Model flow (admin API + UI) — DONE
+- What:
+  - One "Add Model" flow, HF repo id → loaded and servable with ZERO
+    gateway restart. New `POST /admin/models` registers a model into the
+    live Phase 9 machinery (registry entry, lifecycle slot, supervision
+    task — the exact code paths a configured model boots through, so
+    load/unload/pin/TTL/eviction apply immediately) AND appends the
+    equivalent `[[model]]` block to kiln.toml in the same locked flow.
+  - Runtime-add plumbing: `Registry` and the lifecycle slot map are now
+    interior-mutable (RwLock; entries only ever added), entry build
+    extracted to `registry::build_entry`, supervision-task spawn
+    extracted to a `ModelSpawner` handle shared by boot and runtime
+    paths; gateway shutdown awaits runtime-spawned tasks too. New
+    `UnloadReason::Registered`: an added model parks as "unloaded
+    (registered)" — /readyz counts it settled; the existing load
+    endpoint (or a request for it) starts the load.
+  - kiln.toml persistence (kiln-gateway/src/config_write.rs): toml_edit
+    in-place append — comments, formatting, and unrelated entries
+    preserved. Safety: the file is re-read from disk at write time
+    (hand edits made while the service runs survive), any parse failure
+    refuses loudly before touching disk, a duplicate id already in the
+    file is a 409 (never an overwrite), and the edited text must
+    re-validate through the real KilnConfig parser before an atomic
+    tmp+rename replace (original permissions kept).
+  - `GET /admin/models/estimate?path=…`: the plain memory answer before
+    a large download — weights bytes (local dir, or the hub tree
+    listing; HF_ENDPOINT honored) plus the Phase 9 load-overhead
+    margin, against the live ledger (budget/charged/headroom/fits).
+  - Admin UI: "add model" section — repo/path + id + worker/pin/TTL,
+    "check size" ("needs ~X GB (hub weights) — you have ~Y GB free of Z
+    budget"), submit; a not-downloaded model auto-runs the existing
+    Phase 10 download job (progress shown inline AND in the jobs
+    table), auto-registers on success, then a "load now" button — one
+    continuous flow. Docs: CONFIGURATION.md [[model]] intro + README.
+- Decisions:
+  - Not-downloaded models answer a structured 409 `model_not_downloaded`
+    carrying `{download: {repo, dest}}` (dest = kiln-jobs' derivation
+    `<model_dir>/<org>--<name>`); the UI orchestrates download → retry.
+    Chosen over server-side background orchestration: no new job-watcher
+    state, a gateway restart mid-download loses nothing, and the retried
+    add resolves naturally (a repo already at its default dest registers
+    directly, so the API is also two curl calls for a human).
+  - kiln.toml records the RESOLVED local path, not the repo id — the
+    registry requires local dirs at boot, so the persisted block must be
+    bootable as written. Persist-then-insert ordering: a failed disk
+    write leaves the gateway unchanged; a crash between write and
+    insert costs a restart-time entry, never a lost one.
+  - `[model.speculative]` stays config-file-only (out of add scope).
+  - SPEC §8.1 words the admin surface as "GET/POST /admin/models
+    (list/load/unload/pin)"; register + estimate recorded here as an
+    additive extension within the Phase 10 admin latitude (SPEC text
+    untouched).
+  - Deps (both already in the build graph): toml_edit 0.22 direct in
+    kiln-gateway (was transitive via figment's toml backend; needed for
+    the format-preserving edit API; MIT/Apache-2.0) and reqwest (the
+    existing workspace dep kiln-jobs uses; rustls-only unchanged) for
+    the hub size probe.
+- Deviations: none.
+- Acceptance:
+  ```
+  cargo fmt --check                                             clean
+  cargo clippy --workspace --all-targets -- -D warnings         clean
+  cargo clippy --workspace --all-targets --no-default-features  clean
+  cargo build --workspace --no-default-features                 clean
+  cargo test --workspace                     exit 0 (238 passed, 0 failed)
+  ruff check + format --check (python/ tests/e2e scripts)       clean
+  uv run --project tests/e2e pytest tests/e2e
+      97 passed, 3 skipped in 366.95s   (was 93+3; the 4 new tests pass)
+  New coverage:
+  - test_admin_ui.py::test_admin_ui_add_model_full_flow (real browser,
+    stub hub serving the REAL qwen3-0.6b-4bit dir from disk): estimate
+    rendered from the hub listing, download progress observed, auto-
+    registered, "load now" -> status ready over SSE, completion 200 on
+    'qwen-added', gateway.poll() is None (zero restarts), and the
+    kiln.toml line-diff is exactly one inserted [[model]] block naming
+    the downloaded dest (whole flow 22s locally).
+  - test_add_model.py::test_add_local_model_live_with_hand_edit_preserved:
+    a comment hand-written into kiln.toml while the gateway runs
+    survives the concurrent add-write (difflib opcodes: all equal + one
+    insert); duplicate id -> 409 model_exists with file untouched;
+    file-only duplicate -> 409 config_conflict naming the restart;
+    added model load -> ready -> completion 200 on the same process.
+  - test_add_model.py::test_add_model_download_flow_over_the_api:
+    estimate source=hub matching the stub listing bytes exactly;
+    structured 409 with {repo, dest}; standard download job succeeded;
+    retried add 201 persisting path == dest, worker preserved.
+  - Rust unit: config_write (comment preservation, duplicate-in-file,
+    unparseable + re-validation refusals with file untouched, no-model
+    file), admin_register (register/persist, both duplicate shapes,
+    structured 409 + post-download resolution, 400s, local estimate
+    arithmetic, repo-shape detection). Gateway suite 86 tests green.
+  ```
+- Next: nothing scheduled — the SPEC §12 plan remains complete; this was
+  a post-closeout UX task (live add-model). Phase 11 still requires
+  separate human approval.

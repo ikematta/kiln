@@ -14,6 +14,23 @@
 	let jobsError = $state('');
 	let download = $state({ repo: '', revision: '', dest: '' });
 	let quantize = $state({ path: '', bits: '4', group_size: '64', out: '' });
+	// Add-model flow: HF repo id (or local path) → optional size check →
+	// register; a not-yet-downloaded model runs the download job first and
+	// auto-registers on success — one continuous flow.
+	let add = $state({
+		id: '',
+		path: '',
+		worker: 'auto',
+		pinned: false,
+		ttl_seconds: '',
+		phase: 'idle', // idle | downloading | ready
+		message: '',
+		error: '',
+		estimate: null,
+		progress: null,
+		jobId: null,
+		registeredId: ''
+	});
 	let abort = null;
 	let jobsTimer = null;
 
@@ -170,6 +187,120 @@
 		return bytes ? `${(bytes / (1024 * 1024)).toFixed(0)} MiB` : '0';
 	}
 
+	// Plain human size for the add-model estimate ("needs ~4.2 GB").
+	function gb(bytes) {
+		if (bytes == null) return '?';
+		if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+		return `${Math.max(1, Math.round(bytes / 1024 ** 2))} MB`;
+	}
+
+	async function checkEstimate() {
+		add.error = '';
+		add.estimate = null;
+		const response = await fetch(`/admin/models/estimate?path=${encodeURIComponent(add.path)}`, {
+			headers: authHeaders()
+		}).catch(() => null);
+		if (!response) {
+			add.error = 'gateway unreachable';
+		} else if (!response.ok) {
+			add.error = await apiError(response);
+		} else {
+			add.estimate = await response.json();
+		}
+	}
+
+	function addPayload() {
+		const payload = { id: add.id, path: add.path, worker: add.worker, pinned: add.pinned };
+		const ttl = Number(add.ttl_seconds);
+		if (ttl > 0) payload.ttl_seconds = ttl;
+		return payload;
+	}
+
+	async function registerModel() {
+		const response = await fetch('/admin/models', {
+			method: 'POST',
+			headers: { ...authHeaders(), 'content-type': 'application/json' },
+			body: JSON.stringify(addPayload())
+		}).catch(() => null);
+		if (!response) return { failed: 'gateway unreachable' };
+		const body = await response.json().catch(() => null);
+		if (response.status === 201) return { created: body };
+		if (response.status === 409 && body?.error?.code === 'model_not_downloaded')
+			return { download: body.download };
+		return { failed: body?.error?.message ?? `request failed with HTTP ${response.status}` };
+	}
+
+	async function submitAdd() {
+		add.error = '';
+		add.message = '';
+		const result = await registerModel();
+		if (result.created) {
+			add.phase = 'ready';
+			add.registeredId = add.id;
+			add.message = `registered — persisted to ${result.created.persisted_to}`;
+		} else if (result.download) {
+			await downloadThenRegister(result.download);
+		} else {
+			add.error = result.failed;
+		}
+	}
+
+	// The not-downloaded path: run the standard download job (it appears in
+	// the jobs table like any other), watch its progress here, and register
+	// automatically the moment it succeeds.
+	async function downloadThenRegister(download) {
+		add.phase = 'downloading';
+		add.progress = null;
+		add.message = `downloading ${download.repo} → ${download.dest}`;
+		const response = await fetch('/admin/jobs/download', {
+			method: 'POST',
+			headers: { ...authHeaders(), 'content-type': 'application/json' },
+			body: JSON.stringify({ repo: download.repo, dest: download.dest })
+		}).catch(() => null);
+		if (!response || !response.ok) {
+			add.phase = 'idle';
+			add.error = response ? await apiError(response) : 'gateway unreachable';
+			return;
+		}
+		add.jobId = (await response.json()).id;
+		refreshJobs();
+		while (connected && add.phase === 'downloading') {
+			await new Promise((resolve) => setTimeout(resolve, 1000));
+			const poll = await fetch(`/admin/jobs/${add.jobId}`, { headers: authHeaders() }).catch(
+				() => null
+			);
+			if (!poll?.ok) continue; // transient; keep polling
+			const job = await poll.json();
+			if (job.detail?.event === 'progress')
+				add.progress = { done: job.detail.done_bytes, total: job.detail.total_bytes };
+			if (job.state === 'failed') {
+				add.phase = 'idle';
+				add.error = `download failed: ${jobDetail(job)}`;
+				return;
+			}
+			if (job.state === 'succeeded') {
+				add.progress = null;
+				add.message = 'download complete — registering';
+				const result = await registerModel();
+				if (result.created) {
+					add.phase = 'ready';
+					add.registeredId = add.id;
+					add.message = `registered — persisted to ${result.created.persisted_to}`;
+				} else {
+					add.phase = 'idle';
+					add.error = result.failed ?? 'registration after download failed';
+				}
+				return;
+			}
+		}
+	}
+
+	async function loadNow() {
+		await modelAction(add.registeredId, 'load');
+		add.message = `load requested for ${add.registeredId} — watch its row in the models table`;
+		add.phase = 'idle';
+	}
+
 	function jobDetail(job) {
 		const detail = job.detail;
 		if (detail == null) return '';
@@ -266,6 +397,76 @@
 		</section>
 
 		<section>
+			<h2>add model</h2>
+			<form
+				class="job"
+				onsubmit={(event) => {
+					event.preventDefault();
+					submitAdd();
+				}}
+			>
+				<input
+					placeholder="hf repo (org/name) or local path"
+					data-testid="add-path"
+					bind:value={add.path}
+				/>
+				<input placeholder="model id" data-testid="add-id" bind:value={add.id} />
+				<select data-testid="add-worker" bind:value={add.worker}>
+					<option value="auto">auto</option>
+					<option value="rust">rust</option>
+					<option value="python">python</option>
+				</select>
+				<label class="opt">
+					<input type="checkbox" data-testid="add-pinned" bind:checked={add.pinned} /> pin
+				</label>
+				<input
+					placeholder="ttl s"
+					size="5"
+					data-testid="add-ttl"
+					bind:value={add.ttl_seconds}
+				/>
+				<button
+					type="button"
+					data-testid="add-estimate"
+					disabled={!add.path}
+					onclick={checkEstimate}
+				>
+					check size
+				</button>
+				<button
+					type="submit"
+					data-testid="add-submit"
+					disabled={!add.id || !add.path || add.phase === 'downloading'}
+				>
+					add
+				</button>
+			</form>
+			{#if add.estimate}
+				<p data-testid="add-estimate-text">
+					needs ~{gb(add.estimate.estimated_bytes)} ({add.estimate.source} weights) — you have
+					~{gb(add.estimate.headroom_bytes)} free of {gb(add.estimate.budget_bytes)} budget{add
+						.estimate.fits
+						? ''
+						: ' — does NOT fit without unloading something'}
+				</p>
+			{/if}
+			{#if add.phase === 'downloading'}
+				<p data-testid="add-progress">
+					downloading… {add.progress ? `${gb(add.progress.done)} / ${gb(add.progress.total)}` : ''}
+				</p>
+			{/if}
+			{#if add.message}
+				<p data-testid="add-status">{add.message}</p>
+			{/if}
+			{#if add.phase === 'ready'}
+				<button data-testid="add-load-now" onclick={loadNow}>load now</button>
+			{/if}
+			{#if add.error}
+				<p class="banner" data-testid="add-error">{add.error}</p>
+			{/if}
+		</section>
+
+		<section>
 			<h2>jobs</h2>
 			{#if jobsError}
 				<p class="banner" data-testid="jobs-error">{jobsError}</p>
@@ -359,6 +560,12 @@
 	.token input,
 	.job input {
 		flex: 1;
+	}
+	.opt {
+		display: flex;
+		align-items: center;
+		gap: 0.25rem;
+		white-space: nowrap;
 	}
 	.detail {
 		max-width: 24rem;
