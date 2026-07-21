@@ -124,7 +124,9 @@ kiln-gateway hash-key my-secret-token   # → paste into auth.admin_token_hash
 ```
 
 Then `http://127.0.0.1:8080/ui` is a live dashboard (models table,
-load/unload/pin, live stats, download/quantize job launcher), and the same
+load/unload/pin, live stats, download/quantize job launcher, and an Add
+Model flow that takes an HF repo id from download to loaded — persisting
+the `[[model]]` block to kiln.toml — with zero restarts), and the same
 functionality is available over `GET/POST /admin/models*`, `/admin/jobs*`,
 and the `GET /admin/stats` SSE stream with `Authorization: Bearer <token>`.
 

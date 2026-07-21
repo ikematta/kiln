@@ -66,7 +66,7 @@ const DRAIN_POLL: Duration = Duration::from_millis(250);
 /// measured heartbeat). Idle footprints measured 17-33 MB over raw
 /// weight bytes across the pinned fleet; 64 MiB covers that with margin
 /// so admissions racing a load window cannot consume unprojected bytes.
-const LOAD_OVERHEAD_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const LOAD_OVERHEAD_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 
 fn backoff(attempt: u32) -> Duration {
     // 500ms, 1s, 2s, ... capped at 10s.
@@ -83,8 +83,135 @@ pub enum StartError {
 }
 
 pub struct Supervisor {
-    tasks: Vec<JoinHandle<()>>,
+    spawner: ModelSpawner,
+}
+
+/// Everything needed to spawn one model's supervision task; shared by
+/// [`Supervisor::start`] for the boot-time fleet and (via
+/// [`Supervisor::spawner`]) by the runtime add-model path, so a model
+/// registered through `POST /admin/models` is supervised by exactly the
+/// same code as a configured one.
+#[derive(Clone)]
+pub struct ModelSpawner {
+    config: Arc<KilnConfig>,
+    metrics: Arc<Metrics>,
+    lifecycle: Arc<Lifecycle>,
     shutdown: watch::Sender<bool>,
+    /// Shared with [`Supervisor::shutdown`], which drains and awaits every
+    /// handle — including tasks spawned after boot.
+    tasks: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl ModelSpawner {
+    /// Spawner for handler unit tests that build registry/lifecycle by
+    /// hand instead of through [`Supervisor::start`]. Tasks it spawns are
+    /// dropped with the test runtime.
+    #[cfg(test)]
+    pub(crate) fn test_stub(
+        config: Arc<KilnConfig>,
+        metrics: Arc<Metrics>,
+        lifecycle: Arc<Lifecycle>,
+    ) -> Self {
+        Self {
+            config,
+            metrics,
+            lifecycle,
+            shutdown: watch::channel(false).0,
+            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Spawns the supervision task for one registry entry and registers
+    /// its handle for gateway shutdown.
+    pub(crate) fn spawn(
+        &self,
+        entry: Arc<ModelEntry>,
+        status_tx: watch::Sender<WorkerStatus>,
+        cmd_rx: mpsc::UnboundedReceiver<LifecycleCommand>,
+    ) {
+        let projected_bytes = load_projection(&entry);
+        if projected_bytes == 0 {
+            tracing::warn!(model = %entry.id, path = %entry.model_path.display(),
+                "no *.safetensors found; load projection is 0 bytes (budget still \
+                 enforced from measured heartbeats)");
+        }
+        let ctx = SuperviseCtx {
+            argv: worker_argv(&self.config, &entry),
+            entry,
+            status_tx,
+            metrics: Arc::clone(&self.metrics),
+            shutdown: self.shutdown.subscribe(),
+            cmd_rx,
+            lifecycle: Arc::clone(&self.lifecycle),
+            projected_bytes,
+        };
+        let handle = tokio::spawn(supervise(ctx));
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
+    }
+}
+
+/// Builds the worker argv for one entry: worker binary prefix from config
+/// plus the SPEC §10 flags (SSD tier, paged-attention kernel, speculative
+/// draft — rust workers only; the python worker has none of them).
+fn worker_argv(config: &KilnConfig, entry: &ModelEntry) -> Vec<String> {
+    match entry.worker_kind {
+        crate::config::WorkerKind::Rust => {
+            let mut argv = config.server.rust_worker_argv.clone();
+            // SPEC §10 [defaults]: SSD tier flags for the rust worker (it
+            // derives `<cache_dir>/<fingerprint>/blocks` itself).
+            if config.defaults.ssd_tier {
+                argv.push("--ssd-dir".to_owned());
+                argv.push(
+                    crate::registry::expand_tilde(&config.server.cache_dir)
+                        .display()
+                        .to_string(),
+                );
+                argv.push("--ssd-max-gb".to_owned());
+                argv.push(config.defaults.ssd_cache_max_gb.to_string());
+            }
+            // SPEC §7.4: opt-in paged-attention kernel flag.
+            if config.defaults.paged_attention_kernel {
+                argv.push("--paged-attention-kernel".to_owned());
+            }
+            // SPEC §6.5/§10 [model.speculative]: draft path was resolved
+            // (and gated to rust workers) at registry build; the worker
+            // enforces the ADR 0005 attach gates and goes UNHEALTHY on an
+            // incompatible pair.
+            if let (Some(draft), Some(spec)) = (&entry.draft_path, &entry.config.speculative) {
+                argv.push("--draft-model".to_owned());
+                argv.push(draft.display().to_string());
+                argv.push("--draft-gamma".to_owned());
+                argv.push(spec.gamma.to_string());
+            }
+            argv
+        }
+        _ => config.server.python_worker_argv.clone(),
+    }
+}
+
+/// Load-time projection (SPEC §2.3): weight bytes on disk for target +
+/// draft, plus a conservative runtime-overhead margin (Phase 9 part 3
+/// ruling: projections reserve on the HIGH side and heartbeats release
+/// the difference). Measured idle footprints run 17-33 MB over raw
+/// weight bytes across the pinned fleet (tokenizer, runtime, small
+/// buffers); without the margin, a request admission racing this load
+/// window could consume that sliver and transiently overshoot. The first
+/// post-READY heartbeat replaces the whole projection with the measured
+/// footprint before the load permit is released.
+pub(crate) fn load_projection(entry: &ModelEntry) -> u64 {
+    let weights_bytes = lifecycle::weights_bytes_on_disk(&entry.model_path)
+        + entry
+            .draft_path
+            .as_deref()
+            .map(lifecycle::weights_bytes_on_disk)
+            .unwrap_or(0);
+    match weights_bytes {
+        0 => 0,
+        bytes => bytes + LOAD_OVERHEAD_MARGIN_BYTES,
+    }
 }
 
 impl Supervisor {
@@ -108,93 +235,30 @@ impl Supervisor {
             "machine memory budget (SPEC 2.3)"
         );
         let (shutdown, _) = watch::channel(false);
+        let spawner = ModelSpawner {
+            config: Arc::new(config.clone()),
+            metrics,
+            lifecycle: Arc::clone(&lifecycle),
+            shutdown,
+            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
 
-        let mut tasks = Vec::new();
-        for ((entry, status_tx), cmd_rx) in registry.iter().zip(senders).zip(receivers) {
-            let argv = match entry.worker_kind {
-                crate::config::WorkerKind::Rust => {
-                    let mut argv = config.server.rust_worker_argv.clone();
-                    // SPEC §10 [defaults]: SSD tier flags for the rust
-                    // worker (it derives `<cache_dir>/<fingerprint>/blocks`
-                    // itself). The python worker has no cold tier.
-                    if config.defaults.ssd_tier {
-                        argv.push("--ssd-dir".to_owned());
-                        argv.push(
-                            crate::registry::expand_tilde(&config.server.cache_dir)
-                                .display()
-                                .to_string(),
-                        );
-                        argv.push("--ssd-max-gb".to_owned());
-                        argv.push(config.defaults.ssd_cache_max_gb.to_string());
-                    }
-                    // SPEC §7.4: opt-in paged-attention kernel flag.
-                    if config.defaults.paged_attention_kernel {
-                        argv.push("--paged-attention-kernel".to_owned());
-                    }
-                    // SPEC §6.5/§10 [model.speculative]: draft path was
-                    // resolved (and gated to rust workers) at registry
-                    // build; the worker enforces the ADR 0005 attach
-                    // gates and goes UNHEALTHY on an incompatible pair.
-                    if let (Some(draft), Some(spec)) =
-                        (&entry.draft_path, &entry.config.speculative)
-                    {
-                        argv.push("--draft-model".to_owned());
-                        argv.push(draft.display().to_string());
-                        argv.push("--draft-gamma".to_owned());
-                        argv.push(spec.gamma.to_string());
-                    }
-                    argv
-                }
-                _ => config.server.python_worker_argv.clone(),
-            };
-            // Load-time projection (SPEC §2.3): weight bytes on disk for
-            // target + draft, plus a conservative runtime-overhead margin
-            // (Phase 9 part 3 ruling: projections reserve on the HIGH
-            // side and heartbeats release the difference). Measured idle
-            // footprints run 17-33 MB over raw weight bytes across the
-            // pinned fleet (tokenizer, runtime, small buffers); without
-            // the margin, a request admission racing this load window
-            // could consume that sliver and transiently overshoot. The
-            // first post-READY heartbeat replaces the whole projection
-            // with the measured footprint before the load permit is
-            // released.
-            let weights_bytes = lifecycle::weights_bytes_on_disk(&entry.model_path)
-                + entry
-                    .draft_path
-                    .as_deref()
-                    .map(lifecycle::weights_bytes_on_disk)
-                    .unwrap_or(0);
-            let projected_bytes = match weights_bytes {
-                0 => 0,
-                bytes => bytes + LOAD_OVERHEAD_MARGIN_BYTES,
-            };
-            if projected_bytes == 0 {
-                tracing::warn!(model = %entry.id, path = %entry.model_path.display(),
-                    "no *.safetensors found; load projection is 0 bytes (budget still \
-                     enforced from measured heartbeats)");
-            }
-            let ctx = SuperviseCtx {
-                entry: Arc::clone(entry),
-                argv,
-                status_tx,
-                metrics: Arc::clone(&metrics),
-                shutdown: shutdown.subscribe(),
-                cmd_rx,
-                lifecycle: Arc::clone(&lifecycle),
-                projected_bytes,
-            };
-            tasks.push(tokio::spawn(supervise(ctx)));
+        for ((entry, status_tx), cmd_rx) in
+            registry.entries().into_iter().zip(senders).zip(receivers)
+        {
+            spawner.spawn(entry, status_tx, cmd_rx);
         }
 
         // Initial loads, sequenced in config order: the LRU clock starts at
         // READY time, so startup eviction order stays deterministic instead
-        // of racing on the load permit.
+        // of racing on the load permit. Runtime-added models are not boot
+        // models: the snapshot below is taken before any add can land.
         {
-            let registry = Arc::clone(&registry);
+            let entries = registry.entries();
             let lifecycle = Arc::clone(&lifecycle);
-            let mut shutdown = shutdown.subscribe();
-            tasks.push(tokio::spawn(async move {
-                for entry in registry.iter() {
+            let mut shutdown = spawner.shutdown.subscribe();
+            let handle = tokio::spawn(async move {
+                for entry in entries {
                     lifecycle.boot_load(&entry.id);
                     let mut status = entry.status.clone();
                     loop {
@@ -219,16 +283,29 @@ impl Supervisor {
                     }
                 }
                 tracing::info!("initial model loads settled");
-            }));
+            });
+            spawner
+                .tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(handle);
         }
 
-        Ok((registry, lifecycle, Self { tasks, shutdown }))
+        Ok((registry, lifecycle, Self { spawner }))
+    }
+
+    /// A cloneable handle for spawning supervision tasks after boot
+    /// (`POST /admin/models`); shutdown waits for those too.
+    pub fn spawner(&self) -> ModelSpawner {
+        self.spawner.clone()
     }
 
     /// Signals every supervision task to kill its worker and waits for them.
     pub async fn shutdown(self) {
-        self.shutdown.send_replace(true);
-        for task in self.tasks {
+        self.spawner.shutdown.send_replace(true);
+        let tasks =
+            std::mem::take(&mut *self.spawner.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+        for task in tasks {
             // A panicked supervision task is already logged by tokio; there
             // is nothing further to unwind during shutdown.
             let _ = task.await;

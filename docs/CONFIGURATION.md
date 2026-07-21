@@ -68,6 +68,19 @@ Enforcement, as actually built (Phase 9):
 
 ## `[[model]]` (one block per servable model)
 
+You do not have to hand-edit these blocks: the admin dashboard's **Add
+Model** action (or `POST /admin/models` with `{id, path, worker, pinned,
+ttl_seconds}`) registers a model on the running gateway — downloading it
+first through the job runner when needed — and appends the equivalent
+`[[model]]` block to kiln.toml in place, preserving comments, formatting,
+and any concurrent hand edits (the file is re-read at write time; a
+duplicate id or unparseable file is refused loudly). No restart involved:
+the model is immediately loadable via the existing load/unload/pin
+machinery. `GET /admin/models/estimate?path=…` answers the size question
+first (weights on disk or from the hub listing, against the live memory
+budget). Removing or changing a model still means editing the file and
+restarting.
+
 | Key | Default | Meaning |
 |---|---|---|
 | `id` | required | The `model` string clients send. |

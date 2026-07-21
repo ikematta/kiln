@@ -25,6 +25,9 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub auth: Auth,
     pub jobs: crate::admin::JobsProxy,
+    /// Runtime model registration (`POST /admin/models`): live insert +
+    /// kiln.toml persistence in one flow.
+    pub registrar: crate::admin_register::Registrar,
     /// Flips true when graceful shutdown begins. Endpoints holding
     /// never-ending responses (the /admin/stats SSE stream) must end them
     /// on this signal, or axum's connection drain waits forever — an open
@@ -62,7 +65,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/jobs/quantize", post(crate::admin::submit_quantize))
         .route("/admin/jobs", get(crate::admin::list_jobs))
         .route("/admin/jobs/{id}", get(crate::admin::get_job))
-        .route("/admin/models", get(crate::admin_models::list_models))
+        .route(
+            "/admin/models",
+            get(crate::admin_models::list_models).post(crate::admin_register::add_model),
+        )
+        .route(
+            "/admin/models/estimate",
+            get(crate::admin_register::estimate_model),
+        )
         .route(
             "/admin/models/{id}/load",
             post(crate::admin_models::load_model),
@@ -152,7 +162,7 @@ async fn healthz() -> Json<serde_json::Value> {
 async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     let mut models = serde_json::Map::new();
     let mut all_ready = true;
-    for entry in state.registry.iter() {
+    for entry in state.registry.entries() {
         let status = entry.status();
         all_ready &= matches!(status, WorkerStatus::Ready | WorkerStatus::Unloaded { .. });
         models.insert(entry.id.clone(), json!(status.to_string()));
@@ -172,6 +182,7 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Response {
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let data: Vec<ModelObject> = state
         .registry
+        .entries()
         .iter()
         .map(|entry| ModelObject {
             id: entry.id.clone(),
