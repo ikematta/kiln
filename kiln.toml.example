@@ -70,9 +70,12 @@ block_size = 32          # tokens per KV block; must be a power of two
 ssd_cache_max_gb = 64
 ssd_tier = true
 # Block-table-aware paged-attention Metal kernel for decode steps (SPEC
-# §7.4, rust workers only). Opt-in: leave off unless the kernel's parity
-# and throughput bars are proven for your device (docs/decisions/, Phase 7).
-paged_attention_kernel = false
+# §7.4, rust workers only). Default on since 2026-07-22 (probe stayed green
+# across the CI runs accumulated since PR #18; PROGRESS 2026-07-13/-22).
+# Set false to fall back to the gather-based path; the blocking
+# kernel-vs-gather bit probe (`cargo test -p kiln-engine --test paged_attn`)
+# verifies parity on your hardware either way.
+paged_attention_kernel = true
 
 # One [[model]] block per servable model.
 [[model]]

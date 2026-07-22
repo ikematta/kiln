@@ -6767,3 +6767,87 @@
   CI: re-triggered by this push; PR #34 merge gated on green
   ```
 - Next: merge PR #34 once CI is green (user-approved).
+
+## [2026-07-22] Phase 7 follow-up / paged_attention_kernel default ON (task 7.4 flag flip) — DONE
+- What: the dedicated default-flip commit the 2026-07-13 PM ruling parked
+  behind accumulated green CI bit-probe runs. One semantic line:
+  `defaults::paged_attention_kernel()` in kiln-gateway/src/config.rs
+  false -> true. kiln.toml.example and docs/CONFIGURATION.md updated to
+  match (default-on, opt-OUT documented). Worker CLI and
+  `EngineConfig::default()` untouched: the flag is a presence-only argv
+  the supervisor appends for rust workers, so the gateway default IS the
+  deployment default, and lower-level defaults staying false is what
+  keeps `paged_attention_kernel = false` able to turn it off.
+- CI evidence (verified against real run shapes, not assumed): since PR
+  #18 merged (2026-07-13T22:47Z, first probe-green run 29289929704),
+  54 completed CI runs through 29923292811 (2026-07-22) each ran the
+  blocking `kernel_output_is_bit_identical_to_gather_sdpa` probe in BOTH
+  macOS lanes (`cargo test --workspace` debug + release) = 108 probe
+  executions, ZERO probe failures. The 7 non-green runs in the span all
+  failed at steps AFTER the probe-bearing step (30-min soak x5,
+  model-gated suites x1 = run 29294575202, e2e + ubuntu lint x1 = run
+  29887475596) with the probe step green. Executed-not-Metal-skipped
+  verified in the actual job logs (probe "ok" line present, no
+  "skipping: paged-attention kernels need Metal") at 7 runs sampled
+  across the whole span, both lanes each: 29296905731 (07-14),
+  29383369634 (07-15), 29486211285 (07-16), 29557178033 (07-17),
+  29859211245 (07-21), 29890106666 (07-22), 29923292811 (07-22). The
+  ruling's bar ("a handful of real CI runs", probe never fires) is met
+  with a wide margin.
+- Re-verified with the new default (dev machine, M4-class):
+  - Golden (ADR 0002 B' + ADR 0004 scope): exact token-id match, every
+    fixture model x {single-stream, width-16} x {gather, kernel} —
+    591.64s, 1 passed.
+  - 8k gate (ADR 0003-pattern release gate): gather 40.4 tok/s
+    (24.72 ms/step) -> kernel 62.1 tok/s (16.10 ms/step) = 1.536x
+    (bar 1.15x; Phase 7 recorded 1.461x) — the recorded gain holds as
+    the default.
+  - e2e as the default-consumer (conftest pins no [defaults], so every
+    rust-worker stack inherits the flipped default): full suite green —
+    99 passed, 3 skipped in 353.99s.
+- e2e investigation (recorded because two runs DID fail first): the
+  first two flag-ON full-suite runs failed ONLY at
+  test_system_memory.py::test_load_refused_under_real_memory_pressure_
+  and_recovers (2026-07-21 entry's dev-only hog test), recovery half:
+  after the hog exited, request admission answered 503 with 0 bytes of
+  headroom above the test's computed floor for the whole 120s retry
+  window. Bisected: the test passes in isolation flag-ON (13.5s); a
+  flag-OFF control full suite passed (374s); a third flag-ON full suite
+  passed (353.99s, the fastest run of the day) with a 15s sampler
+  showing pressure level 1 throughout and MTLCompilerService RSS flat
+  at 2.5 MB (a per-worker-JIT memory theory disproven). The two
+  failures were the two suites launched immediately after this
+  session's own churn (10-min golden + release-gate model loads);
+  suite durations decayed 491s -> 478s -> 374s -> 354s as the machine
+  settled, uncorrelated with the flag. Conclusion: host-memory-weather
+  flake in the hog test's recovery margin (macOS returned the hog's
+  3 GiB too slowly on a churned machine), the exact sensitivity that
+  test's own skip messages document ("rerun when idle") — not a kernel
+  regression. Test NOT modified (never weaken a test); hardening its
+  recovery half (longer deadline vs a pre-recovery availability guard)
+  is parked as a PM question, non-blocking.
+- Decisions: flip applies to the gateway default only (deployment
+  surface); env override `KILN_DEFAULTS__PAGED_ATTENTION_KERNEL=false`
+  and the kiln.toml key remain the opt-out paths, both verified live in
+  this session (the OFF control ran via the env override).
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh api .../actions/jobs/<id>/logs (7 runs x 2 macOS lanes, sampled)
+  test kernel_output_is_bit_identical_to_gather_sdpa ... ok   (all 14; no skip line)
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --test golden
+  test greedy_parity_is_exact_for_every_fixture_model ... ok (591.64s)
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --release --test paged_attn_gate -- --ignored --nocapture
+  decode @8k: gather 40.4 tok/s (24.72 ms/step), kernel 62.1 tok/s (16.10 ms/step) -> 1.536x (bar 1.15x)
+  test paged_attention_kernel_meets_the_8k_bar ... ok
+  $ cargo test -p kiln-gateway --lib          -> 94 passed (incl. example-file parse)
+  $ uv run --project tests/e2e pytest tests/e2e
+  99 passed, 3 skipped in 353.99s   (new default; see investigation above)
+  $ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings  -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings       -> clean
+  $ cargo build --workspace --no-default-features                                     -> clean
+  $ ruff check / format --check python/ tests/e2e scripts                             -> clean
+  ```
+- Next: nothing scheduled — SPEC §12 remains complete; this closes the
+  last parked Phase 7 item (the default flip). Phase 11 still requires
+  separate human approval.

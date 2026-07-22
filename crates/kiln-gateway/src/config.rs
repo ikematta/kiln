@@ -410,7 +410,7 @@ mod defaults {
         true
     }
     pub(super) fn paged_attention_kernel() -> bool {
-        false
+        true
     }
     pub(super) fn gamma() -> u32 {
         4
