@@ -52,6 +52,16 @@ jobs_db = "~/.kiln/jobs.sqlite"
 budget_fraction = 0.80
 # Explicit budget in bytes; overrides budget_fraction when set.
 #budget_bytes = 25000000000
+# The budget above is cut from INSTALLED RAM and cannot see memory other
+# processes already hold. Every admission (model load, projected KV-pool
+# growth) is therefore also priced against a LIVE probe of what the OS can
+# grant without swapping (vm_stat availability + the kernel's
+# memory-pressure level): at least this much real availability must remain
+# afterwards, and nothing is admitted while the kernel already reports
+# elevated pressure. Refusals are structured ("unloaded (system memory
+# pressure)", kiln_load_rejects_total) and retried on the next request.
+# 0 disables the system gate (budget-only admission).
+min_available_bytes = 1073741824  # 1 GiB
 
 [defaults]
 max_batch_tokens = 8192

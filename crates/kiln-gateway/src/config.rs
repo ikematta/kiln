@@ -87,6 +87,15 @@ pub struct MemoryConfig {
     /// (operator caps and eviction tests need an exact number).
     #[serde(default)]
     pub budget_bytes: Option<u64>,
+    /// Real system availability that must remain AFTER an admission
+    /// (load or KV-pool growth): the budget above is cut from installed
+    /// RAM, but other processes' memory is invisible to it, so admissions
+    /// are additionally priced against a live probe of what the OS can
+    /// grant without swapping (`sysmem::probe`). `0` disables the system
+    /// gate entirely (budget-only admission, the pre-fix behavior —
+    /// deterministic-budget tests use this).
+    #[serde(default = "defaults::min_available_bytes")]
+    pub min_available_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -311,6 +320,7 @@ impl Default for MemoryConfig {
         Self {
             budget_fraction: defaults::budget_fraction(),
             budget_bytes: None,
+            min_available_bytes: defaults::min_available_bytes(),
         }
     }
 }
@@ -380,6 +390,9 @@ mod defaults {
     }
     pub(super) fn budget_fraction() -> f64 {
         0.80
+    }
+    pub(super) fn min_available_bytes() -> u64 {
+        1 << 30 // 1 GiB left for the OS and everyone else after any admission
     }
     pub(super) fn max_batch_tokens() -> u32 {
         8192

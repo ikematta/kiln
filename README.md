@@ -26,7 +26,9 @@ hatch behind the identical worker protocol.
   over: see [docs/API_COMPAT.md](docs/API_COMPAT.md).
 - **Multi-model memory governance** — machine-level memory budget, LRU
   eviction with drain, pinning, idle TTL, INTERACTIVE/BATCH priorities,
-  reservation-ledger admission control.
+  reservation-ledger admission control, and a live system-memory gate:
+  loads the machine could only satisfy by swapping are refused up front,
+  even when they fit the configured budget.
 - **Operations built in** — Prometheus `/metrics`, structured JSON logs,
   a web admin dashboard (`/ui`), and a jobs runner for Hugging Face
   downloads and mlx-lm quantization.

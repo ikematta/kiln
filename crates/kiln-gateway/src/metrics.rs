@@ -57,6 +57,19 @@ pub struct Metrics {
     /// covered (bytes, per model). Should stay at zero: any increment
     /// means memory materialized without being priced — alertable.
     pub admission_uncovered_bytes_total: IntCounterVec,
+    /// Model loads refused up front, per model and constraint (`budget |
+    /// system_available | system_pressure`).
+    pub load_rejects_total: IntCounterVec,
+    /// Real system availability from the last `sysmem` probe: bytes the
+    /// OS can grant or reclaim without swapping (free + speculative +
+    /// inactive pages).
+    pub system_available_bytes: IntGauge,
+    /// Swap currently allocated by the OS (`vm.swapusage` used) —
+    /// observability only, not a gate (stale swap outlives pressure).
+    pub system_swap_used_bytes: IntGauge,
+    /// Kernel memory-pressure level (`kern.memorystatus_vm_pressure_level`):
+    /// 1 normal, 2 warning, 4 critical; 0 = unavailable.
+    pub system_pressure_level: IntGauge,
     /// Worker `Stats` mirrors, per model.
     pub worker_stats: WorkerStatGauges,
     /// Heartbeat `MemoryReport` mirrors, per model (SPEC §2.3).
@@ -257,6 +270,25 @@ impl Metrics {
              (should stay zero; nonzero means unpriced memory materialized)",
             &["model"],
         )?;
+        let load_rejects_total = counter(
+            "kiln_load_rejects_total",
+            "Model loads refused up front, per constraint \
+             (budget | system_available | system_pressure)",
+            &["model", "constraint"],
+        )?;
+        let system_available_bytes = plain_gauge(
+            "kiln_system_available_bytes",
+            "Bytes the OS can grant without swapping (last sysmem probe: \
+             free + speculative + inactive pages)",
+        )?;
+        let system_swap_used_bytes = plain_gauge(
+            "kiln_system_swap_used_bytes",
+            "Swap currently allocated by the OS (vm.swapusage used)",
+        )?;
+        let system_pressure_level = plain_gauge(
+            "kiln_system_pressure_level",
+            "Kernel memory-pressure level: 1 normal, 2 warning, 4 critical, 0 unavailable",
+        )?;
         // Heartbeat MemoryReport mirrors (SPEC §2.3), per model.
         let mem = |name: &str, help: &str| gauge(name, help, &["model"]);
         let worker_memory = MemoryGauges {
@@ -376,6 +408,10 @@ impl Metrics {
             memory_used_bytes,
             memory_reserved_bytes,
             admission_uncovered_bytes_total,
+            load_rejects_total,
+            system_available_bytes,
+            system_swap_used_bytes,
+            system_pressure_level,
             worker_stats,
             worker_memory,
         })

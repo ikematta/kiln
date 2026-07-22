@@ -45,6 +45,9 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEALTH_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 /// A worker silent for longer than this is treated as crashed (SPEC §5: 3s).
 const HEALTH_MISSED_DEADLINE: Duration = Duration::from_secs(3);
+/// Max age of the cached system-memory snapshot the request-admission path
+/// prices against; health polls refresh it in the background past this.
+const SYSTEM_PROBE_MAX_AGE: Duration = Duration::from_secs(2);
 /// Poll cadence while waiting for the model to load.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Give up on a load that never reaches READY (tiny models load in seconds;
@@ -227,12 +230,17 @@ impl Supervisor {
         let (lifecycle, receivers) =
             Lifecycle::new(config, &registry, Arc::clone(&metrics)).map_err(StartError::Budget)?;
         let lifecycle = Arc::new(lifecycle);
+        let system = lifecycle.system_memory();
         tracing::info!(
             budget_bytes = lifecycle.budget_bytes(),
             total_unified_bytes = lifecycle.total_bytes().unwrap_or(0),
             fraction = config.memory.budget_fraction,
             explicit_budget = config.memory.budget_bytes.is_some(),
-            "machine memory budget (SPEC 2.3)"
+            min_available_bytes = lifecycle.min_available_bytes(),
+            system_available_bytes = system.map(|m| m.available_bytes).unwrap_or(0),
+            swap_used_bytes = system.map(|m| m.swap_used_bytes).unwrap_or(0),
+            pressure_level = system.map(|m| m.pressure_level).unwrap_or(0),
+            "machine memory budget (SPEC 2.3) + live system snapshot"
         );
         let (shutdown, _) = watch::channel(false);
         let spawner = ModelSpawner {
@@ -332,6 +340,10 @@ enum RunExit {
     },
     /// Load rejected up front: over budget with no evictable model.
     BudgetRejected,
+    /// Load rejected up front by the system-memory gate: the machine
+    /// cannot grant the projected bytes without swapping, even though the
+    /// configured budget has room (2026-07-21 field finding).
+    SystemRejected,
     /// Deliberate unload (eviction / idle TTL) completed; memory released.
     Unloaded {
         reason: UnloadReason,
@@ -365,6 +377,12 @@ async fn supervise(mut ctx: SuperviseCtx) {
                 RunExit::BudgetRejected => {
                     ctx.status_tx.send_replace(WorkerStatus::Unloaded {
                         reason: UnloadReason::OverBudget,
+                    });
+                    break;
+                }
+                RunExit::SystemRejected => {
+                    ctx.status_tx.send_replace(WorkerStatus::Unloaded {
+                        reason: UnloadReason::SystemMemory,
                     });
                     break;
                 }
@@ -509,6 +527,10 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
                 projected_bytes = ctx.projected_bytes, used_bytes = used, budget_bytes = budget,
                 "load rejected: machine budget exceeded and no evictable model \
                  (candidates must be loaded, unpinned, and outside their TTL lease)");
+            ctx.metrics
+                .load_rejects_total
+                .with_label_values(&[&entry.id, lifecycle::AdmitConstraint::Budget.label()])
+                .inc();
             return RunExit::BudgetRejected;
         };
         tracing::warn!(model = %entry.id, victim = %victim,
@@ -521,6 +543,43 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
         }
         if *ctx.shutdown.borrow() {
             return RunExit::Shutdown;
+        }
+    }
+    // System-memory gate (2026-07-21 field finding): the budget above is
+    // cut from INSTALLED memory and cannot see what other processes hold —
+    // it admitted an 11.5 GB model on a 16 GB machine that was already
+    // 4.4 GB into swap. Price the load against a FRESH probe of what the
+    // OS can actually grant, after the eviction loop so freed bytes count.
+    // No eviction on a system refusal: the budget check above already
+    // handles Kiln-caused contention, so a shortfall here is external
+    // (other processes) — evicting our own fleet cannot fix it and a
+    // laggy kernel pressure signal would spiral through every victim.
+    {
+        let lifecycle = Arc::clone(&ctx.lifecycle);
+        let projected = ctx.projected_bytes;
+        // A panicked probe task must not take down supervision: fail open
+        // (tokio logs the panic) exactly like a failed probe.
+        let verdict = tokio::task::spawn_blocking(move || lifecycle.admit_load_system(projected))
+            .await
+            .unwrap_or(Ok(()));
+        if let Err(denial) = verdict {
+            tracing::error!(model = %entry.id,
+                projected_bytes = denial.needed_bytes,
+                system_available_bytes = denial.available_bytes,
+                min_available_bytes = denial.min_available_bytes,
+                swap_used_bytes = denial.swap_used_bytes,
+                pressure_level = denial.pressure_level,
+                constraint = denial.constraint.label(),
+                budget_bytes = ctx.lifecycle.budget_bytes(),
+                charged_bytes = ctx.lifecycle.charged_bytes(),
+                "load rejected: the machine cannot grant these bytes without \
+                 swapping (fits the configured budget, but real availability \
+                 or kernel pressure says otherwise)");
+            ctx.metrics
+                .load_rejects_total
+                .with_label_values(&[&entry.id, denial.constraint.label()])
+                .inc();
+            return RunExit::SystemRejected;
         }
     }
     // Reserve the projection; the first measured heartbeat replaces it
@@ -657,6 +716,10 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
                         }
                         last_ok = Instant::now();
                         record_memory(ctx, &status);
+                        // Keep the request path's system snapshot warm
+                        // (background, rate-limited, one probe in flight).
+                        ctx.lifecycle
+                            .refresh_system_memory_soon(SYSTEM_PROBE_MAX_AGE);
                         if status.requests_running + status.requests_waiting > 0 {
                             // In-flight work counts as use: it holds the LRU
                             // position and the TTL idle clock alike.

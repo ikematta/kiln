@@ -156,9 +156,9 @@ async fn healthz() -> Json<serde_json::Value> {
 }
 
 /// 200 once every configured worker has settled: Ready, or deliberately
-/// Unloaded (idle TTL / evicted / over budget — SPEC §2.2 lifecycle states,
-/// reloaded on demand). Everything transitional or broken is 503 with
-/// per-model states.
+/// Unloaded (idle TTL / evicted / over budget / system memory pressure —
+/// SPEC §2.2 lifecycle states, reloaded on demand). Everything
+/// transitional or broken is 503 with per-model states.
 async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     let mut models = serde_json::Map::new();
     let mut all_ready = true;

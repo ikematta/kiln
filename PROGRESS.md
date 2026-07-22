@@ -6590,3 +6590,141 @@
 - Next: nothing scheduled — the SPEC §12 plan remains complete; this was
   a post-closeout UX task (live add-model). Phase 11 still requires
   separate human approval.
+
+## [2026-07-21] Post-closeout / System-memory-aware admission (field bug fix) — DONE
+- What:
+  - Fixes a confirmed field finding: on this 16 GB dev machine under
+    daily-use load, Qwen2.5-Coder-14B-4bit was admitted under the
+    total-RAM budget (budget 13.74 GB, used 11.57 GB) while the OS ran
+    ~4.4 GB of active swap — generation measured ~0.44 tok/s, 150-200x
+    under the machine's benchmark. The budget is cut from INSTALLED RAM
+    and cannot see memory other processes hold.
+  - New `kiln-gateway/src/sysmem.rs`: live probe of what the machine can
+    actually grant — availability = free+speculative+inactive pages
+    (`vm_stat`; disjoint queues), swap-used (`sysctl vm.swapusage`), and
+    the kernel's own live pressure signal
+    (`kern.memorystatus_vm_pressure_level`: 1/2/4). Shelled out like the
+    existing `hw.memsize` read (unsafe stays confined to kiln-mlx).
+  - Load admission (supervisor `run_once`): after the budget/eviction
+    loop settles, the load is priced against a FRESH probe — refused when
+    it would leave less than `memory.min_available_bytes` (new config key,
+    default 1 GiB, 0 = gate off) of real availability, or when the kernel
+    already reports pressure ≥ warning. Structured refusal: status
+    `unloaded (system memory pressure)` (settled for /readyz, retried on
+    the next request), `kiln_load_rejects_total{model,constraint}`
+    (budget | system_available | system_pressure — the budget-reject path
+    now counts too), and an ERROR log carrying every number the decision
+    used. No eviction on a system refusal: the budget check owns
+    Kiln-caused contention; a system shortfall is external, and evicting
+    our own fleet against a laggy kernel signal would spiral.
+  - Request admission (`admit_request`): effective headroom is now
+    min(budget − charged, available − floor − outstanding reservations),
+    from a cached snapshot the supervisors' 1s health polls keep ≤2s old
+    (background `spawn_blocking`, one probe in flight); pool growth is
+    refused outright under kernel pressure. Warm pools (zero growth) are
+    never gated — live traffic keeps serving. `MemoryDenial` gained a
+    `constraint` field; the 503 `insufficient_memory` message names which
+    bound refused. Missing snapshot fails OPEN to budget-only (never a
+    refusal on absent data).
+  - Observability: gauges `kiln_system_available_bytes`,
+    `kiln_system_swap_used_bytes`, `kiln_system_pressure_level`; the
+    admin memory ledger and stats SSE carry a `system` object; the
+    startup budget log line includes the live snapshot;
+    `GET /admin/models/estimate` now answers `fits_budget`/`fits_system`
+    with `fits` the conjunction (admin UI message distinguishes "unload
+    something" from "the machine itself is low on free memory").
+  - Deliberately NOT gated on swap-allocated: macOS keeps swap around
+    long after pressure passes (this machine idles at ~2.5 GB used at
+    pressure level normal, and grew it to ~4 GB during cargo builds while
+    still normal). Gating on it would refuse loads on machines with
+    gigabytes genuinely free; the pressure level is the honest version of
+    "swap is active", and low availability catches the rest.
+  - Tests: 4 sysmem parser/probe unit tests; 4 lifecycle system-gate unit
+    tests via injected snapshots (availability bound with reservations,
+    request-path min() bound + recovery, pressure refusal incl. the
+    swap-active shape + warm-pool passthrough, fail-open); new e2e
+    tests/e2e/test_system_memory.py — a real 3 GiB touched-page hog makes
+    the boot load refuse (structured status + counter, nothing charged,
+    /readyz settled 200) and the IDENTICAL config admits and serves the
+    moment the hog exits; plus the estimate/system-gate surface.
+  - Also fixed en route: admin_models' test helper named temp dirs by
+    SystemTime nanos — µs clock granularity let concurrent tests collide
+    on one dir, and Lifecycle::new's new ~20 ms probe widened the window
+    until one test's teardown deleted another's dir mid-setup (flaked
+    ~1-in-3 full-lib runs). Now a process-wide atomic counter.
+- Decisions:
+  - Availability formula free+speculative+inactive (psutil's macOS
+    "available"): slightly overstates (dirty anon pages in the inactive
+    queue still need compression) — `min_available_bytes` is the guard
+    band. Purgeable excluded (overlaps the active/inactive queues).
+  - Fresh probe per load (loads are rare, serialized, and worth 2 process
+    spawns); cached ≤2s snapshot per request (fork/exec has no place on
+    the request path). Probe failure fails open with a warning — an odd
+    environment degrades to exactly the pre-fix behavior, never an
+    outage.
+  - The e2e hog starts FIRST and the floor anchors to hog-resident
+    availability: the first version measured before the hog and proved
+    macOS absorbs big allocations partly by compressing other pages
+    (availability fell < 1.5 GiB for a 3 GiB hog → no refusal). Only the
+    hog-resident baseline and the release direction (~3 GiB back to the
+    free queue at exit) are deterministic.
+  - SPEC §2.3 text untouched (same additive-latitude treatment as the
+    add-model entry); it already gestures at "minus a fixed floor", and
+    the system gate is that floor made real against the live machine.
+- Deviations: none.
+- CI shapes (investigated per acceptance): the full e2e suite runs on
+  GitHub `macos-14` runners — 7 GB VMs with run-to-run memory variance.
+  The hog test needs hog (3 GiB) + projection + 2 GiB measured available
+  and SELF-SKIPS below that with a message naming this entry, so it is
+  effectively dev-hardware-only; the estimate/gauge e2e and all unit
+  tests run everywhere. What CI cannot simulate at all — the kernel
+  actually reporting pressure ≥ warning — is pinned by injected-probe
+  unit tests and covered by the real-hardware verification below. The
+  existing suite runs with the default 1 GiB floor ON (runners need
+  ~1.4-1.8 GB available per tiny-model load; the
+  kiln_system_available_bytes gauge and the startup log line now give CI
+  logs the diagnostic if a runner ever runs that tight).
+- Manually verified on the real hardware that found the bug (16 GB dev
+  machine, swap already 2.7 GB allocated — the "admission while swap is
+  active" scenario): a real gateway on the ACTUAL
+  Qwen2.5-Coder-14B-Instruct-4bit checkpoint with pure default config
+  refused the exact load the old code admitted:
+  ```
+  budget_bytes: 13743895347  (the finding's 13.74 GB, fraction 0.8 of 17.18 GB)
+  load rejected: ... projected_bytes: 8376603097,
+    system_available_bytes: 8285700096, min_available_bytes: 1073741824,
+    swap_used_bytes: 2715612610, pressure_level: 1,
+    constraint: "system_available"
+  /readyz: {"status":"ready","models":{"qwen2.5-coder-14b-4bit":"unloaded (system memory pressure)"}}
+  kiln_load_rejects_total{constraint="system_available",...} 1
+  kiln_memory_used_bytes 0
+  ```
+- Acceptance:
+  ```
+  cargo fmt --check                                             clean
+  cargo clippy --workspace --all-targets -- -D warnings         clean
+  cargo clippy --workspace --all-targets --no-default-features  clean
+  cargo build --workspace --no-default-features                 clean
+  cargo test --workspace                    246 passed, 0 failed (was 238)
+  cargo test -p kiln-gateway --lib          8 consecutive runs green
+                                            (temp-dir flake fixed + verified)
+  ruff check + format --check (python/ tests/e2e scripts)       clean
+  uv run --project tests/e2e pytest tests/e2e
+      99 passed, 3 skipped in 699s   (was 97+3; both new tests pass —
+      every Phase 9 lifecycle/admission/priority scenario green under
+      the new gate)
+  tests/e2e/test_system_memory.py::test_load_refused_under_real_memory_pressure_and_recovers PASSED
+  tests/e2e/test_system_memory.py::test_estimate_reports_the_system_gate PASSED
+  ./scripts/soak.sh   (30-minute Phase 9 leak/correctness gate)
+      PASS: all gates held — 1 passed in 1828s (30:28).
+      committed peak 3.67 GB of 3.90 GB budget; reservation ledger peak
+      403 MB in flight, uncovered growth 0.0 MB (gated at 0); interactive
+      p50 0.29s / p95 0.44s (during floods p95 8.01s); spec acceptance
+      1.00; 46 evictions + 22 idle-TTL unloads + 27 request-admission
+      503s exercised, 0 crashes, 0 over_budget, 0 system_memory refusals
+      (availability ~8 GB against the 1 GiB floor throughout) — the new
+      gate changed no soak behavior.
+  ```
+- Next: nothing scheduled — SPEC §12 remains complete; this was a
+  field-bug fix inside Phase 9's admission machinery. Phase 11 still
+  requires separate human approval.
