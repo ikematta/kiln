@@ -56,7 +56,7 @@ def test_request_rejected_when_pool_growth_exceeds_headroom():
     is structured and retriable, the worker stays READY, and — the point —
     the pool never materializes, so the machine never drifts over budget."""
     path = require(QWEN25)
-    memory = f"[memory]\nbudget_bytes = {REJECT_BUDGET}\n"
+    memory = f"[memory]\nbudget_bytes = {REJECT_BUDGET}\nmin_available_bytes = 0\n"
     with running_stack([("solo", "rust", path)], extra_toml=memory) as stack:
         stack.wait_ready()
         _, statuses = readyz(stack)
@@ -86,7 +86,7 @@ def test_request_admitted_when_headroom_allows():
     headroom serves, the pool materializes, and the ledger stays under
     budget — the gate refuses over-commitment, not traffic."""
     path = require(QWEN25)
-    memory = f"[memory]\nbudget_bytes = {SERVE_BUDGET}\n"
+    memory = f"[memory]\nbudget_bytes = {SERVE_BUDGET}\nmin_available_bytes = 0\n"
     with running_stack([("solo", "rust", path)], extra_toml=memory) as stack:
         stack.wait_ready()
         response = complete(stack, "solo")
@@ -112,7 +112,7 @@ def test_drift_from_one_model_gates_anothers_requests():
     snapshot."""
     path = require(QWEN25)
     models = [("hot", "rust", path), ("cold", "rust", path)]
-    memory = f"[memory]\nbudget_bytes = {DRIFT_BUDGET}\n"
+    memory = f"[memory]\nbudget_bytes = {DRIFT_BUDGET}\nmin_available_bytes = 0\n"
     with running_stack(models, extra_toml=memory) as stack:
         stack.wait_ready()
         _, statuses = readyz(stack)
@@ -157,7 +157,7 @@ def test_concurrent_admissions_cannot_jointly_overshoot():
     budget — including transiently, sampled at 200 ms throughout."""
     path = require(QWEN25)
     models = [("left", "rust", path), ("right", "rust", path)]
-    memory = f"[memory]\nbudget_bytes = {DRIFT_BUDGET}\n"
+    memory = f"[memory]\nbudget_bytes = {DRIFT_BUDGET}\nmin_available_bytes = 0\n"
     with running_stack(models, extra_toml=memory) as stack:
         stack.wait_ready()
         time.sleep(2)  # measured heartbeats replace the load reservations

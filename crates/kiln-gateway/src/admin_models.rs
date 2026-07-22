@@ -60,11 +60,22 @@ pub(crate) fn model_json(state: &AppState, entry: &ModelEntry) -> Value {
 }
 
 fn memory_json(state: &AppState) -> Value {
+    // System snapshot: the live machine view admissions are priced
+    // against (null until first probe, or with the gate disabled).
+    let system = state.lifecycle.system_memory().map(|memory| {
+        json!({
+            "available_bytes": memory.available_bytes,
+            "swap_used_bytes": memory.swap_used_bytes,
+            "pressure_level": memory.pressure_level,
+            "min_available_bytes": state.lifecycle.min_available_bytes(),
+        })
+    });
     json!({
         "budget_bytes": state.lifecycle.budget_bytes(),
         "used_bytes": state.lifecycle.used_bytes(),
         "reserved_bytes": state.lifecycle.reserved_bytes(),
         "total_bytes": state.lifecycle.total_bytes(),
+        "system": system,
     })
 }
 
@@ -293,13 +304,16 @@ mod tests {
         mpsc::UnboundedReceiver<Command>,
         PathBuf,
     ) {
+        // A process-wide counter, not a timestamp: macOS clocks tick in
+        // microseconds, and concurrent tests entering here in the same
+        // tick used to collide on one dir — one test's teardown then
+        // deleted the other's dir mid-setup (the window is real since
+        // Lifecycle::new probes system memory, ~tens of ms).
+        static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "kiln-admin-models-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).expect("test dir");
         std::fs::write(dir.join("config.json"), b"{\"model_type\": \"phi3\"}").expect("config");

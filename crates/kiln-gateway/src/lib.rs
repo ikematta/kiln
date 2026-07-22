@@ -19,5 +19,6 @@ pub mod metrics;
 pub mod openai;
 pub mod registry;
 pub mod supervisor;
+pub mod sysmem;
 pub mod uds;
 pub mod ui;

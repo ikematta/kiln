@@ -368,7 +368,9 @@ pub struct EstimateQuery {
 /// shows before a download — how many bytes this model will want
 /// (weights on disk or the hub's listing, plus the same load-overhead
 /// margin the Phase 9 projection charges) against the live budget
-/// ledger's real headroom.
+/// ledger's real headroom AND the live system-memory gate the load
+/// itself will face (fresh probe): `fits` is the conjunction, with
+/// `fits_budget`/`fits_system` splitting the answer for the UI.
 pub async fn estimate_model(
     State(state): State<Arc<AppState>>,
     Query(query): Query<EstimateQuery>,
@@ -388,6 +390,16 @@ pub async fn estimate_model(
     let budget_bytes = state.lifecycle.budget_bytes();
     let charged_bytes = state.lifecycle.charged_bytes();
     let headroom_bytes = budget_bytes.saturating_sub(charged_bytes);
+    // The same fresh-probe verdict the load path will reach (fails open
+    // like it too — a probe failure never blocks the estimate).
+    let fits_system = {
+        let lifecycle = Arc::clone(&state.lifecycle);
+        tokio::task::spawn_blocking(move || lifecycle.admit_load_system(estimated_bytes))
+            .await
+            .unwrap_or(Ok(()))
+            .is_ok()
+    };
+    let system = state.lifecycle.system_memory();
     Ok(Json(json!({
         "path": query.path,
         "source": source,
@@ -396,7 +408,12 @@ pub async fn estimate_model(
         "budget_bytes": budget_bytes,
         "charged_bytes": charged_bytes,
         "headroom_bytes": headroom_bytes,
-        "fits": estimated_bytes <= headroom_bytes,
+        "system_available_bytes": system.map(|m| m.available_bytes),
+        "pressure_level": system.map(|m| m.pressure_level),
+        "min_available_bytes": state.lifecycle.min_available_bytes(),
+        "fits_budget": estimated_bytes <= headroom_bytes,
+        "fits_system": fits_system,
+        "fits": estimated_bytes <= headroom_bytes && fits_system,
     })))
 }
 

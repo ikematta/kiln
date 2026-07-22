@@ -40,6 +40,7 @@ KILN_DEFAULTS__SSD_TIER=false
 |---|---|---|
 | `budget_fraction` | `0.80` | Machine budget = total unified memory × this fraction (SPEC §2.3). Every worker's heartbeat-measured footprint (max(MLX active, weights + KV pool) + MLX cache) is charged against it. |
 | `budget_bytes` | unset | Absolute budget in bytes; overrides `budget_fraction` when set. |
+| `min_available_bytes` | `1073741824` (1 GiB) | Real system availability that must remain AFTER any admission. The budget above is cut from installed RAM and cannot see memory other processes hold, so every load (and projected KV-pool growth) is also priced against a live OS probe (`vm_stat` free+speculative+inactive pages; `kern.memorystatus_vm_pressure_level`). `0` disables the system gate (budget-only admission). |
 
 Enforcement, as actually built (Phase 9):
 
@@ -51,6 +52,19 @@ Enforcement, as actually built (Phase 9):
   retriable `503 insufficient_memory` instead of drifting over budget.
   Admission runs against a reservation ledger, so concurrent requests
   cannot race past the budget (PROGRESS 2026-07-15, Phase 9 part 3).
+- **System gate** (2026-07-21 field fix): both decisions above are ALSO
+  bounded by what the machine can actually give out right now. A load whose
+  projection would leave less than `min_available_bytes` of real
+  availability — or any load/pool-growth while the kernel already reports
+  elevated memory pressure (`kern.memorystatus_vm_pressure_level` ≥ 2,
+  the live "swap is actively working" signal) — is refused with the
+  status `unloaded (system memory pressure)` and
+  `kiln_load_rejects_total{constraint="system_available"|"system_pressure"}`,
+  even when it fits the configured budget. Swap *allocated* is deliberately
+  not a gate: macOS keeps swap around long after pressure passes, so a
+  machine with gigabytes genuinely free admits normally. Probe gauges:
+  `kiln_system_available_bytes`, `kiln_system_swap_used_bytes`,
+  `kiln_system_pressure_level`.
 - **Priorities**: requests carry an optional `priority` field
   (`"interactive"` default, `"batch"`); BATCH is preempted first under
   pressure and queues behind INTERACTIVE arrivals.

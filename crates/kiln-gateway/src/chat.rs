@@ -97,10 +97,12 @@ pub(crate) fn ready_entry(state: &AppState, model: &str) -> Result<Arc<ModelEntr
 
 /// Per-request memory admission (SPEC §2.3/§8.2, Phase 9 part 2), shared by
 /// every completion-shaped endpoint: refuses the request when serving it
-/// could materialize KV-pool bytes the machine budget no longer has room
-/// for. Runs against live heartbeat numbers, so drift since load (pools,
-/// caches) is priced in — this is the per-request check, distinct from the
-/// load-time `load()` gate.
+/// could materialize KV-pool bytes the machine no longer has room for —
+/// under the configured budget OR under real system availability/pressure
+/// (the tightest bound wins; `denial.constraint` names it). Runs against
+/// live heartbeat numbers, so drift since load (pools, caches) is priced
+/// in — this is the per-request check, distinct from the load-time
+/// `load()` gate.
 pub(crate) fn admit_memory(state: &AppState, entry: &ModelEntry) -> Result<(), ApiError> {
     state.lifecycle.admit_request(&entry.id).map_err(|denial| {
         state
@@ -110,8 +112,9 @@ pub(crate) fn admit_memory(state: &AppState, entry: &ModelEntry) -> Result<(), A
             .inc();
         tracing::warn!(target: "kiln::admission", model = %entry.id,
             needed_bytes = denial.needed_bytes, headroom_bytes = denial.headroom_bytes,
+            constraint = denial.constraint.label(),
             "request rejected: projected pool growth exceeds machine headroom");
-        ApiError::insufficient_memory(&entry.id, denial.needed_bytes, denial.headroom_bytes)
+        ApiError::insufficient_memory(&entry.id, denial)
     })
 }
 

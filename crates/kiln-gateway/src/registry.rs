@@ -45,6 +45,12 @@ pub enum UnloadReason {
     IdleTtl,
     /// Its own load was rejected: over budget with no evictable model.
     OverBudget,
+    /// Its own load was rejected by the system-memory gate: the machine
+    /// could not grant the projected bytes without swapping (real
+    /// availability below `memory.min_available_bytes` after the load, or
+    /// the kernel already reporting elevated pressure) — even though the
+    /// configured budget had room. Retried on the next request for it.
+    SystemMemory,
     /// Operator asked for it via `POST /admin/models/{id}/unload`.
     Admin,
     /// Registered at runtime via `POST /admin/models` and never yet
@@ -60,6 +66,7 @@ impl UnloadReason {
             Self::Evicted => "evicted",
             Self::IdleTtl => "idle_ttl",
             Self::OverBudget => "over_budget",
+            Self::SystemMemory => "system_memory",
             Self::Admin => "admin",
             Self::Registered => "registered",
         }
@@ -81,6 +88,9 @@ impl fmt::Display for WorkerStatus {
             Self::Unloaded {
                 reason: UnloadReason::OverBudget,
             } => write!(f, "unloaded (over budget)"),
+            Self::Unloaded {
+                reason: UnloadReason::SystemMemory,
+            } => write!(f, "unloaded (system memory pressure)"),
             Self::Unloaded {
                 reason: UnloadReason::Admin,
             } => write!(f, "unloaded (admin)"),

@@ -896,7 +896,7 @@ def test_full_stack_soak():
         (GEMMA, "rust", gemma_path, f"ttl_seconds = {GEMMA_TTL_SECONDS}"),
         (PYSMOL, "python", smol_path, ""),
     ]
-    extra = f"[memory]\nbudget_bytes = {BUDGET_BYTES}\n"
+    extra = f"[memory]\nbudget_bytes = {BUDGET_BYTES}\nmin_available_bytes = 0\n"
 
     with running_stack(models, extra_toml=extra) as stack:
         stack.wait_ready()

@@ -447,7 +447,9 @@
 					~{gb(add.estimate.headroom_bytes)} free of {gb(add.estimate.budget_bytes)} budget{add
 						.estimate.fits
 						? ''
-						: ' — does NOT fit without unloading something'}
+						: add.estimate.fits_budget === false
+							? ' — does NOT fit without unloading something'
+							: ' — the machine itself is low on free memory right now (other apps hold it)'}
 				</p>
 			{/if}
 			{#if add.phase === 'downloading'}

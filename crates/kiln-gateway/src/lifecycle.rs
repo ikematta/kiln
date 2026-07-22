@@ -28,6 +28,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::config::KilnConfig;
 use crate::metrics::Metrics;
 use crate::registry::{Registry, UnloadReason, WorkerStatus};
+use crate::sysmem::{self, SystemMemory};
 
 /// Upper bound on one eviction round-trip: graceful drain deadline plus
 /// SIGTERM grace plus scheduling slack (supervisor constants).
@@ -81,18 +82,78 @@ pub(crate) struct Slot {
     pool_reserved_bytes: AtomicU64,
 }
 
+/// Which bound an admission decision ran into. The configured budget
+/// (SPEC §2.3) caps what Kiln hands out of installed RAM; the system
+/// bounds cap what the machine can actually give out right now — memory
+/// other processes claimed is invisible to the budget but not to the OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitConstraint {
+    /// The configured machine budget (fraction of installed RAM).
+    Budget,
+    /// Live OS availability minus `memory.min_available_bytes`.
+    SystemAvailability,
+    /// The kernel reports elevated memory pressure
+    /// (`kern.memorystatus_vm_pressure_level` ≥ warning): the machine is
+    /// already compressing/swapping, and new bytes would compound it.
+    SystemPressure,
+}
+
+impl AdmitConstraint {
+    /// Bounded label for `kiln_load_rejects_total{constraint}` and logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Budget => "budget",
+            Self::SystemAvailability => "system_available",
+            Self::SystemPressure => "system_pressure",
+        }
+    }
+}
+
 /// Why [`Lifecycle::admit_request`] refused a request: admitting it could
-/// grow the worker by `needed_bytes` but only `headroom_bytes` of the
-/// machine budget remain.
+/// grow the worker by `needed_bytes` but only `headroom_bytes` remain
+/// under `constraint` (the tightest of the budget and system bounds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryDenial {
     pub needed_bytes: u64,
     pub headroom_bytes: u64,
+    pub constraint: AdmitConstraint,
+}
+
+/// Why the load-time system gate ([`Lifecycle::admit_load_system`])
+/// refused: the numbers behind the decision, for the structured log and
+/// the `kiln_load_rejects_total` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemDenial {
+    pub needed_bytes: u64,
+    pub available_bytes: u64,
+    pub min_available_bytes: u64,
+    pub swap_used_bytes: u64,
+    pub pressure_level: u32,
+    /// `SystemAvailability` or `SystemPressure`, never `Budget`.
+    pub constraint: AdmitConstraint,
+}
+
+/// Cached [`sysmem::probe`] reading plus its age, for admission decisions
+/// that must not pay a process spawn on the request path.
+struct SystemSnapshot {
+    memory: Option<SystemMemory>,
+    /// Millis since [`Lifecycle::epoch`] of the probe; 0 = never probed.
+    at_ms: u64,
 }
 
 pub struct Lifecycle {
     budget_bytes: u64,
     total_bytes: Option<u64>,
+    /// `memory.min_available_bytes`: real availability that must remain
+    /// after any admission; 0 disables the system gate.
+    min_available_bytes: u64,
+    /// Latest probe reading (see [`Self::refresh_system_memory`]). The
+    /// load path forces a fresh probe; the request path reads this cache,
+    /// kept warm by the supervisors' 1s health polls.
+    system: std::sync::Mutex<SystemSnapshot>,
+    /// At most one background probe in flight
+    /// ([`Self::refresh_system_memory_soon`]).
+    system_probe_inflight: AtomicBool,
     /// Interior-mutable so `POST /admin/models` can add slots after boot.
     /// Lock order: [`Self::admission_lock`] may take the slots read lock
     /// (via `charged_bytes`) but never the reverse — [`Self::add_slot`]'s
@@ -141,18 +202,27 @@ impl Lifecycle {
             );
             receivers.push(cmd_rx);
         }
-        Ok((
-            Self {
-                budget_bytes,
-                total_bytes,
-                slots: std::sync::RwLock::new(slots),
-                load_permit: tokio::sync::Mutex::new(()),
-                admission_lock: std::sync::Mutex::new(()),
-                metrics,
-                epoch: Instant::now(),
-            },
-            receivers,
-        ))
+        let lifecycle = Self {
+            budget_bytes,
+            total_bytes,
+            min_available_bytes: config.memory.min_available_bytes,
+            system: std::sync::Mutex::new(SystemSnapshot {
+                memory: None,
+                at_ms: 0,
+            }),
+            system_probe_inflight: AtomicBool::new(false),
+            slots: std::sync::RwLock::new(slots),
+            load_permit: tokio::sync::Mutex::new(()),
+            admission_lock: std::sync::Mutex::new(()),
+            metrics,
+            epoch: Instant::now(),
+        };
+        // Seed the cache so the request path never runs on a never-probed
+        // snapshot; boot already shells sysctl for hw.memsize.
+        if lifecycle.min_available_bytes > 0 {
+            lifecycle.refresh_system_memory();
+        }
+        Ok((lifecycle, receivers))
     }
 
     /// Adds the slot for a runtime-registered model (`POST /admin/models`)
@@ -235,6 +305,117 @@ impl Lifecycle {
 
     fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// `memory.min_available_bytes`; 0 = system gate disabled.
+    pub fn min_available_bytes(&self) -> u64 {
+        self.min_available_bytes
+    }
+
+    /// Latest cached probe reading; `None` until the first successful
+    /// probe (or with the gate disabled and nothing keeping it warm).
+    pub fn system_memory(&self) -> Option<SystemMemory> {
+        self.system.lock().unwrap_or_else(|e| e.into_inner()).memory
+    }
+
+    /// Stores a probe reading (also the injection point for unit tests)
+    /// and exports the system gauges.
+    pub(crate) fn store_system_memory(&self, memory: SystemMemory) {
+        {
+            let mut snapshot = self.system.lock().unwrap_or_else(|e| e.into_inner());
+            snapshot.memory = Some(memory);
+            snapshot.at_ms = self.now_ms();
+        }
+        self.metrics
+            .system_available_bytes
+            .set(i64::try_from(memory.available_bytes).unwrap_or(i64::MAX));
+        self.metrics
+            .system_swap_used_bytes
+            .set(i64::try_from(memory.swap_used_bytes).unwrap_or(i64::MAX));
+        self.metrics
+            .system_pressure_level
+            .set(i64::from(memory.pressure_level));
+    }
+
+    /// Probes the OS now and refreshes the cache. Blocking (two process
+    /// spawns): call from `spawn_blocking` in async contexts. A failed
+    /// probe leaves the previous snapshot in place and returns `None`.
+    pub(crate) fn refresh_system_memory(&self) -> Option<SystemMemory> {
+        let memory = sysmem::probe()?;
+        self.store_system_memory(memory);
+        Some(memory)
+    }
+
+    /// Health-poll hook: refreshes the cache off the hot path when it is
+    /// older than `max_age`, with at most one probe in flight. Cheap when
+    /// fresh (one lock, no spawn); a no-op with the gate disabled.
+    pub(crate) fn refresh_system_memory_soon(self: &Arc<Self>, max_age: Duration) {
+        if self.min_available_bytes == 0 {
+            return;
+        }
+        {
+            let snapshot = self.system.lock().unwrap_or_else(|e| e.into_inner());
+            if snapshot.at_ms > 0
+                && self.now_ms().saturating_sub(snapshot.at_ms) < max_age.as_millis() as u64
+            {
+                return;
+            }
+        }
+        if self.system_probe_inflight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            this.refresh_system_memory();
+            this.system_probe_inflight.store(false, Ordering::Release);
+        });
+    }
+
+    /// Load-time system gate: prices `projected_bytes` against a FRESH
+    /// probe of what the machine can actually give out — run AFTER the
+    /// budget/eviction loop settles, so bytes freed by evictions count.
+    /// Blocking (probe): call from `spawn_blocking`. Fails open when the
+    /// gate is disabled or the probe is unavailable (budget-only
+    /// admission, logged).
+    pub(crate) fn admit_load_system(&self, projected_bytes: u64) -> Result<(), SystemDenial> {
+        if self.min_available_bytes == 0 {
+            return Ok(());
+        }
+        let Some(memory) = self.refresh_system_memory() else {
+            tracing::warn!(
+                "system memory probe failed; admitting the load on the configured budget alone"
+            );
+            return Ok(());
+        };
+        match self.system_denial(memory, projected_bytes) {
+            Some(denial) => Err(denial),
+            None => Ok(()),
+        }
+    }
+
+    /// System-gate policy over one probe reading: refuse when the kernel
+    /// already reports elevated pressure, or when granting `needed_bytes`
+    /// would leave less than `min_available_bytes` of real availability.
+    /// Outstanding admission reservations are subtracted from availability
+    /// — admitted growth that has not materialized yet is invisible to
+    /// the OS but will claim real bytes imminently.
+    fn system_denial(&self, memory: SystemMemory, needed_bytes: u64) -> Option<SystemDenial> {
+        let denial = |constraint| SystemDenial {
+            needed_bytes,
+            available_bytes: memory.available_bytes,
+            min_available_bytes: self.min_available_bytes,
+            swap_used_bytes: memory.swap_used_bytes,
+            pressure_level: memory.pressure_level,
+            constraint,
+        };
+        if memory.pressure_elevated() {
+            return Some(denial(AdmitConstraint::SystemPressure));
+        }
+        let headroom = memory
+            .available_bytes
+            .saturating_sub(self.min_available_bytes)
+            .saturating_sub(self.reserved_bytes());
+        (needed_bytes > headroom).then(|| denial(AdmitConstraint::SystemAvailability))
     }
 
     /// Marks the model as just-used (request routed to it, or the worker
@@ -412,6 +593,13 @@ impl Lifecycle {
     /// request on the same still-cold pool) passes without re-reserving:
     /// the pool materializes once. Heartbeats reconcile reservations in
     /// [`Self::record_pool_materialized`].
+    /// System bound (2026-07-21 field finding): the budget is cut from
+    /// INSTALLED memory, blind to what other processes hold, so growth is
+    /// additionally priced against the cached [`sysmem::probe`] reading
+    /// (health-poll refreshed): real availability minus the configured
+    /// floor, and an outright refusal while the kernel reports elevated
+    /// pressure. A fully-warm pool (zero growth) is never gated — its
+    /// bytes are already real and counted.
     pub fn admit_request(&self, model_id: &str) -> Result<(), MemoryDenial> {
         let Some(slot) = self.slot(model_id) else {
             return Ok(());
@@ -430,7 +618,26 @@ impl Lifecycle {
         if growth == 0 {
             return Ok(());
         }
-        let headroom = self.budget_bytes.saturating_sub(self.charged_bytes());
+        let budget_headroom = self.budget_bytes.saturating_sub(self.charged_bytes());
+        let (mut headroom, mut constraint) = (budget_headroom, AdmitConstraint::Budget);
+        if self.min_available_bytes > 0
+            && let Some(memory) = self.system_memory()
+        {
+            if memory.pressure_elevated() {
+                return Err(MemoryDenial {
+                    needed_bytes: growth,
+                    headroom_bytes: 0,
+                    constraint: AdmitConstraint::SystemPressure,
+                });
+            }
+            let system_headroom = memory
+                .available_bytes
+                .saturating_sub(self.min_available_bytes)
+                .saturating_sub(self.reserved_bytes());
+            if system_headroom < headroom {
+                (headroom, constraint) = (system_headroom, AdmitConstraint::SystemAvailability);
+            }
+        }
         if growth <= headroom {
             slot.pool_reserved_bytes.fetch_add(growth, Ordering::AcqRel);
             drop(_guard);
@@ -440,6 +647,7 @@ impl Lifecycle {
         Err(MemoryDenial {
             needed_bytes: growth,
             headroom_bytes: headroom,
+            constraint,
         })
     }
 
@@ -696,6 +904,15 @@ mod tests {
             Lifecycle {
                 budget_bytes: 1000,
                 total_bytes: None,
+                // System gate off by default: these tests pin the budget
+                // arithmetic; system-gate tests flip the field and inject
+                // snapshots via store_system_memory.
+                min_available_bytes: 0,
+                system: std::sync::Mutex::new(SystemSnapshot {
+                    memory: None,
+                    at_ms: 0,
+                }),
+                system_probe_inflight: AtomicBool::new(false),
                 slots: std::sync::RwLock::new(map),
                 load_permit: tokio::sync::Mutex::new(()),
                 admission_lock: std::sync::Mutex::new(()),
@@ -791,6 +1008,7 @@ mod tests {
             Err(MemoryDenial {
                 needed_bytes: 500,
                 headroom_bytes: 300,
+                constraint: AdmitConstraint::Budget,
             })
         );
 
@@ -847,6 +1065,7 @@ mod tests {
             Err(MemoryDenial {
                 needed_bytes: 400,
                 headroom_bytes: 150,
+                constraint: AdmitConstraint::Budget,
             })
         );
         // The hot model unloads: headroom recovers, the same request passes.
@@ -873,6 +1092,7 @@ mod tests {
             Err(MemoryDenial {
                 needed_bytes: 400,
                 headroom_bytes: 100,
+                constraint: AdmitConstraint::Budget,
             })
         );
         // A refusal reserves nothing.
@@ -950,6 +1170,136 @@ mod tests {
             100
         );
         assert_eq!(lifecycle.reserved_bytes(), 0);
+    }
+
+    /// The 2026-07-21 field finding as arithmetic: the budget is cut from
+    /// installed RAM, so it admitted an 11.5 GB load on a 16 GB machine
+    /// whose OS was already 4.4 GB into swap. The system gate prices the
+    /// same decision against what the machine can actually give out.
+    #[test]
+    fn load_system_gate_refuses_what_the_machine_cannot_give() {
+        let (mut lifecycle, _senders) = lifecycle_with(vec![("m", false, None, 0, 0)]);
+        lifecycle.min_available_bytes = 100;
+        let plenty = SystemMemory {
+            available_bytes: 1000,
+            swap_used_bytes: 0,
+            pressure_level: 1,
+        };
+
+        // Fits: 800 needed + 100 floor <= 1000 available.
+        assert_eq!(lifecycle.system_denial(plenty, 800), None);
+        // The floor is enforced: 950 would leave only 50 of the 100.
+        assert_eq!(
+            lifecycle
+                .system_denial(plenty, 950)
+                .map(|denial| denial.constraint),
+            Some(AdmitConstraint::SystemAvailability)
+        );
+        // Outstanding admission reservations are bytes the OS has not seen
+        // yet but WILL: they shrink what availability can promise.
+        lifecycle.set_pool_commitment("m", 300);
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+        assert_eq!(lifecycle.reserved_bytes(), 300);
+        assert_eq!(
+            lifecycle
+                .system_denial(plenty, 700)
+                .map(|denial| denial.constraint),
+            Some(AdmitConstraint::SystemAvailability)
+        );
+        assert_eq!(lifecycle.system_denial(plenty, 600), None);
+
+        // The kernel already reporting pressure (warning/critical) refuses
+        // outright — "swap is active" as the OS defines it, regardless of
+        // how the availability arithmetic looks.
+        let pressured = SystemMemory {
+            available_bytes: 1000,
+            swap_used_bytes: 4_400_000_000,
+            pressure_level: 2,
+        };
+        let denial = lifecycle
+            .system_denial(pressured, 1)
+            .expect("pressure refuses even trivial admissions");
+        assert_eq!(denial.constraint, AdmitConstraint::SystemPressure);
+        assert_eq!(denial.swap_used_bytes, 4_400_000_000);
+
+        // Gate disabled (min_available_bytes = 0): budget-only admission.
+        lifecycle.min_available_bytes = 0;
+        assert!(lifecycle.admit_load_system(u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn request_admission_is_bounded_by_system_availability() {
+        // Budget headroom is generous (1000 budget, 100 used) but the
+        // MACHINE has little to give: 500 available against a 300 floor.
+        let (mut lifecycle, _senders) = lifecycle_with(vec![("m", false, None, 100, 0)]);
+        lifecycle.min_available_bytes = 300;
+        lifecycle.store_system_memory(SystemMemory {
+            available_bytes: 500,
+            swap_used_bytes: 0,
+            pressure_level: 1,
+        });
+        lifecycle.set_pool_commitment("m", 400);
+        // Growth 400 fits the 900 budget headroom but not the 200 the
+        // system can give — the denial names the tighter constraint.
+        assert_eq!(
+            lifecycle.admit_request("m"),
+            Err(MemoryDenial {
+                needed_bytes: 400,
+                headroom_bytes: 200,
+                constraint: AdmitConstraint::SystemAvailability,
+            })
+        );
+        // Nothing was reserved by the refusal.
+        assert_eq!(lifecycle.reserved_bytes(), 0);
+
+        // The machine recovers (other apps closed): same request passes.
+        lifecycle.store_system_memory(SystemMemory {
+            available_bytes: 800,
+            swap_used_bytes: 0,
+            pressure_level: 1,
+        });
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+        assert_eq!(lifecycle.reserved_bytes(), 400);
+    }
+
+    #[test]
+    fn request_admission_refuses_new_growth_under_os_pressure() {
+        let (mut lifecycle, _senders) = lifecycle_with(vec![("m", false, None, 100, 0)]);
+        lifecycle.min_available_bytes = 1;
+        lifecycle.store_system_memory(SystemMemory {
+            available_bytes: 10_000,
+            swap_used_bytes: 2_000_000_000,
+            pressure_level: 2,
+        });
+        lifecycle.set_pool_commitment("m", 400);
+        // New pool growth would compound active pressure: refused.
+        assert_eq!(
+            lifecycle.admit_request("m").map_err(|d| d.constraint),
+            Err(AdmitConstraint::SystemPressure)
+        );
+        // A warm pool (zero growth) keeps serving under pressure — its
+        // bytes are already real; refusing would only break live traffic.
+        lifecycle.record_pool_materialized("m", 400);
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+        // Pressure clears: cold growth admits again.
+        lifecycle.set_pool_commitment("m", 600);
+        lifecycle.store_system_memory(SystemMemory {
+            available_bytes: 10_000,
+            swap_used_bytes: 2_000_000_000,
+            pressure_level: 1,
+        });
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+    }
+
+    #[test]
+    fn missing_snapshot_fails_open_to_budget_only() {
+        // Gate on but no probe reading yet (or probe failed at boot): the
+        // budget arithmetic still governs — never a refusal on absent data.
+        let (mut lifecycle, _senders) = lifecycle_with(vec![("m", false, None, 100, 0)]);
+        lifecycle.min_available_bytes = 1 << 30;
+        assert_eq!(lifecycle.system_memory(), None);
+        lifecycle.set_pool_commitment("m", 400);
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
     }
 
     #[test]

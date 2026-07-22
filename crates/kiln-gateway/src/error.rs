@@ -75,17 +75,31 @@ impl ApiError {
 
     /// Per-request admission rejection (SPEC §2.3/§8.2, Phase 9 part 2):
     /// serving the request would grow the worker past the machine's
-    /// remaining memory headroom. Retriable — headroom recovers when
-    /// another model unloads or its usage shrinks.
-    pub fn insufficient_memory(model: &str, needed_bytes: u64, headroom_bytes: u64) -> Self {
+    /// remaining memory headroom — the configured budget, or what the OS
+    /// can actually grant right now (`denial.constraint`). Retriable —
+    /// headroom recovers when a model unloads, usage shrinks, or system
+    /// pressure clears.
+    pub fn insufficient_memory(model: &str, denial: crate::lifecycle::MemoryDenial) -> Self {
+        use crate::lifecycle::AdmitConstraint;
+        let bound = match denial.constraint {
+            AdmitConstraint::Budget => "of the machine memory budget remain",
+            AdmitConstraint::SystemAvailability => {
+                "of real system memory remain above the configured floor \
+                 (other processes hold the rest)"
+            }
+            AdmitConstraint::SystemPressure => {
+                "can be granted while the OS reports elevated memory pressure"
+            }
+        };
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             error_type: "server_error",
             code: "insufficient_memory",
             message: format!(
                 "admission rejected: serving this request could grow model '{model}' by \
-                 {needed_bytes} bytes (KV pool materialization) but only {headroom_bytes} \
-                 bytes of the machine memory budget remain; retry later or unload a model"
+                 {} bytes (KV pool materialization) but only {} bytes {bound}; \
+                 retry later or free memory",
+                denial.needed_bytes, denial.headroom_bytes
             ),
         }
     }

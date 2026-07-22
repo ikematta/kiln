@@ -182,6 +182,18 @@ def running_stack(models: list[tuple], extra_toml: str = ""):
         [binary, "hash-key", API_KEY], capture_output=True, text=True, check=True
     ).stdout.strip()
 
+    # System-memory gate OFF by default, for the same reason budgets are
+    # explicit bytes: suite behavior must not depend on how much memory
+    # the host happens to have free. CI's 7 GB macos-14 runners measure
+    # ~2-3 GB available and the gate (correctly) refused the suite's
+    # multi-GB KV-pool materializations there — run 29887475596. A test
+    # that passes its own [memory] section owns the whole table (TOML
+    # forbids reopening it) and must set min_available_bytes itself;
+    # test_system_memory.py opts IN with computed floors.
+    memory_default = (
+        "" if "[memory]" in extra_toml else "[memory]\nmin_available_bytes = 0\n"
+    )
+
     # /tmp, not pytest's tmp_path: worker socket paths must stay under the
     # 104-byte macOS UDS limit.
     runtime_dir = pathlib.Path(tempfile.mkdtemp(prefix="kiln-e2e-", dir="/tmp"))
@@ -207,6 +219,7 @@ runtime_dir = "{runtime_dir}"
 cache_dir = "{runtime_dir}/cache"
 jobs_db = "{runtime_dir}/jobs.sqlite"
 {extra_toml}
+{memory_default}
 {blocks}
 [[auth.api_keys]]
 name = "e2e"
