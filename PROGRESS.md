@@ -6928,3 +6928,35 @@
   No option picked.
 - Next: the PM ruling above. The probe/golden/8k/e2e evidence for the
   flip itself stands unchanged in the previous entry.
+
+## [2026-07-22] Phase 7 follow-up / PR #35 — soak datapoints 2-4 recorded — BLOCKED (same ruling)
+- The evidence promised in the previous entry, now landed:
+  - CI re-run of the failed job (run 29930224449 attempt 2): PASS — the
+    full soak green on the identical commit (73a80db).
+  - Local 30-min kernel-ON soak (dev machine): PASS all gates —
+    canaries 31+19 bit-identical, spec acceptance 4004/4004 = 1.00,
+    gemma bursts 6/6, restarts 0, no committed-over-budget samples.
+  - CI run 29936108761 (the PROGRESS-commit push, third kernel-ON CI
+    soak): FAIL on a THIRD distinct gate — llama-int mlx live objects
+    442 vs floor 440 at the final quiesced checkpoint. Series
+    440,440,440,442,440,442: non-monotonic (t+1440 was back at floor),
+    NOT a leak. Matches the P9-characterized +2 SSD-flush transient
+    (flag-OFF precedent, "returned to floor" then; this instance landed
+    ON the final sample). Kernel-path holding of arrays ruled out by
+    code inspection: PagedAttnInputs lives on the per-step SeqStep and
+    the parked pipeline InFlight retains only sampled-token arrays.
+- Aggregate now: kernel-ON soaks 2 green (1 CI, 1 local) / 2 red (CI),
+  the two reds on three DIFFERENT strict-threshold race windows, each
+  with documented flag-OFF precedent, none leak-shaped, none touching
+  correctness/determinism gates. Versus ~1-2 red in ~20 flag-OFF CI
+  soaks since the ledger fix. Consistent with (not proof of) the
+  kernel's 1.46-1.54x decode timing widening exposure to the soak's
+  existing dice windows on the slow macos-14 runner.
+- The DECISION NEEDED from the previous entry stands unchanged, with
+  this sharper framing: the question is less "is the kernel wrong"
+  (every kernel-specific gate green in all four soaks) and more "are
+  the soak's strict gates runner-race-free enough to stay the merge
+  gate for a timing-shifting change" — which is exactly the Option A/B
+  root-cause fork already written there. No option picked.
+- Next: the PM ruling (previous entry). This push adds CI soak
+  datapoint #4 to the record for it.
