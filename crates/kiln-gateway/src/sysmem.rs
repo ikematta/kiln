@@ -112,6 +112,7 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
 
 /// Available bytes from `vm_stat` output: page size from the header line,
 /// then free + speculative + inactive page counts.
+#[cfg(target_os = "macos")]
 fn parse_vm_stat_available(text: &str) -> Option<u64> {
     // "Mach Virtual Memory Statistics: (page size of 16384 bytes)"
     let header = text.lines().next()?;
@@ -138,6 +139,7 @@ fn parse_vm_stat_available(text: &str) -> Option<u64> {
 
 /// "used" bytes from `sysctl -n vm.swapusage`:
 /// `total = 4096.00M  used = 2493.12M  free = 1602.88M  (encrypted)`.
+#[cfg(target_os = "macos")]
 fn parse_swapusage_used(text: &str) -> Option<u64> {
     let value = text.split("used =").nth(1)?.split_whitespace().next()?;
     let (number, unit) = value.split_at(value.len().saturating_sub(1));
@@ -173,6 +175,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn vm_stat_available_is_free_plus_speculative_plus_inactive() {
         let sample = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
@@ -197,6 +200,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn swapusage_used_parses_units() {
         let sample = "total = 4096.00M  used = 2493.12M  free = 1602.88M  (encrypted)";

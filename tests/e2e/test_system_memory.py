@@ -241,7 +241,15 @@ def test_estimate_reports_the_system_gate():
         [gateway, "hash-key", ADMIN_TOKEN], capture_output=True, text=True, check=True
     ).stdout.strip()
     dest_root = pathlib.Path(tempfile.mkdtemp(prefix="kiln-e2e-sysmem-", dir="/tmp"))
-    extra = f'model_dir = "{dest_root}"\n[auth]\nadmin_token_hash = "{token_hash}"\n'
+    # Opt IN to the gate at the shipped 1 GiB default (the harness pins it
+    # off everywhere else for determinism). Model-less stack: nothing
+    # loads, so the assertions below are consistency checks that hold on
+    # any machine, whatever fits_system answers.
+    extra = (
+        f'model_dir = "{dest_root}"\n'
+        f"[memory]\nmin_available_bytes = {GIB}\n"
+        f'[auth]\nadmin_token_hash = "{token_hash}"\n'
+    )
     with running_stack([], extra_toml=extra) as stack:
         stack.wait_ready()
         response = httpx.get(
@@ -254,7 +262,7 @@ def test_estimate_reports_the_system_gate():
         body = response.json()
         assert body["source"] == "local"
         assert body["fits"] == (body["fits_budget"] and body["fits_system"])
-        # Default 1 GiB floor, live probe numbers.
+        # The configured (shipped-default-valued) floor, live probe numbers.
         assert body["min_available_bytes"] == GIB
         assert body["system_available_bytes"] > 0
         assert body["pressure_level"] in (0, 1, 2, 4)

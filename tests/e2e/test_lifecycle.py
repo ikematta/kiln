@@ -118,7 +118,7 @@ def test_lru_eviction_order_and_on_demand_reload():
         ("bravo", "rust", path),
         ("charlie", "rust", path),
     ]
-    memory = f"[memory]\nbudget_bytes = {LRU_BUDGET}\n"
+    memory = f"[memory]\nbudget_bytes = {LRU_BUDGET}\nmin_available_bytes = 0\n"
     with running_stack(models, extra_toml=memory) as stack:
         stack.wait_ready()
 
@@ -213,7 +213,7 @@ def test_pinned_model_survives_eviction_pressure():
         ("alpha", "rust", path),
         ("charlie", "rust", path),
     ]
-    memory = f"[memory]\nbudget_bytes = {PINNED_BUDGET}\n"
+    memory = f"[memory]\nbudget_bytes = {PINNED_BUDGET}\nmin_available_bytes = 0\n"
     with running_stack(models, extra_toml=memory) as stack:
         stack.wait_ready()
 

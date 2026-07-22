@@ -6728,3 +6728,42 @@
 - Next: nothing scheduled — SPEC §12 remains complete; this was a
   field-bug fix inside Phase 9's admission machinery. Phase 11 still
   requires separate human approval.
+
+## [2026-07-21] System-memory admission — CI follow-up (PR #34 run 29887475596) — DONE
+- What: first CI pass over the system gate failed two jobs; both fixes
+  are harness/portability, not gate behavior.
+  - lint (ubuntu, --no-default-features): the two macOS probe parsers are
+    dead code on the Linux compile-check target — now `#[cfg(target_os =
+    "macos")]` (with their unit tests). Local clippy missed it because it
+    runs on macOS, where they are used.
+  - test-macos: the REQUEST-path gate fired for real on the 7 GB
+    macos-14 runner — it measured ~2.2-2.9 GB available and refused
+    KV-pool materializations of 1.88 GB (qwen3 'qwen-added', admin-UI
+    flow) and 3.76 GB (spec pair 'spec-wired'), 503
+    insufficient_memory{system_available}. The gate was doing exactly
+    its job — those pools genuinely cannot materialize there without
+    swap (the suite previously passed by silently swapping/compressing
+    on the runner) — but suite behavior must not depend on host memory
+    weather, for the same reason every scenario pins budget_bytes to
+    explicit bytes. The e2e harness (conftest running_stack) now pins
+    `min_available_bytes = 0` into every generated kiln.toml whose
+    extra_toml does not carry its own [memory] table; the seven
+    budget-owning scenarios set the key in their own tables; the
+    test_system_memory tests opt IN (computed floor for the hog test,
+    the shipped 1 GiB value for the estimate test).
+- Decisions: gate-off-in-harness over shrinking pools/models: pool sizes
+  are the scenarios' load-bearing measured constants, and the dedicated
+  system tests + real-hardware verification own gate coverage. Shipped
+  defaults unchanged.
+- Deviations: none.
+- Acceptance:
+  ```
+  cargo fmt --check + clippy --all-targets -D warnings (macOS)   clean
+  cargo test -p kiln-gateway --lib sysmem     4 passed (macOS side)
+  ruff check + format --check tests/e2e                          clean
+  uv run --project tests/e2e pytest tests/e2e
+      99 passed, 3 skipped in 381s (dev machine; gate-off harness changes
+      nothing locally — same totals as the pre-fix run)
+  CI: re-triggered by this push; PR #34 merge gated on green
+  ```
+- Next: merge PR #34 once CI is green (user-approved).
