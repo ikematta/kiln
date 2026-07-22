@@ -6851,3 +6851,80 @@
 - Next: nothing scheduled — SPEC §12 remains complete; this closes the
   last parked Phase 7 item (the default flip). Phase 11 still requires
   separate human approval.
+
+## [2026-07-22] Phase 7 follow-up / PR #35 CI — strict soak gate fired on the flip PR — BLOCKED
+- What: PR #35 (the paged_attention_kernel default flip, commit 73a80db)
+  run 29930224449: lint, compile-linux, test-macos-release green, and
+  test-macos green through every step INCLUDING the e2e suite — the bit
+  probe passed in both lanes (streak now 55 runs) — then failed at the
+  final step, the 30-minute soak. This was the FIRST kernel-ON soak ever
+  executed anywhere: every dev-machine soak through 2026-07-21 and all
+  prior CI soaks ran the flag-OFF default.
+- Soak scorecard, kernel-specific gates ALL clean: mlx live objects at
+  exact baseline at every quiesced checkpoint (llama 440, spec 1404,
+  gemma 740 final), RSS slopes negative in the gated window,
+  determinism canaries 28 llama + 19 spec bit-identical, spec
+  acceptance 3824/3824 = 1.00, zero crash-restarts, pinned model never
+  touched. The violations are ledger/orchestration shapes:
+  1. committed (weights+pools) = 3,906,848,078 > budget 3,900,000,000
+     (+6.8 MB, 0.18%) at t+1472s and t+1482s, self-healed in <60s.
+  2. one of five gemma bursts never recovered to a 200 within 180s
+     (t+717.6s).
+- Precedent (verified in the actual CI job logs, not recalled):
+  - Violation 1 is BYTE-IDENTICAL to Finding 3 of the P9 soak closeout
+    (run 29436961038, flag OFF, PRE-reservation-ledger): same committed
+    sum, same +6.8 MB, near-same soak time (t+1491s vs t+1472s). The
+    Option A ruling (commit 5c7d73d) then declared the TOCTOU
+    "structurally impossible (reservations serialize admission
+    decisions)". Since that fix, 18 of 19 CI soaks (all flag OFF) ran
+    green; the one failure was violation 2's gate, below. Reappearance
+    on the first kernel-ON soak = either a residual reachability the
+    ledger does not close, or a gate measurement-semantics gap.
+  - Violation 2 has post-closeout flag-OFF precedent: run 29540167586
+    (2026-07-17) failed the identical gemma-burst gate and the same-day
+    re-push (29540215158) passed — a known runner-variance mode.
+- Characterization from this run's log: the overshoot window sits
+  exactly inside a ttl-qwen25 reload racing burst-gemma's idle-TTL
+  unload (t+1443s status: gemma up/ttl down, committed 3.23 GB;
+  t+1502s: gemma down/ttl up, 2.74 GB; overshoot samples in between).
+  The run also reports reservation peak 436 MB in flight and uncovered
+  growth 0.0 — every materialized byte WAS reservation-covered. Two
+  candidate mechanisms, BOTH flag-independent in reachability (the
+  kernel's 1.46-1.54x decode only shifts unload/reload interleavings):
+  - (a) drain-overlap measurement semantics: an unload releases ledger
+    budget at decision time; a correctly-priced racing admission
+    proceeds; the soak's committed metric sums MEASURED footprints
+    including the still-draining worker — transient committed > budget
+    with zero pricing error anywhere;
+  - (b) a residual pricing gap, e.g. materialization slightly beyond
+    its own reservation — the uncovered-bytes alarm counts only
+    wholly-unreserved materialization, so it would read 0.0 either way.
+- Kernel disposition: nothing here implicates kernel correctness
+  (probe, golden, canaries, leak gates all green with the flag on);
+  the flip is the timing change that surfaced a Phase 9 ledger/gate
+  question. NOT fixed here: lifecycle.rs admission is closed Phase 9
+  machinery and the strict committed gate is the regression proof the
+  Option A ruling demanded — patching either unilaterally is barred
+  (never weaken a test; decisions ledger is read-only).
+- Evidence in flight, to be recorded when they land: CI re-run of the
+  failed job (run 29930224449 attempt 2) and a local 30-minute
+  kernel-ON soak on the dev machine (where the 2026-07-21 flag-OFF
+  soak passed at committed peak 3.67 of 3.90 GB).
+- Deviations: none.
+- DECISION NEEDED: disposition of PR #35 given the fired strict gate —
+  - Option A: hold PR #35; a dedicated session root-causes the
+    overshoot (drain-overlap vs pricing gap) in the Phase 9 machinery
+    and lands the fix — or the ruled measurement correction — then the
+    flip merges on a green kernel-ON soak. Keeps the invariant strict
+    and true; delays the flip.
+  - Option B: if root-cause confirms mechanism (a), rule a drain-aware
+    correction of the soak's committed sampling (a gate-semantics
+    correction in the same class as the P9 py-smollm slope
+    correction, not a weakening), then merge on green. Requires
+    Option A's root-cause work regardless.
+  - Option C: re-run to green and merge on the dice. Listed for
+    completeness only — this is the pattern the P9 Option A ruling
+    already rejected.
+  No option picked.
+- Next: the PM ruling above. The probe/golden/8k/e2e evidence for the
+  flip itself stands unchanged in the previous entry.
