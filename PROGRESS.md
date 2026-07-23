@@ -7491,3 +7491,69 @@
   ```
 - Next: nothing scheduled — SPEC §12 remains complete; the merge-
   triggered CI run on main is the routine post-merge validation.
+
+## [2026-07-23] Phase 10 follow-up / admin UI — /ui (no trailing slash) blank-page fix: redirect before the shell — DONE
+- What:
+  - Investigation first (the task): the fix was NEVER implemented or
+    merged — ui.rs has exactly one commit (b24f711, part 2's original
+    implementation), app.rs served the shell in place at both `/ui` and
+    `/ui/`, and no PROGRESS entry, commit, or PR ever mentions the
+    trailing-slash issue; it was not even on the ledger as diagnosed.
+    Why no test caught it: the browser e2e navigates straight to `/ui/`
+    (connect() in test_admin_ui.py) and the embedded-shell check also
+    fetched only `/ui/`. The bug is structural: the SvelteKit shell's
+    asset links are relative (`./_app/immutable/...`), so a document
+    served at bare `/ui` resolves them to `/_app/...` — no route matches,
+    every asset 404s, the page renders blank (the shell's inline `base`
+    computation also derives the wrong base there).
+  - Fix (crates/kiln-gateway/src/ui.rs + app.rs): `GET /ui` now answers
+    308 Permanent Redirect to `/ui/` (query string preserved) BEFORE the
+    shell is ever served; `/ui/` and `/ui/{*path}` unchanged.
+  - Regression tests, full chain not just the status code: two ui.rs
+    unit tests (308 + Location `/ui/`; query preservation) and e2e
+    `test_ui_no_trailing_slash_full_chain` — asserts the 308, follows it
+    like a browser, lands on `/ui/`, extracts EVERY asset link from the
+    served shell (href/src + dynamic import specifiers), resolves each
+    against the final document URL, and requires a genuine 200 for each;
+    then a negative control resolving the same links against
+    un-redirected bare `/ui` and requiring the resulting `/_app/...`
+    paths to 404 — proof the redirect is load-bearing.
+  - Test bites: with the fix temporarily neutralized (route reverted to
+    the old direct-serve, run, restored), the new e2e test FAILS
+    ("assert 200 == 308" — the pre-fix serve-in-place behavior).
+- Decisions:
+  - 308 (Redirect::permanent) over 301/307: permanent is right for a
+    structural URL (browsers may cache it, desirable here) and 308 is
+    the method-preserving modern form; axum's constructor emits it.
+  - Query string carried through the redirect: nothing uses it today,
+    but dropping it would make the redirect lossy for future deep links.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ curl -s -o /dev/null -w "%{http_code} -> %{redirect_url}" /ui
+      308 -> http://127.0.0.1:18414/ui/
+  $ curl -sL -o /dev/null -w "%{http_code} (%{url_effective})" /ui
+      200 (http://127.0.0.1:18414/ui/)
+  $ curl -sL -o /dev/null -w "%{http_code} (%{url_effective})" /ui/
+      200 (http://127.0.0.1:18414/ui/)
+  every asset link in the served shell, resolved against the final URL,
+  fetched: 12/12 -> 200 (/ui/_app/immutable/...); negative control (same
+  links resolved against un-redirected bare /ui, the pre-fix breakage):
+  12/12 -> 404 (/_app/immutable/...)
+  $ cargo test -p kiln-gateway --lib -> 97 passed (95 + the 2 new)
+  $ uv run --project tests/e2e pytest tests/e2e/test_admin_ui.py
+      -> 5 passed in 56.26s (both browser flows + disabled-admin +
+         embedded-shell + the new full-chain regression test)
+      fix neutralized (temp, reverted) -> FAILED
+         test_ui_no_trailing_slash_full_chain: assert 200 == 308
+  CI shapes (the lint/compile gates CI runs, executed locally):
+    cargo fmt --check                                          -> clean
+    cargo clippy --workspace --all-targets -- -D warnings      -> clean
+    cargo clippy --workspace --all-targets --no-default-features
+      -- -D warnings                                           -> clean
+    cargo build --workspace --no-default-features              -> clean
+    ruff check + format --check python/ tests/e2e scripts      -> clean
+  ```
+- Next: committed on branch claude/ui-trailing-slash-redirect (session
+  rule: no direct commits to main); PM to push/PR for the runner's CI
+  pass and merge. No other work scheduled — SPEC §12 remains complete.
