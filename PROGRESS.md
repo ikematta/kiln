@@ -7476,3 +7476,18 @@
   ```
 - Next: PM ruling on merging PR #35 (both formerly blocking branches
   closed; no further CI runs needed from this session).
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — MERGED (PM ruling) — DONE
+- What: PM ruled to merge on the evidence of the two closed branches
+  (flush-idle live-object correction + the admission load-pricing fix,
+  green CI kernel-ON soak 30032174804). Merge commit a51b181 (merge
+  commit, not squash — PROGRESS commit references stay valid on main).
+  `paged_attention_kernel` now defaults ON on main; opt-outs remain
+  `KILN_DEFAULTS__PAGED_ATTENTION_KERNEL=false` and the kiln.toml key.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr merge 35 --merge -> merged; origin/main head a51b181
+  ```
+- Next: nothing scheduled — SPEC §12 remains complete; the merge-
+  triggered CI run on main is the routine post-merge validation.
