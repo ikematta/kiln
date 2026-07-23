@@ -203,7 +203,10 @@ fn worker_argv(config: &KilnConfig, entry: &ModelEntry) -> Vec<String> {
 /// buffers); without the margin, a request admission racing this load
 /// window could consume that sliver and transiently overshoot. The first
 /// post-READY heartbeat replaces the whole projection with the measured
-/// footprint before the load permit is released.
+/// footprint before the load permit is released. `run_once` additionally
+/// prices in the pool commitment remembered from the model's last READY
+/// (see `Lifecycle::known_pool_commitment_bytes`) — this function is the
+/// weights-only base.
 pub(crate) fn load_projection(entry: &ModelEntry) -> u64 {
     let weights_bytes = lifecycle::weights_bytes_on_disk(&entry.model_path)
         + entry
@@ -513,18 +516,28 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
         permit = lifecycle.load_permit().lock() => permit,
         _ = wait_shutdown(&mut ctx.shutdown) => return RunExit::Shutdown,
     };
+    // Price the load at weights PLUS the pool commitment remembered from
+    // this model's last READY (0 on a first-ever load). A demand-driven
+    // reload is immediately followed by the triggering request's pool
+    // growth, and weights-only pricing can admit the worker into headroom
+    // that growth does not fit — stranding it READY-with-cold-pool behind
+    // the per-request denial path, which has no eviction lever (the
+    // 2026-07-23 soak burst-starvation root cause).
+    let pool_hint = ctx.lifecycle.known_pool_commitment_bytes(&entry.id);
+    let projected_bytes = ctx.projected_bytes.saturating_add(pool_hint);
     loop {
         // Charged, not just used: request-admission reservations awaiting
         // heartbeat confirmation are real obligations this load must not
         // double-spend (Phase 9 part 3 reservation ledger).
         let used = ctx.lifecycle.charged_bytes();
         let budget = ctx.lifecycle.budget_bytes();
-        if used.saturating_add(ctx.projected_bytes) <= budget {
+        if used.saturating_add(projected_bytes) <= budget {
             break;
         }
         let Some(victim) = ctx.lifecycle.pick_victim(&entry.id) else {
             tracing::error!(model = %entry.id,
-                projected_bytes = ctx.projected_bytes, used_bytes = used, budget_bytes = budget,
+                projected_bytes, pool_hint_bytes = pool_hint,
+                used_bytes = used, budget_bytes = budget,
                 "load rejected: machine budget exceeded and no evictable model \
                  (candidates must be loaded, unpinned, and outside their TTL lease)");
             ctx.metrics
@@ -534,7 +547,8 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
             return RunExit::BudgetRejected;
         };
         tracing::warn!(model = %entry.id, victim = %victim,
-            projected_bytes = ctx.projected_bytes, used_bytes = used, budget_bytes = budget,
+            projected_bytes, pool_hint_bytes = pool_hint,
+            used_bytes = used, budget_bytes = budget,
             "machine budget exceeded; evicting LRU model");
         if !ctx.lifecycle.evict(&victim).await {
             tracing::error!(model = %entry.id, victim = %victim,
@@ -556,7 +570,7 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
     // laggy kernel pressure signal would spiral through every victim.
     {
         let lifecycle = Arc::clone(&ctx.lifecycle);
-        let projected = ctx.projected_bytes;
+        let projected = projected_bytes;
         // A panicked probe task must not take down supervision: fail open
         // (tokio logs the panic) exactly like a failed probe.
         let verdict = tokio::task::spawn_blocking(move || lifecycle.admit_load_system(projected))
@@ -584,7 +598,7 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
     }
     // Reserve the projection; the first measured heartbeat replaces it
     // below, before the load permit is released.
-    ctx.lifecycle.record_usage(&entry.id, ctx.projected_bytes);
+    ctx.lifecycle.record_usage(&entry.id, projected_bytes);
 
     // -- spawn --------------------------------------------------------------
     let mut child = match spawn_worker(ctx) {
@@ -654,6 +668,14 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
     // -- READY ---------------------------------------------------------------
     let ready_at = Instant::now();
     refresh_info(ctx, &mut client).await;
+    // The load priced the pool (reload path): convert that room into an
+    // admission reservation BEFORE the measured-footprint swap below can
+    // release it to racing request admissions. Seeded before the swap,
+    // the interim double-count (projection + reservation) only refuses
+    // racers for a moment — the conservative direction.
+    if pool_hint > 0 {
+        ctx.lifecycle.reserve_pool_room(&entry.id);
+    }
     // Swap the reservation for a measured footprint before releasing the
     // load permit, so the next load in line budgets against real bytes.
     if let Ok(Ok(resp)) = timeout(HEALTH_RPC_TIMEOUT, client.health(HealthRequest {})).await {

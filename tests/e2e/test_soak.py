@@ -1640,10 +1640,27 @@ def test_full_stack_soak():
                 )
             if evictions < 2:
                 failures.append(f"only {evictions:.0f} evictions (need >= 2)")
-            if total_rejects < 1:
+            # Pressure-exercised proof, corrected for the 2026-07-23
+            # load-pricing fix (PROGRESS root cause): a demand reload now
+            # prices weights + the pool commitment remembered from its
+            # last READY and EVICTS at load, so the scenario's deliberate
+            # over-subscription resolves through load-time governance and
+            # request-level insufficient_memory 503s become the
+            # defense-in-depth path (gen-0 cold pools, drift races) —
+            # expected ~0 where pre-fix runs logged 38-70, so requiring
+            # them made the check a permanent flake. The exercised proof
+            # is now: every burst walked the on-demand reload path
+            # (model_loading retries) or at least one admission 503
+            # fired. Rejects stay counted, reported, and structurally
+            # validated when they occur; test_admission.py holds the
+            # isolated request-gate scenarios and
+            # test_lifecycle.py::test_reload_prices_pool_and_evicts_instead_of_stranding
+            # pins the reload-pricing semantics themselves.
+            if total_rejects < 1 and not burst.extra.get("loading_retry", 0):
                 failures.append(
-                    "no admission rejections at all — the pressure scenario "
-                    "did not exercise the gate"
+                    "gemma bursts neither walked the reload path nor hit any "
+                    "admission rejection — the pressure scenario did not "
+                    "exercise memory governance"
                 )
             if preempted < 1:
                 failures.append("no preemptions despite 12-stream floods")

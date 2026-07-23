@@ -7296,3 +7296,136 @@
   the burst gate's 180 s recovery bar is a deployment-shape question
   separable from the flip. No option picked; no further CI runs burned
   from this session.
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — admission-pressure branch root-caused and FIXED: weights-only reload pricing stranded cold pools behind a leverless denial path — DONE (CI evidence run in flight)
+- Root cause (the dedicated session the previous entry's ruling asked
+  for; direct observation across ALL FOUR burst-gate failures ever
+  recorded — kernel-ON runs 30018908142 t+938.8s, 29930224449 attempt 1
+  t+717.6s, 29967425675 t+951.6s, and flag-OFF run 29540167586
+  t+1680.1s — the same signature in every fetched log):
+  - In every failed window burst-gemma was RESIDENT the whole time at
+    weights-only committed (fleet 2.94 + gemma 0.53 = 3.47 GB, pool
+    COLD — below even its 736 MB baseline act), while `used` sat
+    ≥ ~3.78 GB and its 436 MB pool-growth admissions were denied
+    throughout (rejects 7→24→27 across the 30018908142 window; 16→40
+    dp#1; 30→54 flag-OFF).
+  - The ENFORCED ledger held everywhere: committed peak 3.67 ≤ 3.90 GB,
+    reservation uncovered growth 0.0 (run 30018908142). NOT a
+    reservation-ledger pricing hole and NOT a stale sample.
+  - The real-bytes-over-budget the ruling flagged (`used` 4.08, worst
+    4.45 GB) is mlx_cache/compute-buffer drift — the RECORDED open
+    Phase 9 gap ("no continuous-pressure eviction yet"), reported-not-
+    gated, and NOT kernel-specific: flag-OFF failing run worst +582 MB
+    vs kernel-ON +551/+525 MB; used≥3.7 GB duty across 60 s status
+    lines: 8/30 in a green flag-OFF run vs 10-13/31 in the failing runs.
+  - Mechanism: a demand reload was priced at WEIGHTS ONLY
+    (load_projection = weights-on-disk + 64 MiB margin). Gemma's burst
+    reload fit the drifted budget WITHOUT evicting, landed
+    READY-with-cold-pool, and its inevitable 436 MB growth was then
+    priced per-request against headroom ≈ 0 — a denial path with NO
+    eviction lever (evictions run only inside run_once's load loop) —
+    while evictable memory (spec 0.96 GB, py 0.27 GB) sat resident the
+    whole window. Recovery needed an UNRELATED load (ttl-qwen25's next
+    reload) to evict on gemma's behalf plus cache trims; that
+    coincidence chain exceeded 180 s once per failing run. The soak's
+    own design text prices a burst at "gemma load+pool (~1.2 GB)" —
+    the code priced 0.79 GB.
+  - Hypotheses REFUTED by the same logs: (i) SSD-flush-backlog /
+    drain-overlap interaction with reservation TTL logic — the cycling
+    models have ssd_writes ≈ 0 (flush traffic is llama-only and llama
+    is pinned, never unloads), and unload() releases ledger bytes only
+    after process death; (ii) kernel-banked backlog as the driver —
+    the identical signature reproduces flag-OFF. Kernel-ON's role is
+    timing/throughput exposure only (3-of-7 vs 1-of-~20), consistent
+    with every prior finding in this arc.
+- Fix (admission logic per the ruling; the 180 s recovery bar, the
+  committed gate, and every leak gate untouched):
+  - lifecycle.rs: `known_pool_commitment_bytes` — each model's
+    whole-worker pool commitment, recorded at every READY, RETAINED
+    across unloads (clear_usage clears only live state);
+    `reserve_pool_room()` — converts the priced pool room into an
+    admission reservation under the admission lock (max-not-add;
+    reconciled down by heartbeats exactly like request reservations).
+  - supervisor.rs run_once: a (re)load is priced at weights + known
+    commitment (0 on a first-ever load — boot stays cheap, per the
+    lazy-pool design), so a demand reload forces the eviction its pool
+    needs; at READY the pool room is seeded as a reservation BEFORE the
+    measured-footprint swap, so racing admissions cannot spend it. The
+    triggering request rides the reservation: growth 0, no 503.
+- Proof the fix addresses the real mechanism (the injected-proof
+  standard):
+  - New permanent e2e test tests/e2e/test_lifecycle.py::
+    test_reload_prices_pool_and_evicts_instead_of_stranding — the trap
+    deterministically (victim warm 486 MB + ttl model under a 900 MB
+    budget where reload weights fit ~414 MB headroom but weights+pool
+    543 MB does not). With the fix: victim evicted at the reload, the
+    request serves off the seeded reservation, zero admission rejects —
+    PASSED (72.47 s). With the fix temporarily neutralized
+    (pool_hint = 0, uncommitted): FAILED exactly at the trap —
+    "reload was admitted without evicting — the starvation trap:
+    {'victim': 'ready', 'trap': 'ready'}" (28.06 s). Patch reverted.
+  - New lifecycle unit test
+    reload_reserves_pool_room_from_the_remembered_commitment
+    (commitment survives unload; seed is max-not-add; heartbeats
+    reconcile; uncovered stays 0).
+- Soak harness correction forced by the fix (test_soak.py, one check):
+  the `total_rejects >= 1` scenario-coverage self-check asserted the
+  PRE-fix pressure valve (request-level 503s, 38-70 per run). Under
+  honest load pricing the same pressure resolves through load-time
+  eviction and fleet-wide rejects are legitimately ~0, so the check
+  became a permanent flake (local soak #1: 30:29, ALL real gates held,
+  the coverage check the sole violation). Corrected to the post-fix
+  signature: fail only when bursts neither walked the on-demand reload
+  path nor produced any admission 503. NOT a bar change: committed,
+  180 s recovery, floors, canaries, eviction/idle-TTL minimums all
+  unchanged; request-gate coverage lives in test_admission.py (4
+  scenarios incl. drift-gating and the TOCTOU) and the new trap test.
+- Also observed in run 30018908142, recorded for completeness: the
+  ADVISORY golden lane (continue-on-error, ADR 0004) failed on the
+  gemma-3-1b/chat-basic gather-path divergence — the EXACT
+  ADR-0004-precedented cross-device pair (188797 vs 195597 at token
+  50, first seen run 28753659372). Unchanged failure pattern, not
+  job-gating, no action per the ADR ("red alone is not signal").
+- Decisions: seeding is gated on the load having priced the pool
+  (hint > 0), so gen-0 boot keeps the deliberate cheap-idle semantics
+  (all five soak models still fit idle at startup); seeding BEFORE the
+  measured swap double-counts the pool for microseconds in the
+  conservative direction (refuses racers, never double-spends).
+- Deviations: none (SPEC §2.2/§2.3 prescribe no projection formula;
+  "rejects load() that would exceed budget" is made honest for
+  reloads). Residual, stated: a FIRST-EVER load (commitment unknowable
+  before any READY) can still theoretically strand; unreachable in the
+  soak fleet (every model's boot READY records its commitment before
+  any burst) and unobserved in any run to date. The cache-drift
+  open gap (used > budget, reported-not-gated) is untouched and stands
+  as recorded.
+- Acceptance:
+  ```
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings   -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings  -> clean
+  $ cargo build --workspace --no-default-features && cargo build --workspace     -> clean
+  $ ruff check / format --check python/ tests/e2e scripts                        -> clean
+  $ cargo test -p kiln-gateway --lib -> 95 passed (incl. the new reservation test)
+  $ pytest tests/e2e/test_lifecycle.py::test_reload_prices_pool_and_evicts_instead_of_stranding
+      with fix    -> 1 passed in 72.47s
+      fix neutralized (temp, reverted) -> FAILED: "reload was admitted without
+      evicting — the starvation trap: {'victim': 'ready', 'trap': 'ready'}"
+  $ pytest tests/e2e/test_lifecycle.py tests/e2e/test_admission.py -> 8 passed in 123s
+  $ ./scripts/soak.sh --minutes 30  (local #2, corrected coverage check)
+      PASS: all gates held — 1 passed in 1831s
+      gemma bursts 6/6 recovered, ok=15 rejected=0 loading_retry=6
+      fleet admission_rejects=0 (pre-fix runs: 38-70); evictions spec 16
+      + py 28 + gemma 1; idle_ttl 20; committed peak 3.67/3.90 GB;
+      reservation peak 436 MB (gemma's seeded pool), uncovered 0.0;
+      raw used over budget 12/177 worst +525 MB (recorded gap,
+      unchanged); live floors 440/1404/704 + gemma 740/792(warm) with
+      fp0 at every checkpoint; canaries 31+18 bit-identical; spec
+      acceptance 3571/3571 = 1.00; rej=0 on all 30 status lines
+  ```
+- Next: the CI kernel-ON soak evidence run (this push). Falsifiable
+  hypothesis: every gemma burst recovers ≤ 180 s via the reload/evict
+  path, fleet admission_rejects ≈ 0 (vs 38-70 pre-fix), and the
+  live-object/committed/canary gates stay green under corrected
+  semantics. Falsified if any burst starves or a ledger gate fires.
+  Result to be recorded in the next entry; PR #35 stays unmerged until
+  that run is green and the PM accepts both closed branches.

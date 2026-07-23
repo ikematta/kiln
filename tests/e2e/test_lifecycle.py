@@ -43,6 +43,7 @@ QWEN25 = "qwen2.5-0.5b-4bit"
 
 LRU_BUDGET = 2_080_000_000
 PINNED_BUDGET = 730_000_000
+TRAP_BUDGET = 900_000_000
 
 METRIC_LINE = re.compile(r"^(\w+)(?:\{([^}]*)\})?\s+([0-9eE+.-]+)$")
 
@@ -258,6 +259,90 @@ def test_pinned_model_survives_eviction_pressure():
         assert metric_value(text, "kiln_admission_rejects_total", model="pin") == 1, (
             text
         )
+
+
+def test_reload_prices_pool_and_evicts_instead_of_stranding():
+    """The 2026-07-23 soak burst-starvation trap, reproduced deterministically
+    (PROGRESS root cause, runs 30018908142 / 29930224449 / 29967425675 /
+    29540167586): a demand-driven reload whose WEIGHTS fit the drifted
+    budget but whose pool does not. Weights-only load pricing admitted the
+    worker without evicting, stranding it READY-with-cold-pool behind
+    per-request `insufficient_memory` 503s — a denial path with no
+    eviction lever — while an evictable idle model held the room the
+    whole time. Commitment-carried pricing must instead evict at the
+    reload and serve the triggering request off the READY-seeded
+    reservation, with zero admission rejects.
+
+    Sizing (qwen2.5: ~300 MB idle, ~486 MB warm, weights-on-disk 278 MB
+    + 64 MB margin = 342 MB load base, pool commitment 201 MB), budget
+    900 MB: boot fits both idle (~642 MB peak); victim warm (~486 MB)
+    leaves the reload's weights (342 <= ~414 headroom) but not
+    weights + pool (543) — the trap window. Post-eviction the full
+    reload fits alone (543 <= 900)."""
+    path = require(QWEN25)
+    models = [
+        ("victim", "rust", path),
+        ("trap", "rust", path, "ttl_seconds = 10"),
+    ]
+    memory = f"[memory]\nbudget_bytes = {TRAP_BUDGET}\nmin_available_bytes = 0\n"
+    with running_stack(models, extra_toml=memory) as stack:
+        stack.wait_ready()
+        _, statuses = readyz(stack)
+        assert statuses == {"victim": "ready", "trap": "ready"}, statuses
+
+        # trap's first READY records its pool commitment (GetInfo geometry;
+        # the pool itself never materializes — it stays cold, exactly like
+        # the soak's gemma between bursts). Warm the victim so its drift
+        # occupies the pool-sized share of the headroom.
+        assert_completes(stack, "victim")
+        time.sleep(3)  # warmed footprint reaches the ledger
+
+        # trap idles past its TTL and unloads.
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            _, statuses = readyz(stack)
+            if statuses["trap"] == "unloaded (idle ttl)":
+                break
+            time.sleep(1)
+        assert statuses["trap"] == "unloaded (idle ttl)", statuses
+
+        # The demand reload. Weights-only pricing loads WITHOUT evicting
+        # (642 + 342 fits 900) and the follow-up request starves on
+        # insufficient_memory; commitment-carried pricing must evict the
+        # victim at the load and serve off the seeded reservation.
+        response = complete(stack, "trap")
+        assert response.status_code == 503, response.text
+        assert response.json()["error"]["code"] == "model_loading", response.text
+        wait_for_status(stack, "trap", "ready", timeout_s=120)
+
+        _, statuses = readyz(stack)
+        assert statuses["victim"] == "unloaded (evicted)", (
+            f"reload was admitted without evicting — the starvation trap: {statuses}"
+        )
+
+        # The triggering request's retry serves promptly: its pool room is
+        # reserved, so it must never bounce off insufficient_memory.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            response = complete(stack, "trap")
+            if response.status_code == 200:
+                break
+            assert response.json()["error"]["code"] != "insufficient_memory", (
+                f"reloaded model starved on its own pool growth: {response.text}"
+            )
+            time.sleep(2)
+        assert response.status_code == 200, response.text
+
+        text = stack.metrics_text()
+        assert metric_value(text, "kiln_admission_rejects_total", model="trap") is None
+        assert (
+            metric_value(
+                text, "kiln_worker_unloads_total", model="victim", reason="evicted"
+            )
+            == 1
+        )
+        used = metric_value(text, "kiln_memory_used_bytes")
+        assert used <= TRAP_BUDGET, f"ledger over budget: {used}"
 
 
 def test_ttl_idle_model_auto_unloads_and_reloads_on_demand():
