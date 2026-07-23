@@ -68,6 +68,19 @@ Leak gates (SPEC §11.3), tracked throughout, not endpoint-compared:
     Pool materialization is a one-time +2×layers step (measured: llama
     +32, gemma +52, qwen25 +48, qwen3 +2×56) absorbed by the warmup and
     the (generation, pool) grouping. Negative anywhere is a double-free.
+    Sampling semantics (PROGRESS 2026-07-23 root-cause + ruling): the
+    gated sample is taken FLUSH-IDLE — the checkpoint polls until every
+    rust worker's kiln_worker_flush_pending_blocks reads 0 in the same
+    scrape (bounded by FLUSH_IDLE_DEADLINE_S; on expiry it samples
+    anyway, so a stuck queue is not a bypass). The quiesce itself
+    triggers a cancel burst whose donations feed the SSD write-behind
+    queue, and each in-flight block capture (read_block_bytes) holds
+    exactly +2 handles for the duration of a sync'd 1 MiB read — on slow
+    CI runners that tail outlives a fixed post-settle sleep, so an
+    un-gated sample reads floor+2 with ~0.9 probability while flushes
+    are in flight (measured; kiln-engine/tests/paged_attn_leak.rs R6).
+    A real parked leak elevates EVERY sample, flush-idle ones included,
+    so this is a measurement correction, not a bar change.
   - mlx_active equal (±2 MB transient band) and mlx_cache bounded at
     quiesced checkpoints within a generation.
 
@@ -175,6 +188,16 @@ CACHE_CAP_BYTES = 768 * 1024 * 1024
 # checkpoint). 8 allows four in-flight block copies; a real leak fails
 # the return-to-baseline check regardless of this allowance.
 LIVE_TRANSIENT_ALLOWANCE = 8
+# Flush-idle sampling (see the live-objects gate note in the module
+# docstring): how long a quiesced checkpoint will wait for every rust
+# worker's SSD write-behind queue to drain before sampling anyway.
+# Sized from the instrumented CI evidence run (29980519514): gated
+# samples observed with 133-397 blocks pending and a drain pace of a
+# few blocks/s on the runner (debug-build Sha256 + 1 MiB copy per block
+# dominates each flush cycle), so a large post-burst backlog can take
+# minutes. 240 s bounds the wait; on expiry the sample is taken anyway
+# and the stuck depths printed — a deadline, not a bypass.
+FLUSH_IDLE_DEADLINE_S = 240.0
 INTERACTIVE_P100_S = 90.0
 REQ_TIMEOUT = httpx.Timeout(30.0, read=420.0, write=30.0, pool=60.0)
 
@@ -857,6 +880,36 @@ def model_snapshot(metrics, model: str) -> dict[str, float]:
     }
 
 
+def sample_flush_idle(stack, gateway_pid: int, label: str):
+    """Takes the checkpoint sample only once every rust worker's SSD
+    write-behind queue reads empty (`kiln_worker_flush_pending_blocks`
+    == 0) in the SAME scrape that supplies the gated live-object value —
+    the flush-idle sampling semantics from the module docstring. `live`
+    and `flush_pending` ride one heartbeat, so a scrape with fp == 0 has
+    its live value read at an instant with no block capture in flight.
+    Bounded: on deadline the last scrape is used unchanged — a stuck
+    queue or a real leak is still sampled and still gated (a parked
+    handle elevates every sample, flush-idle ones included)."""
+    deadline = time.monotonic() + FLUSH_IDLE_DEADLINE_S
+    while True:
+        sample = take_sample(stack, gateway_pid)
+        metrics = sample[0]
+        pending = {
+            m: mval(metrics, "kiln_worker_flush_pending_blocks", model=m) or 0
+            for m in RUST_MODELS
+        }
+        if all(v == 0 for v in pending.values()):
+            return sample
+        if time.monotonic() >= deadline:
+            stuck = {m: int(v) for m, v in pending.items() if v}
+            print(
+                f"checkpoint {label}: flush queues still pending after "
+                f"{FLUSH_IDLE_DEADLINE_S:.0f}s: {stuck} — sampling anyway"
+            )
+            return sample
+        time.sleep(2.0)
+
+
 def quiesce(ctx: Ctx, runners: list[Runner], label: str, gateway_pid: int):
     ctx.gate.clear()
     deadline = time.monotonic() + 180
@@ -864,7 +917,7 @@ def quiesce(ctx: Ctx, runners: list[Runner], label: str, gateway_pid: int):
         time.sleep(0.25)
     busy_left = [r.label for r in runners if r.busy]
     time.sleep(6.0)  # let heartbeat/stats polling catch up (1 s cadence)
-    metrics, gateway_rss, _ready = take_sample(ctx.stack, gateway_pid)
+    metrics, gateway_rss, _ready = sample_flush_idle(ctx.stack, gateway_pid, label)
     checkpoint = Checkpoint(
         label=label,
         t=ctx.elapsed(),
@@ -1090,7 +1143,9 @@ def test_full_stack_soak():
         final_canary.client.close()
 
         time.sleep(6.0)
-        final_metrics, final_gateway_rss, final_ready = take_sample(stack, gateway_pid)
+        final_metrics, final_gateway_rss, final_ready = sample_flush_idle(
+            stack, gateway_pid, "final"
+        )
         checkpoints.append(
             Checkpoint(
                 label="final",
