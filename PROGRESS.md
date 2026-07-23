@@ -7429,3 +7429,50 @@
   semantics. Falsified if any burst starves or a ledger gate fires.
   Result to be recorded in the next entry; PR #35 stays unmerged until
   that run is green and the PM accepts both closed branches.
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — CI kernel-ON soak GREEN under the fixed admission: the evidence run confirms the mechanism — DONE
+- What: the evidence run promised by the previous entry (commit 3b18606,
+  run 30032174804, macos-14): lint, compile-linux, test-macos-release,
+  and test-macos ALL GREEN — the first fully green kernel-ON CI run of
+  the PR #35 arc, soak included (PASS: all gates held, 1903.70s).
+- The falsifiable hypothesis, checked discriminator by discriminator
+  against the job log (89291127138):
+  - Every gemma burst recovered inside its window: 6/6 bursts, ok=18,
+    loading_retry=11 — all via the reload/evict path. CONFIRMED.
+  - Fleet admission_rejects = 0 on all five models and rej=0 on every
+    60 s status line, vs 38-70 per pre-fix run. CONFIRMED.
+  - Load-time governance carried the pressure: evictions spec 15 +
+    py 24 + ttl 1 + gemma 1; idle_ttl 19. CONFIRMED.
+  - The drift conditions that starved the pre-fix bursts were PRESENT
+    and harmless: raw used above budget in 13/162 samples, worst
+    t+523s +466 MB (the recorded, untouched cache-drift gap) — and no
+    burst starved through it. This is the discriminating observation:
+    pre-fix, exactly this state produced the 180 s failures.
+  - Ledger gates unchanged-green: committed peak 3.67 of 3.90 GB;
+    reservation peak 436 MB (gemma's seeded pool room, visible in the
+    ledger exactly as designed), uncovered growth 0.0.
+  - Corrected-semantics live-object gate green again: llama 440 at all
+    six checkpoints with fp0 in the same scrape (sw 40 → 2718), spec
+    1404, ttl 704, gemma 740 baseline / 792 warm; canaries 28 + 14
+    bit-identical; spec acceptance 2898/2898 = 1.00; zero restarts.
+- Where this leaves PR #35: both blocking branches are now closed with
+  the same evidentiary standard — the live-object branch (flush-idle
+  sampling, previous entries) and the admission-pressure branch (this
+  root cause + fix + green run). Kernel-ON CI soaks: the two reds'
+  mechanisms are root-caused and fixed/corrected, and the flip's own
+  gates (probe, golden-blocking, 8k bar, canaries) have never been red.
+  Merging remains the PM's call.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh run view 30032174804 -> completed success (all four jobs)
+  $ gh api .../jobs/89291127138/logs:
+      PASS: all gates held — 1 passed in 1903.70s
+      gemma-burst ok=18 rejected=0 bursts=6 loading_retry=11
+      admission_rejects=0 x5 models; rej=0 on all 26 status lines
+      committed peak 3.67/3.90 GB; reservations peak 436 MB, uncovered 0.0
+      raw used over budget 13/162 worst +466 MB (recorded gap, unchanged)
+      llama 440/fp0 at all six checkpoints (sw 40 -> 2718)
+  ```
+- Next: PM ruling on merging PR #35 (both formerly blocking branches
+  closed; no further CI runs needed from this session).
