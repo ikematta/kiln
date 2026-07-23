@@ -1200,6 +1200,17 @@ impl<M: StepModel> Engine<M> {
             .is_some_and(|state| state.store.is_some() && !state.flush_queue.is_empty())
     }
 
+    /// Depth of the SSD write-behind flush queue (0 without a store).
+    /// Feeds the heartbeat's `flush_pending_blocks`: a live-object sample
+    /// taken while this is nonzero can be reading `read_block_bytes`
+    /// mid-capture (+2 transient), not a parked handle.
+    pub fn pending_flush_blocks(&self) -> usize {
+        self.cache
+            .as_ref()
+            .filter(|state| state.store.is_some())
+            .map_or(0, |state| state.flush_queue.len())
+    }
+
     /// Drains the whole flush queue synchronously and waits for the writer
     /// (worker drain/shutdown and tests; the steady-state path flushes
     /// write-behind in small batches instead).

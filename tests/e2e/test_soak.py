@@ -844,6 +844,13 @@ def model_snapshot(metrics, model: str) -> dict[str, float]:
         "live": get("kiln_worker_mlx_live_objects"),
         "kv_alloc": get("kiln_worker_kv_pool_allocated_bytes"),
         "up": get("kiln_worker_up"),
+        # Instrumentation only (PROGRESS 2026-07-23 root-cause): the SSD
+        # flush-queue depth paired with the live-object sample above —
+        # both fields ride the same heartbeat, so a live excursion can be
+        # attributed to (or cleared of) an in-flight block capture. Logged
+        # in the checkpoint table; no gate consumes these.
+        "flush": get("kiln_worker_flush_pending_blocks"),
+        "ssd_w": get("kiln_worker_ssd_writes_total"),
         # generation marker: any unload or restart recycles the process
         "generation": msum(metrics, "kiln_worker_unloads_total", model=model)
         + msum(metrics, "kiln_worker_restarts_total", model=model),
@@ -1141,15 +1148,19 @@ def test_full_stack_soak():
         print(header)
         print(
             f"{'':>29}"
-            + "  ".join(f"{'live/act_MB/cache_MB/gen':>28}" for _ in RUST_MODELS)
+            + "  ".join(f"{'live/act_MB/cache_MB/gen/fp/sw':>28}" for _ in RUST_MODELS)
         )
         for cp in checkpoints:
             cells = []
             for m in RUST_MODELS:
                 s = cp.per_model[m]
+                # fp = flush_pending_blocks and sw = ssd_writes_total at
+                # the SAME heartbeat as `live` — instrumentation for the
+                # PR #35 +2 attribution (PROGRESS 2026-07-23); print-only.
                 cells.append(
                     f"{int(s['live'])}/{s['active'] / 1e6:.1f}/"
                     f"{s['cache'] / 1e6:.1f}/g{int(s['generation'])}"
+                    f"/fp{int(s['flush'])}/sw{int(s['ssd_w'])}"
                 )
             print(
                 f"{cp.label:>12} {cp.t:7.0f} {cp.gateway_rss / 1e6:7.1f}M  "
