@@ -7557,3 +7557,20 @@
 - Next: committed on branch claude/ui-trailing-slash-redirect (session
   rule: no direct commits to main); PM to push/PR for the runner's CI
   pass and merge. No other work scheduled — SPEC §12 remains complete.
+
+## [2026-07-23] Phase 10 follow-up / admin UI — PR #36 MERGED (PM ruling) — DONE
+- What: PM ruled to merge on green CI (run 30048558152, all four jobs:
+  lint 1m0s, compile-linux 2m8s, test-macos-release 5m22s, test-macos
+  1h4m3s — the new full-chain /ui regression test ran live on the
+  runner inside the e2e suite, soak included). Merge commit 26d5e93
+  (merge commit, not squash — PROGRESS commit references stay valid on
+  main). `/ui` without a trailing slash now 308s to `/ui/` on main; the
+  admin shell and its assets are only ever served under the slashed
+  prefix.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 36 -> 4/4 pass (run 30048558152)
+  $ gh pr merge 36 --merge -> merged; origin/main head 26d5e93
+  ```
+- Next: nothing scheduled — SPEC §12 remains complete.
