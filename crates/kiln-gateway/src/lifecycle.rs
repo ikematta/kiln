@@ -80,6 +80,15 @@ pub(crate) struct Slot {
     /// error) lingers conservatively — it only ever under-reports
     /// headroom, and the next served request or unload reconciles it.
     pool_reserved_bytes: AtomicU64,
+    /// Whole-worker pool commitment from this model's most recent READY,
+    /// RETAINED across unloads (unlike `pool_commitment_bytes`, which
+    /// clears with the worker): the next (re)load prices weights PLUS
+    /// this, so a demand-driven reload cannot be admitted into headroom
+    /// its inevitable pool growth does not fit — the per-request denial
+    /// path has no eviction lever, so a worker stranded READY-with-cold-
+    /// pool starves until an unrelated load frees memory (the 2026-07-23
+    /// soak burst-starvation root cause). 0 until the first READY.
+    known_pool_commitment_bytes: AtomicU64,
 }
 
 /// Which bound an admission decision ran into. The configured budget
@@ -520,11 +529,53 @@ impl Lifecycle {
     }
 
     /// Records the worker's full-pool cost (READY-time `WorkerInfo`
-    /// geometry) for [`Lifecycle::admit_request`] projections.
+    /// geometry) for [`Lifecycle::admit_request`] projections, and
+    /// remembers it across unloads for the next load's pricing.
     pub(crate) fn set_pool_commitment(&self, model_id: &str, bytes: u64) {
         if let Some(slot) = self.slot(model_id) {
             slot.pool_commitment_bytes.store(bytes, Ordering::Release);
+            if bytes > 0 {
+                slot.known_pool_commitment_bytes
+                    .store(bytes, Ordering::Release);
+            }
         }
+    }
+
+    /// Pool commitment remembered from this model's most recent READY
+    /// (0 before the first, and always 0 for workers without pool
+    /// geometry): the load path adds it to the weight projection so a
+    /// reload is priced at what serving it will cost.
+    pub(crate) fn known_pool_commitment_bytes(&self, model_id: &str) -> u64 {
+        self.slot(model_id)
+            .map(|slot| slot.known_pool_commitment_bytes.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    /// Converts the pool share of a load projection into an admission
+    /// reservation at READY (called only when the load was priced with a
+    /// known commitment): the room the budget/eviction loop secured for
+    /// the pool stays claimed until heartbeats confirm materialization,
+    /// so admissions racing the measured-footprint swap cannot spend it
+    /// out from under the request that triggered the reload. `max`, not
+    /// add — growth already reserved by a request admission on the same
+    /// cold pool is absorbed, never double-charged.
+    pub(crate) fn reserve_pool_room(&self, model_id: &str) {
+        let Some(slot) = self.slot(model_id) else {
+            return;
+        };
+        let _guard = self
+            .admission_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let outstanding = slot
+            .pool_commitment_bytes
+            .load(Ordering::Acquire)
+            .saturating_sub(slot.pool_materialized_bytes.load(Ordering::Acquire));
+        let reserved = slot.pool_reserved_bytes.load(Ordering::Acquire);
+        slot.pool_reserved_bytes
+            .store(reserved.max(outstanding), Ordering::Release);
+        drop(_guard);
+        self.export_gauges();
     }
 
     /// Records the pool bytes a heartbeat reports as materialized, and
@@ -733,6 +784,7 @@ fn make_slot(
         pool_commitment_bytes: AtomicU64::new(0),
         pool_materialized_bytes: AtomicU64::new(0),
         pool_reserved_bytes: AtomicU64::new(0),
+        known_pool_commitment_bytes: AtomicU64::new(0),
     }
 }
 
@@ -896,6 +948,7 @@ mod tests {
                     pool_commitment_bytes: AtomicU64::new(0),
                     pool_materialized_bytes: AtomicU64::new(0),
                     pool_reserved_bytes: AtomicU64::new(0),
+                    known_pool_commitment_bytes: AtomicU64::new(0),
                 }),
             );
             senders.push(status_tx);
@@ -1138,6 +1191,65 @@ mod tests {
         // Worker exit clears usage, projection, and reservation alike.
         lifecycle.clear_usage("m");
         assert_eq!(lifecycle.charged_bytes(), 0);
+    }
+
+    /// The 2026-07-23 soak burst-starvation shape as arithmetic: a model
+    /// whose commitment is known from a prior READY reloads, the load
+    /// pricing covers weights + pool, and the READY-time seeding turns
+    /// the priced pool room into a reservation the triggering request
+    /// rides — instead of a per-request growth check that the drifted
+    /// ledger refuses with no eviction lever.
+    #[test]
+    fn reload_reserves_pool_room_from_the_remembered_commitment() {
+        let (lifecycle, _senders) = lifecycle_with(vec![("m", false, None, 300, 0)]);
+        // First READY records the commitment; the worker then unloads.
+        lifecycle.set_pool_commitment("m", 400);
+        assert_eq!(lifecycle.known_pool_commitment_bytes("m"), 400);
+        lifecycle.clear_usage("m");
+        // Live projection state clears with the worker; the remembered
+        // commitment does not.
+        assert_eq!(lifecycle.charged_bytes(), 0);
+        assert_eq!(lifecycle.known_pool_commitment_bytes("m"), 400);
+
+        // Reload: the supervisor re-records usage and the fresh
+        // commitment, then converts the priced pool room into a
+        // reservation at READY.
+        lifecycle.record_usage("m", 300);
+        lifecycle.set_pool_commitment("m", 400);
+        lifecycle.reserve_pool_room("m");
+        assert_eq!(lifecycle.reserved_bytes(), 400);
+        assert_eq!(lifecycle.charged_bytes(), 700);
+
+        // The request that triggered the reload projects zero growth —
+        // its room is already reserved — and admits even though another
+        // model's drift left no free headroom (budget 1000, charged 700,
+        // drift 300 below).
+        lifecycle.record_usage("m", 300);
+        assert_eq!(lifecycle.admit_request("m"), Ok(()));
+        // Seeding is max-not-add: the admission above reserved nothing new.
+        assert_eq!(lifecycle.reserved_bytes(), 400);
+        lifecycle.reserve_pool_room("m");
+        assert_eq!(lifecycle.reserved_bytes(), 400);
+
+        // Heartbeats reconcile the seeded reservation exactly like a
+        // request-admission one; every materialized byte was priced.
+        lifecycle.record_pool_materialized("m", 400);
+        lifecycle.record_usage("m", 700);
+        assert_eq!(lifecycle.reserved_bytes(), 0);
+        assert_eq!(lifecycle.charged_bytes(), 700);
+        assert_eq!(
+            lifecycle
+                .metrics
+                .admission_uncovered_bytes_total
+                .with_label_values(&["m"])
+                .get(),
+            0
+        );
+
+        // Unknown ids are inert on both new paths.
+        assert_eq!(lifecycle.known_pool_commitment_bytes("ghost"), 0);
+        lifecycle.reserve_pool_room("ghost");
+        assert_eq!(lifecycle.reserved_bytes(), 0);
     }
 
     #[test]

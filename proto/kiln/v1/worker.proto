@@ -132,6 +132,13 @@ message MemoryReport {
   // worker. Signed: a negative value means a double-free and is itself
   // a reportable fault. Added Phase 9 part 3 (soak leak gate) — additive.
   int64 mlx_live_objects = 9;
+  // KV blocks queued for the SSD write-behind flush (engine flush queue
+  // depth as of the last engine tick). Rust workers with the SSD tier
+  // only; 0 otherwise. Lets the soak's quiesced checkpoints tell a
+  // mid-flush live-object sample from a genuinely parked one (PROGRESS
+  // 2026-07-23 root-cause: read_block_bytes holds exactly 2 handles per
+  // capture). Added Phase 7 follow-up (PR #35 instrumentation) — additive.
+  uint64 flush_pending_blocks = 10;
 }
 
 message HealthStatus {

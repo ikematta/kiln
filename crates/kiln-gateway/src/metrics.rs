@@ -85,6 +85,7 @@ pub struct MemoryGauges {
     mlx_active: IntGaugeVec,
     mlx_cache: IntGaugeVec,
     mlx_live_objects: IntGaugeVec,
+    flush_pending_blocks: IntGaugeVec,
     process_rss: IntGaugeVec,
 }
 
@@ -105,6 +106,7 @@ impl MemoryGauges {
         self.mlx_live_objects
             .with_label_values(&[model])
             .set(report.mlx_live_objects);
+        set(&self.flush_pending_blocks, report.flush_pending_blocks);
         set(&self.process_rss, report.process_rss_bytes);
     }
 
@@ -316,6 +318,10 @@ impl Metrics {
                 "kiln_worker_mlx_live_objects",
                 "Live wrapper-owned mlx-c handles (debug-build rust workers; 0 otherwise)",
             )?,
+            flush_pending_blocks: mem(
+                "kiln_worker_flush_pending_blocks",
+                "KV blocks queued for SSD write-behind flush as of the last engine tick",
+            )?,
             process_rss: mem(
                 "kiln_worker_process_rss_bytes",
                 "Worker process resident set size",
@@ -453,6 +459,7 @@ mod tests {
             mlx_active_bytes: 620,
             mlx_cache_bytes: 80,
             mlx_live_objects: 42,
+            flush_pending_blocks: 3,
             process_rss_bytes: 900,
             ..MemoryReport::default()
         };
@@ -469,6 +476,7 @@ mod tests {
             "kiln_worker_weights_bytes{model=\"m\"} 500",
             "kiln_worker_mlx_cache_bytes{model=\"m\"} 80",
             "kiln_worker_mlx_live_objects{model=\"m\"} 42",
+            "kiln_worker_flush_pending_blocks{model=\"m\"} 3",
             "kiln_worker_unloads_total{model=\"m\",reason=\"evicted\"} 1",
         ] {
             assert!(text.contains(needle), "missing {needle} in:\n{text}");

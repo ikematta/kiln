@@ -6767,3 +6767,712 @@
   CI: re-triggered by this push; PR #34 merge gated on green
   ```
 - Next: merge PR #34 once CI is green (user-approved).
+
+## [2026-07-22] Phase 7 follow-up / paged_attention_kernel default ON (task 7.4 flag flip) — DONE
+- What: the dedicated default-flip commit the 2026-07-13 PM ruling parked
+  behind accumulated green CI bit-probe runs. One semantic line:
+  `defaults::paged_attention_kernel()` in kiln-gateway/src/config.rs
+  false -> true. kiln.toml.example and docs/CONFIGURATION.md updated to
+  match (default-on, opt-OUT documented). Worker CLI and
+  `EngineConfig::default()` untouched: the flag is a presence-only argv
+  the supervisor appends for rust workers, so the gateway default IS the
+  deployment default, and lower-level defaults staying false is what
+  keeps `paged_attention_kernel = false` able to turn it off.
+- CI evidence (verified against real run shapes, not assumed): since PR
+  #18 merged (2026-07-13T22:47Z, first probe-green run 29289929704),
+  54 completed CI runs through 29923292811 (2026-07-22) each ran the
+  blocking `kernel_output_is_bit_identical_to_gather_sdpa` probe in BOTH
+  macOS lanes (`cargo test --workspace` debug + release) = 108 probe
+  executions, ZERO probe failures. The 7 non-green runs in the span all
+  failed at steps AFTER the probe-bearing step (30-min soak x5,
+  model-gated suites x1 = run 29294575202, e2e + ubuntu lint x1 = run
+  29887475596) with the probe step green. Executed-not-Metal-skipped
+  verified in the actual job logs (probe "ok" line present, no
+  "skipping: paged-attention kernels need Metal") at 7 runs sampled
+  across the whole span, both lanes each: 29296905731 (07-14),
+  29383369634 (07-15), 29486211285 (07-16), 29557178033 (07-17),
+  29859211245 (07-21), 29890106666 (07-22), 29923292811 (07-22). The
+  ruling's bar ("a handful of real CI runs", probe never fires) is met
+  with a wide margin.
+- Re-verified with the new default (dev machine, M4-class):
+  - Golden (ADR 0002 B' + ADR 0004 scope): exact token-id match, every
+    fixture model x {single-stream, width-16} x {gather, kernel} —
+    591.64s, 1 passed.
+  - 8k gate (ADR 0003-pattern release gate): gather 40.4 tok/s
+    (24.72 ms/step) -> kernel 62.1 tok/s (16.10 ms/step) = 1.536x
+    (bar 1.15x; Phase 7 recorded 1.461x) — the recorded gain holds as
+    the default.
+  - e2e as the default-consumer (conftest pins no [defaults], so every
+    rust-worker stack inherits the flipped default): full suite green —
+    99 passed, 3 skipped in 353.99s.
+- e2e investigation (recorded because two runs DID fail first): the
+  first two flag-ON full-suite runs failed ONLY at
+  test_system_memory.py::test_load_refused_under_real_memory_pressure_
+  and_recovers (2026-07-21 entry's dev-only hog test), recovery half:
+  after the hog exited, request admission answered 503 with 0 bytes of
+  headroom above the test's computed floor for the whole 120s retry
+  window. Bisected: the test passes in isolation flag-ON (13.5s); a
+  flag-OFF control full suite passed (374s); a third flag-ON full suite
+  passed (353.99s, the fastest run of the day) with a 15s sampler
+  showing pressure level 1 throughout and MTLCompilerService RSS flat
+  at 2.5 MB (a per-worker-JIT memory theory disproven). The two
+  failures were the two suites launched immediately after this
+  session's own churn (10-min golden + release-gate model loads);
+  suite durations decayed 491s -> 478s -> 374s -> 354s as the machine
+  settled, uncorrelated with the flag. Conclusion: host-memory-weather
+  flake in the hog test's recovery margin (macOS returned the hog's
+  3 GiB too slowly on a churned machine), the exact sensitivity that
+  test's own skip messages document ("rerun when idle") — not a kernel
+  regression. Test NOT modified (never weaken a test); hardening its
+  recovery half (longer deadline vs a pre-recovery availability guard)
+  is parked as a PM question, non-blocking.
+- Decisions: flip applies to the gateway default only (deployment
+  surface); env override `KILN_DEFAULTS__PAGED_ATTENTION_KERNEL=false`
+  and the kiln.toml key remain the opt-out paths, both verified live in
+  this session (the OFF control ran via the env override).
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh api .../actions/jobs/<id>/logs (7 runs x 2 macOS lanes, sampled)
+  test kernel_output_is_bit_identical_to_gather_sdpa ... ok   (all 14; no skip line)
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --test golden
+  test greedy_parity_is_exact_for_every_fixture_model ... ok (591.64s)
+  $ KILN_TEST_MODELS=... cargo test -p kiln-models --release --test paged_attn_gate -- --ignored --nocapture
+  decode @8k: gather 40.4 tok/s (24.72 ms/step), kernel 62.1 tok/s (16.10 ms/step) -> 1.536x (bar 1.15x)
+  test paged_attention_kernel_meets_the_8k_bar ... ok
+  $ cargo test -p kiln-gateway --lib          -> 94 passed (incl. example-file parse)
+  $ uv run --project tests/e2e pytest tests/e2e
+  99 passed, 3 skipped in 353.99s   (new default; see investigation above)
+  $ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings  -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings       -> clean
+  $ cargo build --workspace --no-default-features                                     -> clean
+  $ ruff check / format --check python/ tests/e2e scripts                             -> clean
+  ```
+- Next: nothing scheduled — SPEC §12 remains complete; this closes the
+  last parked Phase 7 item (the default flip). Phase 11 still requires
+  separate human approval.
+
+## [2026-07-22] Phase 7 follow-up / PR #35 CI — strict soak gate fired on the flip PR — BLOCKED
+- What: PR #35 (the paged_attention_kernel default flip, commit 73a80db)
+  run 29930224449: lint, compile-linux, test-macos-release green, and
+  test-macos green through every step INCLUDING the e2e suite — the bit
+  probe passed in both lanes (streak now 55 runs) — then failed at the
+  final step, the 30-minute soak. This was the FIRST kernel-ON soak ever
+  executed anywhere: every dev-machine soak through 2026-07-21 and all
+  prior CI soaks ran the flag-OFF default.
+- Soak scorecard, kernel-specific gates ALL clean: mlx live objects at
+  exact baseline at every quiesced checkpoint (llama 440, spec 1404,
+  gemma 740 final), RSS slopes negative in the gated window,
+  determinism canaries 28 llama + 19 spec bit-identical, spec
+  acceptance 3824/3824 = 1.00, zero crash-restarts, pinned model never
+  touched. The violations are ledger/orchestration shapes:
+  1. committed (weights+pools) = 3,906,848,078 > budget 3,900,000,000
+     (+6.8 MB, 0.18%) at t+1472s and t+1482s, self-healed in <60s.
+  2. one of five gemma bursts never recovered to a 200 within 180s
+     (t+717.6s).
+- Precedent (verified in the actual CI job logs, not recalled):
+  - Violation 1 is BYTE-IDENTICAL to Finding 3 of the P9 soak closeout
+    (run 29436961038, flag OFF, PRE-reservation-ledger): same committed
+    sum, same +6.8 MB, near-same soak time (t+1491s vs t+1472s). The
+    Option A ruling (commit 5c7d73d) then declared the TOCTOU
+    "structurally impossible (reservations serialize admission
+    decisions)". Since that fix, 18 of 19 CI soaks (all flag OFF) ran
+    green; the one failure was violation 2's gate, below. Reappearance
+    on the first kernel-ON soak = either a residual reachability the
+    ledger does not close, or a gate measurement-semantics gap.
+  - Violation 2 has post-closeout flag-OFF precedent: run 29540167586
+    (2026-07-17) failed the identical gemma-burst gate and the same-day
+    re-push (29540215158) passed — a known runner-variance mode.
+- Characterization from this run's log: the overshoot window sits
+  exactly inside a ttl-qwen25 reload racing burst-gemma's idle-TTL
+  unload (t+1443s status: gemma up/ttl down, committed 3.23 GB;
+  t+1502s: gemma down/ttl up, 2.74 GB; overshoot samples in between).
+  The run also reports reservation peak 436 MB in flight and uncovered
+  growth 0.0 — every materialized byte WAS reservation-covered. Two
+  candidate mechanisms, BOTH flag-independent in reachability (the
+  kernel's 1.46-1.54x decode only shifts unload/reload interleavings):
+  - (a) drain-overlap measurement semantics: an unload releases ledger
+    budget at decision time; a correctly-priced racing admission
+    proceeds; the soak's committed metric sums MEASURED footprints
+    including the still-draining worker — transient committed > budget
+    with zero pricing error anywhere;
+  - (b) a residual pricing gap, e.g. materialization slightly beyond
+    its own reservation — the uncovered-bytes alarm counts only
+    wholly-unreserved materialization, so it would read 0.0 either way.
+- Kernel disposition: nothing here implicates kernel correctness
+  (probe, golden, canaries, leak gates all green with the flag on);
+  the flip is the timing change that surfaced a Phase 9 ledger/gate
+  question. NOT fixed here: lifecycle.rs admission is closed Phase 9
+  machinery and the strict committed gate is the regression proof the
+  Option A ruling demanded — patching either unilaterally is barred
+  (never weaken a test; decisions ledger is read-only).
+- Evidence in flight, to be recorded when they land: CI re-run of the
+  failed job (run 29930224449 attempt 2) and a local 30-minute
+  kernel-ON soak on the dev machine (where the 2026-07-21 flag-OFF
+  soak passed at committed peak 3.67 of 3.90 GB).
+- Deviations: none.
+- DECISION NEEDED: disposition of PR #35 given the fired strict gate —
+  - Option A: hold PR #35; a dedicated session root-causes the
+    overshoot (drain-overlap vs pricing gap) in the Phase 9 machinery
+    and lands the fix — or the ruled measurement correction — then the
+    flip merges on a green kernel-ON soak. Keeps the invariant strict
+    and true; delays the flip.
+  - Option B: if root-cause confirms mechanism (a), rule a drain-aware
+    correction of the soak's committed sampling (a gate-semantics
+    correction in the same class as the P9 py-smollm slope
+    correction, not a weakening), then merge on green. Requires
+    Option A's root-cause work regardless.
+  - Option C: re-run to green and merge on the dice. Listed for
+    completeness only — this is the pattern the P9 Option A ruling
+    already rejected.
+  No option picked.
+- Next: the PM ruling above. The probe/golden/8k/e2e evidence for the
+  flip itself stands unchanged in the previous entry.
+
+## [2026-07-22] Phase 7 follow-up / PR #35 — soak datapoints 2-4 recorded — BLOCKED (same ruling)
+- The evidence promised in the previous entry, now landed:
+  - CI re-run of the failed job (run 29930224449 attempt 2): PASS — the
+    full soak green on the identical commit (73a80db).
+  - Local 30-min kernel-ON soak (dev machine): PASS all gates —
+    canaries 31+19 bit-identical, spec acceptance 4004/4004 = 1.00,
+    gemma bursts 6/6, restarts 0, no committed-over-budget samples.
+  - CI run 29936108761 (the PROGRESS-commit push, third kernel-ON CI
+    soak): FAIL on a THIRD distinct gate — llama-int mlx live objects
+    442 vs floor 440 at the final quiesced checkpoint. Series
+    440,440,440,442,440,442: non-monotonic (t+1440 was back at floor),
+    NOT a leak. Matches the P9-characterized +2 SSD-flush transient
+    (flag-OFF precedent, "returned to floor" then; this instance landed
+    ON the final sample). Kernel-path holding of arrays ruled out by
+    code inspection: PagedAttnInputs lives on the per-step SeqStep and
+    the parked pipeline InFlight retains only sampled-token arrays.
+- Aggregate now: kernel-ON soaks 2 green (1 CI, 1 local) / 2 red (CI),
+  the two reds on three DIFFERENT strict-threshold race windows, each
+  with documented flag-OFF precedent, none leak-shaped, none touching
+  correctness/determinism gates. Versus ~1-2 red in ~20 flag-OFF CI
+  soaks since the ledger fix. Consistent with (not proof of) the
+  kernel's 1.46-1.54x decode timing widening exposure to the soak's
+  existing dice windows on the slow macos-14 runner.
+- The DECISION NEEDED from the previous entry stands unchanged, with
+  this sharper framing: the question is less "is the kernel wrong"
+  (every kernel-specific gate green in all four soaks) and more "are
+  the soak's strict gates runner-race-free enough to stay the merge
+  gate for a timing-shifting change" — which is exactly the Option A/B
+  root-cause fork already written there. No option picked.
+- Next: the PM ruling (previous entry). This push adds CI soak
+  datapoint #4 to the record for it.
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — CI soak datapoint #5: the +2 signature repeats and persists — BLOCKED
+- Run 29967425675 (10a0a3d, fourth kernel-ON CI soak): FAIL, same gate
+  as datapoint #3 — llama-int live objects 442 vs floor 440 — but with
+  a sharper shape: 440 at baseline/t+369/t+720/t+1085, then 442 at
+  t+1445 AND final. Late-appearing and PERSISTENT, not a transient the
+  final sample happened to catch.
+- Aggregate: CI kernel-ON soaks now 1 green / 3 red; the last two reds
+  on the IDENTICAL gate and +2 end-state signature (plus one interior
+  +2 that drained, datapoint #1's run). Flag-OFF post-fix CI history:
+  this gate never failed in ~20 runs. Local kernel-ON 30-min soak:
+  clean floors at every checkpoint. Conclusion: a kernel-ON-correlated,
+  CI-runner-manifesting end-of-run residue of exactly 2 mlx objects —
+  no longer classifiable as the soak's pre-existing dice windows.
+- Correction to datapoint #3's note: "kernel-path retention ruled out
+  by inspection" was too strong. What inspection rules out: SeqStep and
+  the parked pipeline InFlight directly holding PagedAttnInputs, and
+  late JIT of kernel HANDLES (all three are built eagerly in
+  PagedAttn::new -> inside the baseline). What remains open, with the
+  suggestive fact that PagedAttnInputs is EXACTLY two arrays (table +
+  context_len_arr): graph-level retention — a parked still-lazy
+  sampled-token array retains its upstream step graph, including the
+  kernel's input arrays, across an idle/cancel window (the soak runs
+  80-93 cancels; an orphaned pipeline row is only reaped at the NEXT
+  pipelined turn) — or an SSD-flush-path interaction shifted by kernel
+  timing. Why flag-OFF stays clean and why it never reproduces locally
+  (device-class dispatch differences, timing) is exactly what the
+  root-cause must explain; CI-shaped instrumentation (live-object
+  breakdown by type, or a targeted pipelined-cancel-quiesce repro) is
+  likely required.
+- Sharpened recommendation into the standing DECISION NEEDED: Option C
+  (dice) is dead at 1-green-in-4. For the live-object gate, Option B's
+  "gate semantics" branch is WEAKENED: the signature is kernel-
+  correlated, so treating it as gate noise is not currently
+  defensible. Recommended: Option A — hold PR #35; a dedicated session
+  root-causes (1) the +2 end-of-run residue in the Phase 7 kernel
+  plumbing (kiln-engine paged_attn/engine pipeline — Phase 7 code, not
+  closed Phase 9 machinery) and (2) the committed-gate drain-overlap
+  question from datapoint #1; the flip re-merges on green kernel-ON
+  soaks after. Still the PM's call; no option picked.
+- Next: PM ruling. No further CI datapoints will be burned from this
+  session (this commit is pushed with [skip ci]).
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — root-cause session: the +2 live-object signature is the P9 SSD-flush mid-copy transient being SAMPLED, not a leak — DONE (PR #35 disposition still awaits the PM ruling)
+- What (root-cause only; PR #35 and the flag default untouched):
+  - New permanent regression test `crates/kiln-engine/tests/paged_attn_leak.rs`
+    (~12 s, Metal-gated, single #[test] per the process-global counter
+    convention): drives the REAL engine with `paged_attention_kernel: true`
+    and a mock StepModel that routes every decode-shaped sampled row through
+    the real `PagedKv::paged_sdpa`, so the custom-kernel node and its
+    `PagedAttnInputs` pair (the exactly-+2-shaped suspect) are ancestors of
+    every pipelined sampled-token array — the production graph shape. It
+    enumerates every DISTINGUISHABLE cancel-observation window (the engine
+    reads the flag only at `pipeline_ok`, `settle_sampled`, and the sweep,
+    so all wall-clock timings collapse onto these): R1 flag-while-parked,
+    R2 flag flipped between build and apply of the same pipelined turn
+    (injected from an earlier row's on_event inside apply_inflight), R3
+    client-drop event-refusal, R4 length-finish at a pipelined apply with a
+    neighbor cancelled in the same window — each swept across depths, SSD
+    tier off and on. Result: live objects return EXACTLY to baseline after
+    every quiesce, every iteration.
+  - Hypothesis (a) (parked lazy sampled-token array retaining the step
+    graph / "orphaned pipeline row reaped only at next pipelined turn") is
+    ELIMINATED, twice over: (1) the counter (`kiln_worker_mlx_live_objects`
+    = kiln-mlx debug counter) counts RUST-SIDE wrapper handles, decremented
+    in Drop — mlx-internal graph retention cannot move it at all; (2) by
+    construction an InFlight row lives at most one step() call (taken at
+    entry; departed rows dropped in the same pipelined_turn's retain;
+    inflight non-empty ⇒ running non-empty ⇒ the serve loop cannot park),
+    confirmed by the R1-R5 sweeps returning bit-exact floors.
+  - Mechanism found and DEMONSTRATED (R6): the only wrapper-creating code
+    path on an idle-with-pending-flushes engine is `flush_entries` →
+    `read_block_bytes`, whose shadowed `rows` bindings (slice + contiguous)
+    hold EXACTLY 2 live objects for the duration of each block capture's
+    sync'd data read — the P9-characterized transient, at the exact
+    magnitude of the CI signature. R6 races an async sampler (the
+    heartbeat's shape: `memory_report()` reads the atomic fresh from the
+    gRPC thread) against a genuine post-cancel-burst flush drain:
+    8,514,161 samples during idle-flush ticks; max +2 over floor; floor+2
+    read 7,563,386 times (89%); floor immediately after the queue drains;
+    ZERO elevated reads post-drain. Both bounds are hard assertions: a
+    real parked leak fails the post-drain check, a third mechanism holding
+    more than the pair fails the ≤ +2 check.
+- CI-log corroboration (fetched from the actual failing jobs, not
+  recalled — runs 29936108761 (dp#3) and 29967425675 (dp#5)):
+  - dp#3's llama series is NON-MONOTONIC within one generation-0 process:
+    440, 440, 442 (t+1088s), 440 (t+1440s), 442 (final). A parked-wrapper
+    leak cannot return to floor and reappear. dp#5 (440 ×4, 442 at
+    t+1445s, 442 final) is two catches, not one persistent state.
+  - Every 442 sits exactly where the soak SYNCHRONIZES flush work with
+    sampling: each checkpoint's `gate.clear()` aborts in-flight streams
+    (cancel burst → donations → novel-block flush enqueues), the final
+    checkpoint follows the drain-abort burst, and the single sample lands
+    only ~6 s later. llama ssd_writes 2531/2485 per run = novel-content
+    flush traffic sustained to the end.
+  - dp#5 sampled burst-gemma at 792 live vs its 740 floor at t+1445s —
+    quiesced checkpoints demonstrably catch worker-INTERNAL activity; the
+    180 s busy-wait covers client runners only.
+- Why CI-only and why kernel-correlated (measured, then arithmetic):
+  - Measured capture cost at REAL llama-3.2-1b geometry (16 layers, 8
+    kv-heads, head-dim 64, block 32, f16; 1 MiB payload, 32 sync'd evals
+    per block), debug build on the M4 dev machine: 6.81 ms/block
+    (scratch harness, deleted after measurement; output in acceptance).
+    Worker idle-flush tick = 2 ms recv_timeout + FLUSH_BATCH(=2) captures
+    → ~87% of tick wall-time is spent inside a capture, matching R6's
+    measured 89% sampling probability.
+  - Pipelined turns call `cache_io_tick(0)` — captures NEVER run during
+    steady pipelined decode, so busy intervals BANK flush backlog that
+    drains exactly during quiesce. Kernel-ON (1.46-1.54x decode) banks
+    ~1.5x more novel blocks per interval and pipelines a larger fraction
+    of steps; the macos-14 virtualized M1 runner multiplies per-block
+    capture cost on top. On the dev machine even the ENTIRE 537-block
+    llama pool drains in ≤ ~4.2 s < the 6 s settle — a local sample
+    structurally cannot land mid-tail (why no local soak, including the
+    2026-07-22 kernel-ON 30-min PASS, ever catches it). On CI a modest
+    banked backlog outlives 6 s, and any sample inside the tail reads
+    floor+2 with ~0.9 probability. Flag-OFF history fits: the P9 closeout
+    itself recorded interior "+2 that DRAINED" excursions flag-OFF; the
+    smaller flag-OFF backlogs simply never landed on a group-final sample
+    in ~20 runs (and dp#1's interior +2 drained the same way).
+- Verdict, in the ledger's terms: hypothesis (a) WRONG; hypothesis (b)
+  CORRECT in refined form — no leak, no mistimed flush: the checkpoint
+  samples the bounded, already-characterized read_block_bytes mid-copy
+  pair because checkpoint-synchronized abort bursts + pipelining-banked
+  backlog + slow-runner capture cost stretch the post-burst flush tail
+  past the soak's fixed 6 s settle. The P9 gate's own allowance (interior
+  excursions ≤ 8, floor at group-final) already names this transient;
+  kernel-ON broke its implicit assumption that the tail cannot reach a
+  final sample on CI hardware.
+- Honest residual: the failing runs' logs do not record flush-queue state
+  at the sample instants, so the attribution there is by exclusion +
+  demonstrated mechanism + arithmetic (every leak-shaped alternative is
+  eliminated locally, and dp#3's non-monotonicity eliminates them on CI
+  independently), not by a direct observation at those two instants. One
+  instrumentation-only soak run would close even that (option below).
+- Decisions: repro test committed as a permanent gate (fails on any
+  parked-wrapper leak in the cancel/quiesce family and on any idle-window
+  mechanism holding > 2 objects). No engine code changed — nothing is
+  broken in the Phase 7 kernel plumbing or the Phase 9 machinery. The
+  soak was NOT touched: re-timing or re-sampling its checkpoint is a
+  gate-semantics change in exactly the class the standing DECISION
+  NEEDED's Option B names, and that ruling is the PM's (never weaken a
+  test unilaterally).
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-engine --test paged_attn_leak -- --nocapture
+  R6 iter 0: flush backlog drained in 8 ticks / 24.3 ms (<= 2 block captures per tick)
+  R6 iter 1-3: 9 ticks / ~29 ms each
+  R6: 8514161 async samples during idle-flush ticks; max +2 over floor;
+      floor+2 read 7563386 times (the CI checkpoint signature, sampled
+      live, with zero leak)
+  all cancel windows quiesced at baseline (kernel path in-graph)
+  test pipelined_cancel_quiesce_returns_live_objects_to_baseline ... ok (12.40s)
+  $ (scratch, deleted) read_block_bytes at llama geometry
+  llama-geometry capture: 6.81 ms/block (16 blocks in 108.9 ms; payload
+      1 MiB/block, 32 sync'd evals/block)
+  $ cargo test -p kiln-engine        -> all suites ok (incl. new test)
+  $ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings  -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings       -> clean
+  ```
+- Next: PM ruling on the refined DECISION NEEDED below; on a ruling, a
+  dedicated session implements it and re-runs kernel-ON soaks; PR #35
+  merges on green.
+- DECISION NEEDED (refines the 2026-07-22 PR #35 disposition, live-object
+  branch; the dp#1 committed-budget branch is unchanged): the live-object
+  reds are a sampling artifact of a bounded, characterized transient —
+  not a leak, not kernel incorrectness. Options:
+  - A (recommended): rule a gate-semantics correction in the same class
+    as the P9 py-smollm slope correction — the checkpoint's live-object
+    sample must be flush-idle to be gate-eligible. Concrete shapes (any
+    one suffices; all keep the floor bar bit-exact for real leaks, since
+    a parked wrapper elevates EVERY sample including flush-idle ones):
+    (i) surface "cache io pending" in the heartbeat (additive
+    WorkerStats/Health field — proto-additive is allowed) and have the
+    soak wait for it to clear before sampling; (ii) double-sample each
+    checkpoint a few seconds apart and gate on the minimum; (iii) record
+    per-checkpoint ssd_writes_total and disqualify live samples whose
+    surrounding write-delta is nonzero.
+  - B (evidence-first variant of A): land an instrumentation-only change
+    (log flush-pending + ssd_writes at each sample; no gate change), burn
+    one CI soak to observe the coincidence directly on the runner, then
+    rule A with the direct observation in hand.
+  - C: leave the gate as-is and re-roll on red (rejected by the P9
+    precedent this gate descends from; dead at 1-green-in-4).
+  No option picked.
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — instrumented CI soak: the +2 sample caught mid-flush-tail (fp380) — evidence CONFIRMED — DONE
+- What: the evidence-first branch of the refined DECISION NEEDED, as
+  ruled. Commit bab42d9 surfaces the engine's SSD write-behind
+  flush-queue depth through the heartbeat (additive proto
+  `MemoryReport.flush_pending_blocks = 10` → worker Shared atomic
+  published per engine tick → gateway gauge
+  `kiln_worker_flush_pending_blocks`) and prints it plus
+  `ssd_writes_total` beside every live-object value in the soak's
+  checkpoint table (`…/fpN/swN` cells). Print-only; no gate change.
+  Both fields ride the SAME heartbeat as the gated live sample, so a
+  +2 excursion is attributable at the instant it is read. (Process
+  note: bab42d9's own body accidentally contained the CI-skip token —
+  GitHub matches it anywhere in the head commit message — so 84c2f7f,
+  an empty commit, triggered the actual run.)
+- Evidence run 29980519514, llama-int column (`live/…/fp/sw`):
+  - Attempt 1 (soak FAILED on the precedented gemma-burst variance
+    gate only; live gate green): live 440 at ALL six checkpoints, BUT
+    fp at the gated sample instants read 0, 0, 133, 345, 397, 391 with
+    sw climbing 40 → 2350 — four of six gated samples taken with
+    133-397 blocks of flush work outstanding. Locally (same build,
+    2-min pipe validation): fp0 at every checkpoint. The CI backlog is
+    STANDING and grows across the run.
+  - Attempt 2 (soak PASSED — all gates held; the 442 below sat within
+    the interior allowance):
+    ```
+       t+1440s   442/1232.1/7.6/g0/fp380/sw1805
+         final   440/1232.1/1.4/g0/fp379/sw2331
+    ```
+    THE DIRECT OBSERVATION the 2026-07-23 root-cause entry named as
+    its honest residual: a +2 live-object sample paired in the same
+    heartbeat with 380 blocks mid-flush and captures in flight
+    (sw 1290 → 1805 → 2331 across the surrounding checkpoints) — and
+    drained back to 440 at the final sample while the backlog
+    persisted (fp379). Non-monotonic within one gen-0 process, again.
+    The contradiction branch (a 442 at fp0) has not occurred in any
+    observed run. NOTE: attempt 2's PASS is under the OLD sampling
+    semantics and is not claimed as the clean kernel-ON soak — that
+    comes under the corrected semantics (next entry), per the ruling
+    ("not a retry-until-green one").
+- Model correction forced by attempt 1's all-440 reads (then verified
+  by measurement): with fp≈390 pending, the root-cause session's ~90%
+  +2-read probability would make four consecutive floor reads
+  implausible. Resolution: the wrapper-holding window is only the READ
+  side of each flush cycle. Measured (debug build, llama geometry,
+  1 MiB payload, M4): read_block_bytes (2 wrappers alive) 6.81
+  ms/block vs Sha256 in enqueue_write (ZERO wrappers) 39.7 ms/block —
+  +2 duty ≈ 15% locally, lower on the runner's slower CPU. (The R6
+  harness's measured 89% was an artifact of its 4 KB mock payloads —
+  hash negligible there.) Numerically closed: expected +2 reads per
+  big-backlog gated sample ≈ 1-in-5-to-7; flag-ON history shows ~5 of
+  ~18 (dp#1 interior, dp#3 2-of-6, dp#5 2-of-6); attempt 1's 0-of-4
+  (p≈0.5) and attempt 2's 1-of-4 both sit inside the model. Slow CI
+  drain (sw deltas ≈ 1.5 blocks/s averaged) matches the
+  hash-dominated cycle in a debug build.
+- Verdict: the exclusion chain is now closed end-to-end by direct
+  observation — the +2 is the read_block_bytes capture pair sampled
+  mid-flush-backlog; kernel-ON's role is growing the backlog (more
+  novel blocks banked, pipelined turns capture 0); CI-only because the
+  dev machine drains its tail inside the settle while the runner
+  sustains minutes-scale standing backlogs.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh api .../jobs/89121138873(89121138887)/logs  attempt 1 table (fp 0,0,133,345,397,391; live all 440)
+  $ gh api .../jobs/89132867737/logs               attempt 2 table (t+1440s 442/fp380/sw1805; final 440/fp379; PASS)
+  $ ./scripts/soak.sh --minutes 2                  -> PASSED (pipe validation; fp/sw render; fp0 local)
+  $ cargo test -p kiln-gateway --lib               -> 94 passed (incl. new gauge needle)
+  $ fmt / clippy both shapes / ruff / build --no-default-features -> clean
+  (scratch, deleted) capture 6.81 ms/block; debug sha256 39.7 ms/block
+  ```
+- Next: land the ruled correction (i) — flush-idle checkpoint
+  sampling — and run the kernel-ON CI soak under it (next entry).
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — flush-idle sampling landed and proven; live-object branch CLOSED; the admission-pressure branch now blocks alone — DONE (correction) / BLOCKED (flip, on the Phase 9 branch)
+- What (commit 8d9ada5): the ruled correction (i), landed on the
+  confirmed evidence. Quiesced checkpoints take the gated live-object
+  sample FLUSH-IDLE: `sample_flush_idle()` polls every 2 s until every
+  rust worker's `kiln_worker_flush_pending_blocks` reads 0 in the SAME
+  scrape that supplies the gated `live` value; wired into `quiesce()`
+  and the final checkpoint; bounded by FLUSH_IDLE_DEADLINE_S = 240
+  (sized from the observed 397-block backlogs at a few blocks/s drain),
+  and on expiry the last scrape is used unchanged with the stuck depths
+  printed — a wedged queue is not a bypass. NOT changed: floors,
+  LIVE_TRANSIENT_ALLOWANCE, return-to-floor at group-final, the 180 s
+  busy-wait, the 6 s settle. Measurement correction in the P9
+  py-smollm-slope class, not a bar change.
+- Gate-sensitivity proof (the corrected gate still catches a real
+  leak): temporary UNCOMMITTED patch — `std::mem::forget(...)` ×2 on
+  `FinishKind::Cancelled` in kiln-engine `finish()` (+2 per cancel,
+  flush-independent) — local 20-min soak under corrected sampling
+  FAILED exactly as required, monotonic +140:
+  ```
+  mlx live objects did not return to baseline for llama-int (gen 0, pool 537MB):
+  [('baseline', 440.0), ('t+309s', 472.0), ('t+607s', 524.0),
+   ('t+906s', 552.0), ('final', 580.0)] (floor 440)
+  (+ the allowance-8 excursion gate fired on the same series)
+  ```
+  Patch reverted; tree clean; kiln-worker rebuilt; paged_attn_leak.rs
+  green again (11.61 s).
+- Corrected-semantics kernel-ON CI soak (run 30018908142, macos-14):
+  - The LIVE-OBJECT GATE IS GREEN with the defect visibly gone: llama
+    440 at ALL six gated samples with fp0 at every one (sw climbed
+    630 → 2753 between checkpoints — heavy flush traffic drained
+    BEFORE each sample instead of under it); spec 1404 at warm
+    checkpoints; gemma 740 final. No flush-idle deadline expiries.
+  - The RUN still FAILED — honestly reported, and not the live gate:
+    one gemma burst never recovered to a 200 within 180 s (t+938.8s;
+    counted twice by the harness: hard error + derived count).
+    Characterized from the run's own 10 s samples: an
+    ADMISSION-PRESSURE window, not a load flake — at t+907 `used`
+    exceeded the budget (4.08 vs 3.90 GB) with ALL FOUR rust models
+    resident, gateway rejects climbing 7 → 24 → 27 across exactly the
+    failure window (and the same shape recurred at t+1569: used 4.08,
+    rej 37 → 51, with that burst surviving). This is datapoint #1's
+    committed/drain-overlap territory (Phase 9 memory governance under
+    kernel-shifted TTL/reload interleavings), now at 3-of-7 kernel-ON
+    soaks (t+717.6s / t+951.6s / t+938.8s) vs 1-of-~20 flag-OFF —
+    kernel-correlated by the same standard this ledger applied to the
+    live-object signature, and NOT further re-rolled from this session.
+- Where this leaves PR #35 (for the PM ruling):
+  - CLOSED: the live-object branch — root-caused (2026-07-23 entries),
+    directly observed (442 paired with fp380), corrected (flush-idle
+    sampling), the correction proven leak-sensitive (injected-leak
+    FAIL), and green on the runner under corrected semantics.
+  - OPEN and now blocking alone: the admission-pressure branch — the
+    dp#1 drain-overlap-vs-pricing-gap fork, unresolved by design in
+    these sessions (closed Phase 9 machinery; the original DECISION
+    NEEDED's Option A root-cause item). The kernel's role remains
+    timing exposure, not correctness: every kernel-specific gate has
+    been green in all seven kernel-ON soaks.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ uv run --project python/kiln_worker_py ruff check / format --check tests/e2e -> clean
+  $ ./scripts/soak.sh --minutes 2   -> PASSED (corrected sampling path, local)
+  $ ./scripts/soak.sh --minutes 20  (with temp injected leak) -> FAILED floor gate (series above)
+  $ gh api .../jobs/89246140565/logs (run 30018908142):
+      llama-int checkpoints: 440/.../fp0 at baseline, t+368s, t+730s,
+      t+1089s, t+1447s, final — live gate green, corrected semantics
+      verdict: FAIL: 2 gate(s) violated  (both = the one gemma burst, t+938.8s)
+  ```
+- Next: PM ruling with two decoupled questions: (1) accept the
+  live-object branch as closed (evidence above); (2) disposition of
+  the admission-pressure branch — a dedicated root-cause session on
+  the Phase 9 drain-overlap/pricing question (the original dp#1
+  Option A work) before the flip re-merges, or an explicit ruling that
+  the burst gate's 180 s recovery bar is a deployment-shape question
+  separable from the flip. No option picked; no further CI runs burned
+  from this session.
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — admission-pressure branch root-caused and FIXED: weights-only reload pricing stranded cold pools behind a leverless denial path — DONE (CI evidence run in flight)
+- Root cause (the dedicated session the previous entry's ruling asked
+  for; direct observation across ALL FOUR burst-gate failures ever
+  recorded — kernel-ON runs 30018908142 t+938.8s, 29930224449 attempt 1
+  t+717.6s, 29967425675 t+951.6s, and flag-OFF run 29540167586
+  t+1680.1s — the same signature in every fetched log):
+  - In every failed window burst-gemma was RESIDENT the whole time at
+    weights-only committed (fleet 2.94 + gemma 0.53 = 3.47 GB, pool
+    COLD — below even its 736 MB baseline act), while `used` sat
+    ≥ ~3.78 GB and its 436 MB pool-growth admissions were denied
+    throughout (rejects 7→24→27 across the 30018908142 window; 16→40
+    dp#1; 30→54 flag-OFF).
+  - The ENFORCED ledger held everywhere: committed peak 3.67 ≤ 3.90 GB,
+    reservation uncovered growth 0.0 (run 30018908142). NOT a
+    reservation-ledger pricing hole and NOT a stale sample.
+  - The real-bytes-over-budget the ruling flagged (`used` 4.08, worst
+    4.45 GB) is mlx_cache/compute-buffer drift — the RECORDED open
+    Phase 9 gap ("no continuous-pressure eviction yet"), reported-not-
+    gated, and NOT kernel-specific: flag-OFF failing run worst +582 MB
+    vs kernel-ON +551/+525 MB; used≥3.7 GB duty across 60 s status
+    lines: 8/30 in a green flag-OFF run vs 10-13/31 in the failing runs.
+  - Mechanism: a demand reload was priced at WEIGHTS ONLY
+    (load_projection = weights-on-disk + 64 MiB margin). Gemma's burst
+    reload fit the drifted budget WITHOUT evicting, landed
+    READY-with-cold-pool, and its inevitable 436 MB growth was then
+    priced per-request against headroom ≈ 0 — a denial path with NO
+    eviction lever (evictions run only inside run_once's load loop) —
+    while evictable memory (spec 0.96 GB, py 0.27 GB) sat resident the
+    whole window. Recovery needed an UNRELATED load (ttl-qwen25's next
+    reload) to evict on gemma's behalf plus cache trims; that
+    coincidence chain exceeded 180 s once per failing run. The soak's
+    own design text prices a burst at "gemma load+pool (~1.2 GB)" —
+    the code priced 0.79 GB.
+  - Hypotheses REFUTED by the same logs: (i) SSD-flush-backlog /
+    drain-overlap interaction with reservation TTL logic — the cycling
+    models have ssd_writes ≈ 0 (flush traffic is llama-only and llama
+    is pinned, never unloads), and unload() releases ledger bytes only
+    after process death; (ii) kernel-banked backlog as the driver —
+    the identical signature reproduces flag-OFF. Kernel-ON's role is
+    timing/throughput exposure only (3-of-7 vs 1-of-~20), consistent
+    with every prior finding in this arc.
+- Fix (admission logic per the ruling; the 180 s recovery bar, the
+  committed gate, and every leak gate untouched):
+  - lifecycle.rs: `known_pool_commitment_bytes` — each model's
+    whole-worker pool commitment, recorded at every READY, RETAINED
+    across unloads (clear_usage clears only live state);
+    `reserve_pool_room()` — converts the priced pool room into an
+    admission reservation under the admission lock (max-not-add;
+    reconciled down by heartbeats exactly like request reservations).
+  - supervisor.rs run_once: a (re)load is priced at weights + known
+    commitment (0 on a first-ever load — boot stays cheap, per the
+    lazy-pool design), so a demand reload forces the eviction its pool
+    needs; at READY the pool room is seeded as a reservation BEFORE the
+    measured-footprint swap, so racing admissions cannot spend it. The
+    triggering request rides the reservation: growth 0, no 503.
+- Proof the fix addresses the real mechanism (the injected-proof
+  standard):
+  - New permanent e2e test tests/e2e/test_lifecycle.py::
+    test_reload_prices_pool_and_evicts_instead_of_stranding — the trap
+    deterministically (victim warm 486 MB + ttl model under a 900 MB
+    budget where reload weights fit ~414 MB headroom but weights+pool
+    543 MB does not). With the fix: victim evicted at the reload, the
+    request serves off the seeded reservation, zero admission rejects —
+    PASSED (72.47 s). With the fix temporarily neutralized
+    (pool_hint = 0, uncommitted): FAILED exactly at the trap —
+    "reload was admitted without evicting — the starvation trap:
+    {'victim': 'ready', 'trap': 'ready'}" (28.06 s). Patch reverted.
+  - New lifecycle unit test
+    reload_reserves_pool_room_from_the_remembered_commitment
+    (commitment survives unload; seed is max-not-add; heartbeats
+    reconcile; uncovered stays 0).
+- Soak harness correction forced by the fix (test_soak.py, one check):
+  the `total_rejects >= 1` scenario-coverage self-check asserted the
+  PRE-fix pressure valve (request-level 503s, 38-70 per run). Under
+  honest load pricing the same pressure resolves through load-time
+  eviction and fleet-wide rejects are legitimately ~0, so the check
+  became a permanent flake (local soak #1: 30:29, ALL real gates held,
+  the coverage check the sole violation). Corrected to the post-fix
+  signature: fail only when bursts neither walked the on-demand reload
+  path nor produced any admission 503. NOT a bar change: committed,
+  180 s recovery, floors, canaries, eviction/idle-TTL minimums all
+  unchanged; request-gate coverage lives in test_admission.py (4
+  scenarios incl. drift-gating and the TOCTOU) and the new trap test.
+- Also observed in run 30018908142, recorded for completeness: the
+  ADVISORY golden lane (continue-on-error, ADR 0004) failed on the
+  gemma-3-1b/chat-basic gather-path divergence — the EXACT
+  ADR-0004-precedented cross-device pair (188797 vs 195597 at token
+  50, first seen run 28753659372). Unchanged failure pattern, not
+  job-gating, no action per the ADR ("red alone is not signal").
+- Decisions: seeding is gated on the load having priced the pool
+  (hint > 0), so gen-0 boot keeps the deliberate cheap-idle semantics
+  (all five soak models still fit idle at startup); seeding BEFORE the
+  measured swap double-counts the pool for microseconds in the
+  conservative direction (refuses racers, never double-spends).
+- Deviations: none (SPEC §2.2/§2.3 prescribe no projection formula;
+  "rejects load() that would exceed budget" is made honest for
+  reloads). Residual, stated: a FIRST-EVER load (commitment unknowable
+  before any READY) can still theoretically strand; unreachable in the
+  soak fleet (every model's boot READY records its commitment before
+  any burst) and unobserved in any run to date. The cache-drift
+  open gap (used > budget, reported-not-gated) is untouched and stands
+  as recorded.
+- Acceptance:
+  ```
+  $ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings   -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings  -> clean
+  $ cargo build --workspace --no-default-features && cargo build --workspace     -> clean
+  $ ruff check / format --check python/ tests/e2e scripts                        -> clean
+  $ cargo test -p kiln-gateway --lib -> 95 passed (incl. the new reservation test)
+  $ pytest tests/e2e/test_lifecycle.py::test_reload_prices_pool_and_evicts_instead_of_stranding
+      with fix    -> 1 passed in 72.47s
+      fix neutralized (temp, reverted) -> FAILED: "reload was admitted without
+      evicting — the starvation trap: {'victim': 'ready', 'trap': 'ready'}"
+  $ pytest tests/e2e/test_lifecycle.py tests/e2e/test_admission.py -> 8 passed in 123s
+  $ ./scripts/soak.sh --minutes 30  (local #2, corrected coverage check)
+      PASS: all gates held — 1 passed in 1831s
+      gemma bursts 6/6 recovered, ok=15 rejected=0 loading_retry=6
+      fleet admission_rejects=0 (pre-fix runs: 38-70); evictions spec 16
+      + py 28 + gemma 1; idle_ttl 20; committed peak 3.67/3.90 GB;
+      reservation peak 436 MB (gemma's seeded pool), uncovered 0.0;
+      raw used over budget 12/177 worst +525 MB (recorded gap,
+      unchanged); live floors 440/1404/704 + gemma 740/792(warm) with
+      fp0 at every checkpoint; canaries 31+18 bit-identical; spec
+      acceptance 3571/3571 = 1.00; rej=0 on all 30 status lines
+  ```
+- Next: the CI kernel-ON soak evidence run (this push). Falsifiable
+  hypothesis: every gemma burst recovers ≤ 180 s via the reload/evict
+  path, fleet admission_rejects ≈ 0 (vs 38-70 pre-fix), and the
+  live-object/committed/canary gates stay green under corrected
+  semantics. Falsified if any burst starves or a ledger gate fires.
+  Result to be recorded in the next entry; PR #35 stays unmerged until
+  that run is green and the PM accepts both closed branches.
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — CI kernel-ON soak GREEN under the fixed admission: the evidence run confirms the mechanism — DONE
+- What: the evidence run promised by the previous entry (commit 3b18606,
+  run 30032174804, macos-14): lint, compile-linux, test-macos-release,
+  and test-macos ALL GREEN — the first fully green kernel-ON CI run of
+  the PR #35 arc, soak included (PASS: all gates held, 1903.70s).
+- The falsifiable hypothesis, checked discriminator by discriminator
+  against the job log (89291127138):
+  - Every gemma burst recovered inside its window: 6/6 bursts, ok=18,
+    loading_retry=11 — all via the reload/evict path. CONFIRMED.
+  - Fleet admission_rejects = 0 on all five models and rej=0 on every
+    60 s status line, vs 38-70 per pre-fix run. CONFIRMED.
+  - Load-time governance carried the pressure: evictions spec 15 +
+    py 24 + ttl 1 + gemma 1; idle_ttl 19. CONFIRMED.
+  - The drift conditions that starved the pre-fix bursts were PRESENT
+    and harmless: raw used above budget in 13/162 samples, worst
+    t+523s +466 MB (the recorded, untouched cache-drift gap) — and no
+    burst starved through it. This is the discriminating observation:
+    pre-fix, exactly this state produced the 180 s failures.
+  - Ledger gates unchanged-green: committed peak 3.67 of 3.90 GB;
+    reservation peak 436 MB (gemma's seeded pool room, visible in the
+    ledger exactly as designed), uncovered growth 0.0.
+  - Corrected-semantics live-object gate green again: llama 440 at all
+    six checkpoints with fp0 in the same scrape (sw 40 → 2718), spec
+    1404, ttl 704, gemma 740 baseline / 792 warm; canaries 28 + 14
+    bit-identical; spec acceptance 2898/2898 = 1.00; zero restarts.
+- Where this leaves PR #35: both blocking branches are now closed with
+  the same evidentiary standard — the live-object branch (flush-idle
+  sampling, previous entries) and the admission-pressure branch (this
+  root cause + fix + green run). Kernel-ON CI soaks: the two reds'
+  mechanisms are root-caused and fixed/corrected, and the flip's own
+  gates (probe, golden-blocking, 8k bar, canaries) have never been red.
+  Merging remains the PM's call.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh run view 30032174804 -> completed success (all four jobs)
+  $ gh api .../jobs/89291127138/logs:
+      PASS: all gates held — 1 passed in 1903.70s
+      gemma-burst ok=18 rejected=0 bursts=6 loading_retry=11
+      admission_rejects=0 x5 models; rej=0 on all 26 status lines
+      committed peak 3.67/3.90 GB; reservations peak 436 MB, uncovered 0.0
+      raw used over budget 13/162 worst +466 MB (recorded gap, unchanged)
+      llama 440/fp0 at all six checkpoints (sw 40 -> 2718)
+  ```
+- Next: PM ruling on merging PR #35 (both formerly blocking branches
+  closed; no further CI runs needed from this session).

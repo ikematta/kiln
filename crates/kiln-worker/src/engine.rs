@@ -150,6 +150,9 @@ pub struct Shared {
     pub ssd_reads_total: AtomicU64,
     pub ssd_writes_total: AtomicU64,
     pub ssd_fingerprint_rejects_total: AtomicU64,
+    /// SSD flush-queue depth as of the last engine tick (heartbeat
+    /// `flush_pending_blocks`; see the proto field's comment).
+    pub flush_pending_blocks: AtomicU64,
     /// Capability enum values advertised in `GetInfo` (set at startup
     /// from the cache flags; the engine thread may clear SSD_TIER if the
     /// store fails to open, adds GRAMMAR once the llguidance environment
@@ -223,6 +226,7 @@ impl Shared {
             ssd_reads_total: AtomicU64::new(0),
             ssd_writes_total: AtomicU64::new(0),
             ssd_fingerprint_rejects_total: AtomicU64::new(0),
+            flush_pending_blocks: AtomicU64::new(0),
             capabilities: std::sync::Mutex::new(capabilities),
             grammar: std::sync::OnceLock::new(),
             deterministic_decode_width: AtomicU32::new(0),
@@ -325,6 +329,11 @@ impl Shared {
             // counter, surfaced so the soak harness can watch it return
             // to baseline across the run (SPEC §11.3).
             mlx_live_objects: kiln_mlx::debug::live_objects(),
+            // Engine-published (per tick), so at most one tick stale
+            // relative to the fresh live_objects read above — stale in
+            // the safe direction: mid-capture the queue was nonzero at
+            // the tick that popped the block being captured.
+            flush_pending_blocks: self.flush_pending_blocks.load(Ordering::Acquire),
         }
     }
 
@@ -715,6 +724,9 @@ fn publish_stats(engine: &Engine<kiln_models::AnyModel>, shared: &Shared) {
     shared
         .ssd_fingerprint_rejects_total
         .store(cache.ssd_fingerprint_rejects_total, Ordering::Release);
+    shared
+        .flush_pending_blocks
+        .store(engine.pending_flush_blocks() as u64, Ordering::Release);
 }
 
 /// Maps a proto submission onto an engine request whose event sink speaks
