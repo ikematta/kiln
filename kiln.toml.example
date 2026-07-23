@@ -29,6 +29,12 @@ python_worker_argv = ["uv", "run", "--project", "python/kiln_worker_py", "python
 #jobs_argv = ["kiln-jobs"]
 # SQLite job store used by the spawned kiln-jobs server.
 jobs_db = "~/.kiln/jobs.sqlite"
+# Downloading gated/private Hugging Face repos (e.g. meta-llama/*): export
+# HF_TOKEN in the gateway's environment — the spawned kiln-jobs runner
+# inherits it and sends it as an Authorization header to the hub only.
+# Deliberately NOT a kiln.toml key: this file stores secrets only as argon2
+# hashes (see [auth]) and the hub needs the raw token, so it lives in the
+# environment and is never written to job state, logs, or error messages.
 
 [memory]
 # Fraction of unified memory the gateway may hand out across all workers.

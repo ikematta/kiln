@@ -7574,3 +7574,82 @@
   $ gh pr merge 36 --merge -> merged; origin/main head 26d5e93
   ```
 - Next: nothing scheduled — SPEC §12 remains complete.
+
+## [2026-07-23] Phase 9 follow-up / kiln-jobs — HF_TOKEN for gated/private hub downloads — PARTIAL
+- What:
+  - Finding first (the task): neither download path supported
+    authentication — no Authorization header, no token knob, anywhere in
+    scripts/fetch-test-model.sh or crates/kiln-jobs/src/hub.rs. A gated
+    repo (e.g. meta-llama/*) failed as a bare `HTTP 401 for <url>` with
+    no guidance. Where gating actually bites: the hub serves revision +
+    tree metadata of gated repos unauthenticated; the 401 hits on file
+    resolve (and, notably, mid-repo — LICENSE.txt is served,
+    USE_POLICY.md is not).
+  - hub.rs: `HubClient::from_env()` now also reads HF_TOKEN (trimmed,
+    ignored when empty) alongside the existing HF_ENDPOINT knob; new
+    `with_token()` attaches `Authorization: Bearer` (HeaderValue marked
+    sensitive) to every hub request — revision, tree (incl. pagination),
+    and file downloads. reqwest strips it on cross-host redirects, so the
+    signed CDN URLs the hub bounces to never see it. 401/403 now map to a
+    new fatal `HubError::Denied` whose hint is actionable and
+    token-aware: without a token it says to set HF_TOKEN (and accept the
+    repo license); with one it says the token was refused. The token
+    itself can never appear in errors, events, or job state (spec_json is
+    built before the client reads the env; runner comment pins that).
+  - fetch-test-model.sh: same pair of env knobs in the embedded Python —
+    Authorization on tree + file requests, a redirect handler that strips
+    the header when leaving the original host (urllib forwards it
+    otherwise), and the same actionable 401/403 exits. Public pins need
+    none of it; behavior without HF_TOKEN is byte-identical.
+  - kiln.toml.example + kiln-jobs docstring document the knob; the
+    gateway needs no change (it spawns kiln-jobs without env_clear, so a
+    token on the gateway reaches the runner).
+  - Tests (tests/download.rs): stub hub can now demand a bearer token,
+    record every Authorization header, and 302 file downloads to a
+    second different-port stub. Four new tests: token rides every hub
+    request and a "gated" download succeeds; no token → fatal Denied
+    naming HF_TOKEN, no retry; wrong token → "refused" hint that does NOT
+    contain the token; Authorization never follows a cross-host redirect.
+- Decisions:
+  - Env var only, deliberately no kiln.toml key and no --token flag:
+    kiln.toml stores secrets exclusively as argon2 hashes
+    (admin_token_hash) and the hub needs the raw token, so a config key
+    would mean plaintext at rest; a flag would leak into ps/shell
+    history. HF_TOKEN matches both the hf ecosystem convention and the
+    existing HF_ENDPOINT pattern in these two files.
+  - 401/403 fatal (no retry): access denial is not transport; retrying
+    burns the attempt budget and delays the actionable message.
+  - No proto change: DownloadSpec stays token-free by design — secrets
+    must not transit job specs or land in the SQLite store.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-jobs
+      13 passed (9 existing + 4 new download auth tests)
+  Real hub, gated repo, no token (kiln-jobs download meta-llama/Llama-3.2-1B):
+      {"event":"error","message":"HTTP 401 for .../USE_POLICY.md: this repo
+       may be gated or private — set HF_TOKEN to a Hugging Face access
+       token whose account has been granted access (gated repos also
+       require accepting the license on the repo page)"}   exit 1
+  Real hub, gated repo, invalid token: same shape, refused-token hint; the
+      scratch jobs.sqlite dump contains zero occurrences of the token.
+  Real hub, script (both edited request paths):
+      ./scripts/fetch-test-model.sh --only qwen3-0.6b-4bit -> verified
+        skips, exit 0 (CI shape, no token, unaffected)
+      extracted heredoc vs gated repo -> same actionable 401 exits
+      fresh public download via extracted heredoc -> done, exit 0
+  Real hub, ungated kiln-jobs download (tiny-random-LlamaForCausalLM),
+      no token -> done, exit 0 (CI shape unaffected)
+  Gates: fmt clean; clippy -D warnings clean (default + no-default
+      features); build --no-default-features clean; ruff check+format
+      clean; bash -n clean.
+  ```
+- Next: one acceptance item remains blocked — a real gated download
+  SUCCEEDING with a valid token. No valid HF credential exists on this
+  machine (~/.cache/huggingface tokens are expired OAuth: whoami -> 401;
+  no keychain entry). PM: `export HF_TOKEN=<token from a HF account with
+  the Llama license accepted>` then
+  `cargo run -p kiln-jobs -- download meta-llama/Llama-3.2-1B --dest /tmp/l32 --db /tmp/j.sqlite`
+  — expect plan/progress/done. The header-attachment mechanics that run
+  is meant to prove are already covered end-to-end by the stub tests
+  (real HTTP server observed the header on every request type).
