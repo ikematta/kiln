@@ -7146,3 +7146,76 @@
   - C: leave the gate as-is and re-roll on red (rejected by the P9
     precedent this gate descends from; dead at 1-green-in-4).
   No option picked.
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — instrumented CI soak: the +2 sample caught mid-flush-tail (fp380) — evidence CONFIRMED — DONE
+- What: the evidence-first branch of the refined DECISION NEEDED, as
+  ruled. Commit bab42d9 surfaces the engine's SSD write-behind
+  flush-queue depth through the heartbeat (additive proto
+  `MemoryReport.flush_pending_blocks = 10` → worker Shared atomic
+  published per engine tick → gateway gauge
+  `kiln_worker_flush_pending_blocks`) and prints it plus
+  `ssd_writes_total` beside every live-object value in the soak's
+  checkpoint table (`…/fpN/swN` cells). Print-only; no gate change.
+  Both fields ride the SAME heartbeat as the gated live sample, so a
+  +2 excursion is attributable at the instant it is read. (Process
+  note: bab42d9's own body accidentally contained the CI-skip token —
+  GitHub matches it anywhere in the head commit message — so 84c2f7f,
+  an empty commit, triggered the actual run.)
+- Evidence run 29980519514, llama-int column (`live/…/fp/sw`):
+  - Attempt 1 (soak FAILED on the precedented gemma-burst variance
+    gate only; live gate green): live 440 at ALL six checkpoints, BUT
+    fp at the gated sample instants read 0, 0, 133, 345, 397, 391 with
+    sw climbing 40 → 2350 — four of six gated samples taken with
+    133-397 blocks of flush work outstanding. Locally (same build,
+    2-min pipe validation): fp0 at every checkpoint. The CI backlog is
+    STANDING and grows across the run.
+  - Attempt 2 (soak PASSED — all gates held; the 442 below sat within
+    the interior allowance):
+    ```
+       t+1440s   442/1232.1/7.6/g0/fp380/sw1805
+         final   440/1232.1/1.4/g0/fp379/sw2331
+    ```
+    THE DIRECT OBSERVATION the 2026-07-23 root-cause entry named as
+    its honest residual: a +2 live-object sample paired in the same
+    heartbeat with 380 blocks mid-flush and captures in flight
+    (sw 1290 → 1805 → 2331 across the surrounding checkpoints) — and
+    drained back to 440 at the final sample while the backlog
+    persisted (fp379). Non-monotonic within one gen-0 process, again.
+    The contradiction branch (a 442 at fp0) has not occurred in any
+    observed run. NOTE: attempt 2's PASS is under the OLD sampling
+    semantics and is not claimed as the clean kernel-ON soak — that
+    comes under the corrected semantics (next entry), per the ruling
+    ("not a retry-until-green one").
+- Model correction forced by attempt 1's all-440 reads (then verified
+  by measurement): with fp≈390 pending, the root-cause session's ~90%
+  +2-read probability would make four consecutive floor reads
+  implausible. Resolution: the wrapper-holding window is only the READ
+  side of each flush cycle. Measured (debug build, llama geometry,
+  1 MiB payload, M4): read_block_bytes (2 wrappers alive) 6.81
+  ms/block vs Sha256 in enqueue_write (ZERO wrappers) 39.7 ms/block —
+  +2 duty ≈ 15% locally, lower on the runner's slower CPU. (The R6
+  harness's measured 89% was an artifact of its 4 KB mock payloads —
+  hash negligible there.) Numerically closed: expected +2 reads per
+  big-backlog gated sample ≈ 1-in-5-to-7; flag-ON history shows ~5 of
+  ~18 (dp#1 interior, dp#3 2-of-6, dp#5 2-of-6); attempt 1's 0-of-4
+  (p≈0.5) and attempt 2's 1-of-4 both sit inside the model. Slow CI
+  drain (sw deltas ≈ 1.5 blocks/s averaged) matches the
+  hash-dominated cycle in a debug build.
+- Verdict: the exclusion chain is now closed end-to-end by direct
+  observation — the +2 is the read_block_bytes capture pair sampled
+  mid-flush-backlog; kernel-ON's role is growing the backlog (more
+  novel blocks banked, pipelined turns capture 0); CI-only because the
+  dev machine drains its tail inside the settle while the runner
+  sustains minutes-scale standing backlogs.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh api .../jobs/89121138873(89121138887)/logs  attempt 1 table (fp 0,0,133,345,397,391; live all 440)
+  $ gh api .../jobs/89132867737/logs               attempt 2 table (t+1440s 442/fp380/sw1805; final 440/fp379; PASS)
+  $ ./scripts/soak.sh --minutes 2                  -> PASSED (pipe validation; fp/sw render; fp0 local)
+  $ cargo test -p kiln-gateway --lib               -> 94 passed (incl. new gauge needle)
+  $ fmt / clippy both shapes / ruff / build --no-default-features -> clean
+  (scratch, deleted) capture 6.81 ms/block; debug sha256 39.7 ms/block
+  ```
+- Next: land the ruled correction (i) — flush-idle checkpoint
+  sampling — and run the kernel-ON CI soak under it (next entry).
