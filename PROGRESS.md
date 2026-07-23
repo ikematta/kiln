@@ -7002,3 +7002,147 @@
   soaks after. Still the PM's call; no option picked.
 - Next: PM ruling. No further CI datapoints will be burned from this
   session (this commit is pushed with [skip ci]).
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — root-cause session: the +2 live-object signature is the P9 SSD-flush mid-copy transient being SAMPLED, not a leak — DONE (PR #35 disposition still awaits the PM ruling)
+- What (root-cause only; PR #35 and the flag default untouched):
+  - New permanent regression test `crates/kiln-engine/tests/paged_attn_leak.rs`
+    (~12 s, Metal-gated, single #[test] per the process-global counter
+    convention): drives the REAL engine with `paged_attention_kernel: true`
+    and a mock StepModel that routes every decode-shaped sampled row through
+    the real `PagedKv::paged_sdpa`, so the custom-kernel node and its
+    `PagedAttnInputs` pair (the exactly-+2-shaped suspect) are ancestors of
+    every pipelined sampled-token array — the production graph shape. It
+    enumerates every DISTINGUISHABLE cancel-observation window (the engine
+    reads the flag only at `pipeline_ok`, `settle_sampled`, and the sweep,
+    so all wall-clock timings collapse onto these): R1 flag-while-parked,
+    R2 flag flipped between build and apply of the same pipelined turn
+    (injected from an earlier row's on_event inside apply_inflight), R3
+    client-drop event-refusal, R4 length-finish at a pipelined apply with a
+    neighbor cancelled in the same window — each swept across depths, SSD
+    tier off and on. Result: live objects return EXACTLY to baseline after
+    every quiesce, every iteration.
+  - Hypothesis (a) (parked lazy sampled-token array retaining the step
+    graph / "orphaned pipeline row reaped only at next pipelined turn") is
+    ELIMINATED, twice over: (1) the counter (`kiln_worker_mlx_live_objects`
+    = kiln-mlx debug counter) counts RUST-SIDE wrapper handles, decremented
+    in Drop — mlx-internal graph retention cannot move it at all; (2) by
+    construction an InFlight row lives at most one step() call (taken at
+    entry; departed rows dropped in the same pipelined_turn's retain;
+    inflight non-empty ⇒ running non-empty ⇒ the serve loop cannot park),
+    confirmed by the R1-R5 sweeps returning bit-exact floors.
+  - Mechanism found and DEMONSTRATED (R6): the only wrapper-creating code
+    path on an idle-with-pending-flushes engine is `flush_entries` →
+    `read_block_bytes`, whose shadowed `rows` bindings (slice + contiguous)
+    hold EXACTLY 2 live objects for the duration of each block capture's
+    sync'd data read — the P9-characterized transient, at the exact
+    magnitude of the CI signature. R6 races an async sampler (the
+    heartbeat's shape: `memory_report()` reads the atomic fresh from the
+    gRPC thread) against a genuine post-cancel-burst flush drain:
+    8,514,161 samples during idle-flush ticks; max +2 over floor; floor+2
+    read 7,563,386 times (89%); floor immediately after the queue drains;
+    ZERO elevated reads post-drain. Both bounds are hard assertions: a
+    real parked leak fails the post-drain check, a third mechanism holding
+    more than the pair fails the ≤ +2 check.
+- CI-log corroboration (fetched from the actual failing jobs, not
+  recalled — runs 29936108761 (dp#3) and 29967425675 (dp#5)):
+  - dp#3's llama series is NON-MONOTONIC within one generation-0 process:
+    440, 440, 442 (t+1088s), 440 (t+1440s), 442 (final). A parked-wrapper
+    leak cannot return to floor and reappear. dp#5 (440 ×4, 442 at
+    t+1445s, 442 final) is two catches, not one persistent state.
+  - Every 442 sits exactly where the soak SYNCHRONIZES flush work with
+    sampling: each checkpoint's `gate.clear()` aborts in-flight streams
+    (cancel burst → donations → novel-block flush enqueues), the final
+    checkpoint follows the drain-abort burst, and the single sample lands
+    only ~6 s later. llama ssd_writes 2531/2485 per run = novel-content
+    flush traffic sustained to the end.
+  - dp#5 sampled burst-gemma at 792 live vs its 740 floor at t+1445s —
+    quiesced checkpoints demonstrably catch worker-INTERNAL activity; the
+    180 s busy-wait covers client runners only.
+- Why CI-only and why kernel-correlated (measured, then arithmetic):
+  - Measured capture cost at REAL llama-3.2-1b geometry (16 layers, 8
+    kv-heads, head-dim 64, block 32, f16; 1 MiB payload, 32 sync'd evals
+    per block), debug build on the M4 dev machine: 6.81 ms/block
+    (scratch harness, deleted after measurement; output in acceptance).
+    Worker idle-flush tick = 2 ms recv_timeout + FLUSH_BATCH(=2) captures
+    → ~87% of tick wall-time is spent inside a capture, matching R6's
+    measured 89% sampling probability.
+  - Pipelined turns call `cache_io_tick(0)` — captures NEVER run during
+    steady pipelined decode, so busy intervals BANK flush backlog that
+    drains exactly during quiesce. Kernel-ON (1.46-1.54x decode) banks
+    ~1.5x more novel blocks per interval and pipelines a larger fraction
+    of steps; the macos-14 virtualized M1 runner multiplies per-block
+    capture cost on top. On the dev machine even the ENTIRE 537-block
+    llama pool drains in ≤ ~4.2 s < the 6 s settle — a local sample
+    structurally cannot land mid-tail (why no local soak, including the
+    2026-07-22 kernel-ON 30-min PASS, ever catches it). On CI a modest
+    banked backlog outlives 6 s, and any sample inside the tail reads
+    floor+2 with ~0.9 probability. Flag-OFF history fits: the P9 closeout
+    itself recorded interior "+2 that DRAINED" excursions flag-OFF; the
+    smaller flag-OFF backlogs simply never landed on a group-final sample
+    in ~20 runs (and dp#1's interior +2 drained the same way).
+- Verdict, in the ledger's terms: hypothesis (a) WRONG; hypothesis (b)
+  CORRECT in refined form — no leak, no mistimed flush: the checkpoint
+  samples the bounded, already-characterized read_block_bytes mid-copy
+  pair because checkpoint-synchronized abort bursts + pipelining-banked
+  backlog + slow-runner capture cost stretch the post-burst flush tail
+  past the soak's fixed 6 s settle. The P9 gate's own allowance (interior
+  excursions ≤ 8, floor at group-final) already names this transient;
+  kernel-ON broke its implicit assumption that the tail cannot reach a
+  final sample on CI hardware.
+- Honest residual: the failing runs' logs do not record flush-queue state
+  at the sample instants, so the attribution there is by exclusion +
+  demonstrated mechanism + arithmetic (every leak-shaped alternative is
+  eliminated locally, and dp#3's non-monotonicity eliminates them on CI
+  independently), not by a direct observation at those two instants. One
+  instrumentation-only soak run would close even that (option below).
+- Decisions: repro test committed as a permanent gate (fails on any
+  parked-wrapper leak in the cancel/quiesce family and on any idle-window
+  mechanism holding > 2 objects). No engine code changed — nothing is
+  broken in the Phase 7 kernel plumbing or the Phase 9 machinery. The
+  soak was NOT touched: re-timing or re-sampling its checkpoint is a
+  gate-semantics change in exactly the class the standing DECISION
+  NEEDED's Option B names, and that ruling is the PM's (never weaken a
+  test unilaterally).
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-engine --test paged_attn_leak -- --nocapture
+  R6 iter 0: flush backlog drained in 8 ticks / 24.3 ms (<= 2 block captures per tick)
+  R6 iter 1-3: 9 ticks / ~29 ms each
+  R6: 8514161 async samples during idle-flush ticks; max +2 over floor;
+      floor+2 read 7563386 times (the CI checkpoint signature, sampled
+      live, with zero leak)
+  all cancel windows quiesced at baseline (kernel path in-graph)
+  test pipelined_cancel_quiesce_returns_live_objects_to_baseline ... ok (12.40s)
+  $ (scratch, deleted) read_block_bytes at llama geometry
+  llama-geometry capture: 6.81 ms/block (16 blocks in 108.9 ms; payload
+      1 MiB/block, 32 sync'd evals/block)
+  $ cargo test -p kiln-engine        -> all suites ok (incl. new test)
+  $ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings  -> clean
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings       -> clean
+  ```
+- Next: PM ruling on the refined DECISION NEEDED below; on a ruling, a
+  dedicated session implements it and re-runs kernel-ON soaks; PR #35
+  merges on green.
+- DECISION NEEDED (refines the 2026-07-22 PR #35 disposition, live-object
+  branch; the dp#1 committed-budget branch is unchanged): the live-object
+  reds are a sampling artifact of a bounded, characterized transient —
+  not a leak, not kernel incorrectness. Options:
+  - A (recommended): rule a gate-semantics correction in the same class
+    as the P9 py-smollm slope correction — the checkpoint's live-object
+    sample must be flush-idle to be gate-eligible. Concrete shapes (any
+    one suffices; all keep the floor bar bit-exact for real leaks, since
+    a parked wrapper elevates EVERY sample including flush-idle ones):
+    (i) surface "cache io pending" in the heartbeat (additive
+    WorkerStats/Health field — proto-additive is allowed) and have the
+    soak wait for it to clear before sampling; (ii) double-sample each
+    checkpoint a few seconds apart and gate on the minimum; (iii) record
+    per-checkpoint ssd_writes_total and disqualify live samples whose
+    surrounding write-delta is nonzero.
+  - B (evidence-first variant of A): land an instrumentation-only change
+    (log flush-pending + ssd_writes at each sample; no gate change), burn
+    one CI soak to observe the coincidence directly on the runner, then
+    rule A with the direct observation in hand.
+  - C: leave the gate as-is and re-roll on red (rejected by the P9
+    precedent this gate descends from; dead at 1-green-in-4).
+  No option picked.
