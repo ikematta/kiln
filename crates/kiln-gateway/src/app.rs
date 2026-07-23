@@ -99,7 +99,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // (SPEC §8.1); operators exposing it terminate auth upstream. The
         // /ui shell is static code — all data behind it rides the
         // bearer-gated /admin API above.
-        .route("/ui", get(crate::ui::index))
+        .route("/ui", get(crate::ui::redirect_to_slash))
         .route("/ui/", get(crate::ui::index))
         .route("/ui/{*path}", get(crate::ui::asset))
         .route("/healthz", get(healthz))

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import subprocess
 
 import httpx
@@ -278,3 +279,55 @@ def test_ui_shell_is_served_embedded():
         assert response.status_code == 200
         assert "text/html" in response.headers["content-type"]
         assert "Kiln Admin" in response.text
+
+
+def shell_asset_links(html: str) -> list[str]:
+    """Every asset URL the shell references (modulepreload/stylesheet
+    hrefs and dynamic-import specifiers — SvelteKit emits them all as
+    ./_app/... relative links)."""
+    links = re.findall(r'(?:href|src)="([^"]+)"', html)
+    links += re.findall(r'import\("([^"]+)"\)', html)
+    return [link for link in links if "_app/" in link]
+
+
+def test_ui_no_trailing_slash_full_chain():
+    """Regression (blank-page bug): GET /ui without the trailing slash
+    must redirect to /ui/ BEFORE the shell is served. The shell's asset
+    links are relative (./_app/...), so a document served at bare /ui
+    resolves them to /_app/... — every asset 404s and the page renders
+    blank. Verify the whole chain, not just the redirect status: follow
+    the redirect, land on /ui/, then fetch every asset the shell links,
+    resolved exactly as a browser would against the final document URL —
+    each must genuinely 200."""
+    with running_stack([]) as stack:
+        stack.wait_ready()
+        # The redirect itself: permanent, to /ui/ (relative links resolve
+        # only under the slashed URL).
+        bare = httpx.get(f"{stack.base_url}/ui", timeout=10)
+        assert bare.status_code == 308, bare.status_code
+        assert bare.headers["location"] == "/ui/"
+
+        # The full chain a browser walks: /ui -> /ui/ -> shell -> assets.
+        page = httpx.get(f"{stack.base_url}/ui", follow_redirects=True, timeout=10)
+        assert page.status_code == 200
+        assert str(page.url).endswith("/ui/")
+        assert "text/html" in page.headers["content-type"]
+        links = shell_asset_links(page.text)
+        assert links, f"shell references no assets? {page.text[:500]}"
+        for link in links:
+            resolved = page.url.join(link)
+            asset = httpx.get(str(resolved), timeout=10)
+            assert asset.status_code == 200, (
+                f"{link} -> {resolved}: {asset.status_code}"
+            )
+
+        # Negative control — proof this test catches the original bug:
+        # the same links resolved against un-redirected bare /ui (what a
+        # browser does when the shell is served there directly) point at
+        # /_app/... and do NOT resolve.
+        for link in links:
+            broken = httpx.URL(f"{stack.base_url}/ui").join(link)
+            assert "/_app/" in broken.path and not broken.path.startswith("/ui/"), (
+                broken
+            )
+            assert httpx.get(str(broken), timeout=10).status_code == 404, broken

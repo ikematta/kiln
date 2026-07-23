@@ -12,9 +12,9 @@
 //! static gateway binary". A checkout that never ran `npm --prefix admin
 //! run build` gets a 503 naming that command instead of a bare 404.
 
-use axum::extract::Path;
+use axum::extract::{Path, RawQuery};
 use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use rust_embed::Embed;
 
 #[derive(Embed)]
@@ -55,7 +55,19 @@ fn serve(path: &str) -> Response {
         .into_response()
 }
 
-/// `GET /ui` and `GET /ui/`: the prerendered shell.
+/// `GET /ui` (no trailing slash): 308 to `/ui/`. The shell's asset links
+/// are relative (`./_app/...`), so they only resolve to `/ui/_app/...`
+/// when the document URL ends in a slash — served directly at `/ui` the
+/// browser requests `/_app/...`, every asset 404s, and the page renders
+/// blank. Redirecting before serving is the fix, not an optimization.
+pub async fn redirect_to_slash(RawQuery(query): RawQuery) -> Redirect {
+    match query {
+        Some(query) => Redirect::permanent(&format!("/ui/?{query}")),
+        None => Redirect::permanent("/ui/"),
+    }
+}
+
+/// `GET /ui/`: the prerendered shell.
 pub async fn index() -> Response {
     serve("index.html")
 }
@@ -102,6 +114,38 @@ mod tests {
         assert!(
             response.status() == StatusCode::NOT_FOUND
                 || response.status() == StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// /ui without the trailing slash must redirect, never serve the
+    /// shell in place: the shell's relative asset links only resolve
+    /// under /ui/. (The full chain — redirect followed, assets fetched —
+    /// is asserted by the e2e regression test.)
+    #[tokio::test]
+    async fn ui_bare_redirects_to_slash() {
+        let response = redirect_to_slash(RawQuery(None)).await.into_response();
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/ui/")
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_bare_redirect_preserves_query() {
+        let response = redirect_to_slash(RawQuery(Some("a=1&b=2".into())))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/ui/?a=1&b=2")
         );
     }
 }
