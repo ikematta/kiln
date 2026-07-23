@@ -7219,3 +7219,80 @@
   ```
 - Next: land the ruled correction (i) — flush-idle checkpoint
   sampling — and run the kernel-ON CI soak under it (next entry).
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — flush-idle sampling landed and proven; live-object branch CLOSED; the admission-pressure branch now blocks alone — DONE (correction) / BLOCKED (flip, on the Phase 9 branch)
+- What (commit 8d9ada5): the ruled correction (i), landed on the
+  confirmed evidence. Quiesced checkpoints take the gated live-object
+  sample FLUSH-IDLE: `sample_flush_idle()` polls every 2 s until every
+  rust worker's `kiln_worker_flush_pending_blocks` reads 0 in the SAME
+  scrape that supplies the gated `live` value; wired into `quiesce()`
+  and the final checkpoint; bounded by FLUSH_IDLE_DEADLINE_S = 240
+  (sized from the observed 397-block backlogs at a few blocks/s drain),
+  and on expiry the last scrape is used unchanged with the stuck depths
+  printed — a wedged queue is not a bypass. NOT changed: floors,
+  LIVE_TRANSIENT_ALLOWANCE, return-to-floor at group-final, the 180 s
+  busy-wait, the 6 s settle. Measurement correction in the P9
+  py-smollm-slope class, not a bar change.
+- Gate-sensitivity proof (the corrected gate still catches a real
+  leak): temporary UNCOMMITTED patch — `std::mem::forget(...)` ×2 on
+  `FinishKind::Cancelled` in kiln-engine `finish()` (+2 per cancel,
+  flush-independent) — local 20-min soak under corrected sampling
+  FAILED exactly as required, monotonic +140:
+  ```
+  mlx live objects did not return to baseline for llama-int (gen 0, pool 537MB):
+  [('baseline', 440.0), ('t+309s', 472.0), ('t+607s', 524.0),
+   ('t+906s', 552.0), ('final', 580.0)] (floor 440)
+  (+ the allowance-8 excursion gate fired on the same series)
+  ```
+  Patch reverted; tree clean; kiln-worker rebuilt; paged_attn_leak.rs
+  green again (11.61 s).
+- Corrected-semantics kernel-ON CI soak (run 30018908142, macos-14):
+  - The LIVE-OBJECT GATE IS GREEN with the defect visibly gone: llama
+    440 at ALL six gated samples with fp0 at every one (sw climbed
+    630 → 2753 between checkpoints — heavy flush traffic drained
+    BEFORE each sample instead of under it); spec 1404 at warm
+    checkpoints; gemma 740 final. No flush-idle deadline expiries.
+  - The RUN still FAILED — honestly reported, and not the live gate:
+    one gemma burst never recovered to a 200 within 180 s (t+938.8s;
+    counted twice by the harness: hard error + derived count).
+    Characterized from the run's own 10 s samples: an
+    ADMISSION-PRESSURE window, not a load flake — at t+907 `used`
+    exceeded the budget (4.08 vs 3.90 GB) with ALL FOUR rust models
+    resident, gateway rejects climbing 7 → 24 → 27 across exactly the
+    failure window (and the same shape recurred at t+1569: used 4.08,
+    rej 37 → 51, with that burst surviving). This is datapoint #1's
+    committed/drain-overlap territory (Phase 9 memory governance under
+    kernel-shifted TTL/reload interleavings), now at 3-of-7 kernel-ON
+    soaks (t+717.6s / t+951.6s / t+938.8s) vs 1-of-~20 flag-OFF —
+    kernel-correlated by the same standard this ledger applied to the
+    live-object signature, and NOT further re-rolled from this session.
+- Where this leaves PR #35 (for the PM ruling):
+  - CLOSED: the live-object branch — root-caused (2026-07-23 entries),
+    directly observed (442 paired with fp380), corrected (flush-idle
+    sampling), the correction proven leak-sensitive (injected-leak
+    FAIL), and green on the runner under corrected semantics.
+  - OPEN and now blocking alone: the admission-pressure branch — the
+    dp#1 drain-overlap-vs-pricing-gap fork, unresolved by design in
+    these sessions (closed Phase 9 machinery; the original DECISION
+    NEEDED's Option A root-cause item). The kernel's role remains
+    timing exposure, not correctness: every kernel-specific gate has
+    been green in all seven kernel-ON soaks.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ uv run --project python/kiln_worker_py ruff check / format --check tests/e2e -> clean
+  $ ./scripts/soak.sh --minutes 2   -> PASSED (corrected sampling path, local)
+  $ ./scripts/soak.sh --minutes 20  (with temp injected leak) -> FAILED floor gate (series above)
+  $ gh api .../jobs/89246140565/logs (run 30018908142):
+      llama-int checkpoints: 440/.../fp0 at baseline, t+368s, t+730s,
+      t+1089s, t+1447s, final — live gate green, corrected semantics
+      verdict: FAIL: 2 gate(s) violated  (both = the one gemma burst, t+938.8s)
+  ```
+- Next: PM ruling with two decoupled questions: (1) accept the
+  live-object branch as closed (evidence above); (2) disposition of
+  the admission-pressure branch — a dedicated root-cause session on
+  the Phase 9 drain-overlap/pricing question (the original dp#1
+  Option A work) before the flip re-merges, or an explicit ruling that
+  the burst gate's 180 s recovery bar is a deployment-shape question
+  separable from the flip. No option picked; no further CI runs burned
+  from this session.
