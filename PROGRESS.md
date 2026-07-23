@@ -6960,3 +6960,45 @@
   root-cause fork already written there. No option picked.
 - Next: the PM ruling (previous entry). This push adds CI soak
   datapoint #4 to the record for it.
+
+## [2026-07-23] Phase 7 follow-up / PR #35 — CI soak datapoint #5: the +2 signature repeats and persists — BLOCKED
+- Run 29967425675 (10a0a3d, fourth kernel-ON CI soak): FAIL, same gate
+  as datapoint #3 — llama-int live objects 442 vs floor 440 — but with
+  a sharper shape: 440 at baseline/t+369/t+720/t+1085, then 442 at
+  t+1445 AND final. Late-appearing and PERSISTENT, not a transient the
+  final sample happened to catch.
+- Aggregate: CI kernel-ON soaks now 1 green / 3 red; the last two reds
+  on the IDENTICAL gate and +2 end-state signature (plus one interior
+  +2 that drained, datapoint #1's run). Flag-OFF post-fix CI history:
+  this gate never failed in ~20 runs. Local kernel-ON 30-min soak:
+  clean floors at every checkpoint. Conclusion: a kernel-ON-correlated,
+  CI-runner-manifesting end-of-run residue of exactly 2 mlx objects —
+  no longer classifiable as the soak's pre-existing dice windows.
+- Correction to datapoint #3's note: "kernel-path retention ruled out
+  by inspection" was too strong. What inspection rules out: SeqStep and
+  the parked pipeline InFlight directly holding PagedAttnInputs, and
+  late JIT of kernel HANDLES (all three are built eagerly in
+  PagedAttn::new -> inside the baseline). What remains open, with the
+  suggestive fact that PagedAttnInputs is EXACTLY two arrays (table +
+  context_len_arr): graph-level retention — a parked still-lazy
+  sampled-token array retains its upstream step graph, including the
+  kernel's input arrays, across an idle/cancel window (the soak runs
+  80-93 cancels; an orphaned pipeline row is only reaped at the NEXT
+  pipelined turn) — or an SSD-flush-path interaction shifted by kernel
+  timing. Why flag-OFF stays clean and why it never reproduces locally
+  (device-class dispatch differences, timing) is exactly what the
+  root-cause must explain; CI-shaped instrumentation (live-object
+  breakdown by type, or a targeted pipelined-cancel-quiesce repro) is
+  likely required.
+- Sharpened recommendation into the standing DECISION NEEDED: Option C
+  (dice) is dead at 1-green-in-4. For the live-object gate, Option B's
+  "gate semantics" branch is WEAKENED: the signature is kernel-
+  correlated, so treating it as gate noise is not currently
+  defensible. Recommended: Option A — hold PR #35; a dedicated session
+  root-causes (1) the +2 end-of-run residue in the Phase 7 kernel
+  plumbing (kiln-engine paged_attn/engine pipeline — Phase 7 code, not
+  closed Phase 9 machinery) and (2) the committed-gate drain-overlap
+  question from datapoint #1; the flip re-merges on green kernel-ON
+  soaks after. Still the PM's call; no option picked.
+- Next: PM ruling. No further CI datapoints will be burned from this
+  session (this commit is pushed with [skip ci]).
