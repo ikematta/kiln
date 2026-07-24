@@ -408,7 +408,7 @@ mod tests {
             registrar,
             shutdown: tokio::sync::watch::channel(false).1,
         });
-        app::router(state)
+        app::router(state, crate::cors::layer(&config.server))
     }
 
     fn admin_hash() -> String {

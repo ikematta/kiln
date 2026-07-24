@@ -46,7 +46,7 @@ pub struct AppState {
 #[derive(Debug, Clone)]
 pub struct RequestId(pub String);
 
-pub fn router(state: Arc<AppState>) -> Router {
+pub fn router(state: Arc<AppState>, cors: Option<tower_http::cors::CorsLayer>) -> Router {
     // Layer order (route_layer wraps: last added runs first): auth runs
     // before the rpm limiter, which needs the RateLimitHandle auth stamps
     // onto the request. tpm is enforced inside the handlers, where
@@ -108,7 +108,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             crate::auth::require_admin,
         ));
 
-    Router::new()
+    let router = Router::new()
         .merge(api)
         .merge(anthropic_api)
         .merge(admin)
@@ -121,7 +121,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui/{*path}", get(crate::ui::asset))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics_endpoint))
+        .route("/metrics", get(metrics_endpoint));
+    // CORS sits inside observe (added earlier = inner) but outside the
+    // auth route_layers: a browser preflight OPTIONS carries no
+    // credentials and must be answered before auth, while still getting
+    // a request id and an http_requests_total sample. None (the default)
+    // leaves the router without any CORS machinery (crate::cors docs).
+    let router = match cors {
+        Some(cors) => router.layer(cors),
+        None => router,
+    };
+    router
         .layer(middleware::from_fn_with_state(Arc::clone(&state), observe))
         .with_state(state)
 }

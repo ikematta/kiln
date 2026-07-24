@@ -35,6 +35,15 @@ jobs_db = "~/.kiln/jobs.sqlite"
 # Cancel path and the client gets a 504 `timeout_error`.
 #ttft_timeout_secs = 120     # arrival → first generated token
 #total_timeout_secs = 600    # arrival → last token (must be >= ttft)
+# Browser clients (CORS, SPEC §8.3). Default: the gateway sends NO CORS
+# headers, so cross-origin browser JS cannot call it — non-browser clients
+# and same-origin pages (the /ui dashboard) are unaffected. List exact
+# origins (scheme://host[:port], no trailing slash or path — matched
+# against the browser's Origin header) to opt them into cross-origin
+# access, e.g. a local dev server. "*" (alone) allows any origin — an
+# explicit choice, never the default. Preflights are answered before auth;
+# allowed methods/headers mirror what the preflight asks for.
+#cors_origins = ["http://localhost:5173"]
 # Downloading gated/private Hugging Face repos (e.g. meta-llama/*): export
 # HF_TOKEN in the gateway's environment — the spawned kiln-jobs runner
 # inherits it and sends it as an Authorization header to the hub only.

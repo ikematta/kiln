@@ -65,6 +65,10 @@ axum = "0.8"
 # 413 instead of a generic 400 (SPEC §8.3 request size limits). MIT.
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+# Already in-tree transitively via reqwest; SPEC §3 names it for CORS. Only
+# the `cors` feature is enabled: the gateway's opt-in browser-origin
+# allowlist (server.cors_origins, SPEC §8.3). MIT.
+tower-http = { version = "0.6", features = ["cors"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

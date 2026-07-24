@@ -85,6 +85,14 @@ pub struct ServerConfig {
     /// the terminal event. Absent = disabled.
     #[serde(default)]
     pub total_timeout_secs: Option<u64>,
+    /// CORS allowlist for browser clients (SPEC §8.3): exact origins
+    /// (`scheme://host[:port]`, matched against the browser's `Origin`
+    /// header), or the single entry `"*"` for wildcard. Empty (the
+    /// default) = the gateway sends no CORS headers at all, so
+    /// cross-origin browser JS is blocked; non-browser clients are
+    /// unaffected either way (crate::cors module docs).
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -298,6 +306,27 @@ impl KilnConfig {
             ));
         }
 
+        // CORS (SPEC §8.3): entries are matched byte-for-byte (after
+        // ASCII-lowercasing) against the browser's `Origin` header, which
+        // is always `scheme://host[:port]` — a trailing slash or path can
+        // never match and would silently allow nothing, so it is a config
+        // error, not a silent surprise. "*" must stand alone: mixing a
+        // wildcard with specific origins is certainly a mistake.
+        if self.server.cors_origins.iter().any(|o| o == "*") && self.server.cors_origins.len() > 1 {
+            return invalid(
+                "server.cors_origins: \"*\" allows every origin and must be the only entry".into(),
+            );
+        }
+        for origin in &self.server.cors_origins {
+            if origin != "*" && !valid_cors_origin(origin) {
+                return invalid(format!(
+                    "server.cors_origins: '{origin}' is not an origin; use \
+                     scheme://host[:port] with no trailing slash or path \
+                     (e.g. \"http://localhost:5173\"), or \"*\" alone"
+                ));
+            }
+        }
+
         let mut seen_keys = std::collections::HashSet::new();
         for key in &self.auth.api_keys {
             // Rate limits (SPEC §8.3): zero would build a bucket that can
@@ -351,6 +380,29 @@ impl KilnConfig {
     }
 }
 
+/// `scheme://host[:port]` and nothing else — the shape a browser sends as
+/// `Origin`. Any scheme is accepted (Tauri apps on macOS present
+/// `tauri://localhost`); `/`, `?`, `#`, whitespace, and non-ASCII in the
+/// host part are rejected, which also guarantees the value is a valid
+/// HTTP header value for the CORS layer.
+fn valid_cors_origin(origin: &str) -> bool {
+    let Some((scheme, host)) = origin.split_once("://") else {
+        return false;
+    };
+    let scheme_ok = scheme
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    let host_ok = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '/' | '?' | '#'));
+    scheme_ok && host_ok
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -365,6 +417,7 @@ impl Default for ServerConfig {
             jobs_db: defaults::jobs_db(),
             ttft_timeout_secs: None,
             total_timeout_secs: None,
+            cors_origins: Vec::new(),
         }
     }
 }
@@ -663,6 +716,51 @@ mod tests {
             jail.set_env("KILN_SERVER__TTFT_TIMEOUT_SECS", "5");
             let config = KilnConfig::load("kiln.toml").expect("env override applies");
             assert_eq!(config.server.ttft_timeout_secs, Some(5));
+            Ok(())
+        });
+    }
+
+    /// SPEC §8.3 CORS: an entry the browser's `Origin` header can never
+    /// equal (trailing slash, path, missing scheme) would silently allow
+    /// nothing — reject it up front with a message naming the shape. "*"
+    /// is legal only alone.
+    #[test]
+    fn cors_origin_validation() {
+        figment::Jail::expect_with(|jail| {
+            for bad in [
+                r#"[server]\ncors_origins = ["http://localhost:5173/"]"#,
+                r#"[server]\ncors_origins = ["http://localhost:5173/app"]"#,
+                r#"[server]\ncors_origins = ["localhost:5173"]"#,
+                r#"[server]\ncors_origins = ["null"]"#,
+                r#"[server]\ncors_origins = [""]"#,
+                r#"[server]\ncors_origins = ["http:// bad.example"]"#,
+                r#"[server]\ncors_origins = ["*", "http://localhost:5173"]"#,
+            ] {
+                jail.create_file("kiln.toml", &bad.replace("\\n", "\n"))?;
+                let err = KilnConfig::load("kiln.toml").unwrap_err();
+                assert!(matches!(err, ConfigError::Invalid(_)), "{bad}");
+            }
+
+            jail.create_file(
+                "kiln.toml",
+                "[server]\ncors_origins = [\n\
+                 \"http://localhost:5173\",\n\
+                 \"https://example.com\",\n\
+                 \"http://127.0.0.1:8080\",\n\
+                 \"tauri://localhost\",\n]\n",
+            )?;
+            let config = KilnConfig::load("kiln.toml").expect("valid origins parse");
+            assert_eq!(config.server.cors_origins.len(), 4);
+
+            // Wildcard: explicit opt-in, alone.
+            jail.create_file("kiln.toml", "[server]\ncors_origins = [\"*\"]\n")?;
+            let config = KilnConfig::load("kiln.toml").expect("lone wildcard parses");
+            assert_eq!(config.server.cors_origins, vec!["*"]);
+
+            // Default: empty — no CORS headers at all.
+            jail.create_file("kiln.toml", "")?;
+            let config = KilnConfig::load("kiln.toml").expect("default valid");
+            assert!(config.server.cors_origins.is_empty());
             Ok(())
         });
     }
