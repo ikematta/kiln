@@ -7653,3 +7653,35 @@
   — expect plan/progress/done. The header-attachment mechanics that run
   is meant to prove are already covered end-to-end by the stub tests
   (real HTTP server observed the header on every request type).
+
+## [2026-07-23] Phase 9 follow-up / kiln-jobs — HF_TOKEN acceptance completed (gated download with a real token) — DONE
+- What: closes the single PARTIAL item from the previous entry. PM
+  supplied a read token (account `ikematta`) and accepted the Gemma
+  license; the real gated download now verified end-to-end through
+  `kiln-jobs download google/gemma-3-1b-it` (2.04 GB, 8 files, LFS
+  weights sha256-verified through the hub→CDN redirect). Paired
+  negative on the SAME repo: without the token the identical command
+  fails with the actionable HF_TOKEN hint, exit 1. Post-run secrecy
+  audit: zero occurrences of the token in the SQLite job store dump and
+  in the emitted event stream. No code changes in this entry.
+- Decisions: gemma-3-1b-it over meta-llama for the acceptance repo —
+  the PM's account grant was instant (Meta approval queues) and the repo
+  is 2 GB not 5 GB; both exercise the same gated 401→Bearer path.
+- Deviations: none.
+- Acceptance:
+  ```
+  Real hub, google/gemma-3-1b-it (gated), no token:
+      {"event":"error","message":"HTTP 401 for .../added_tokens.json:
+       this repo may be gated or private — set HF_TOKEN ..."}   exit 1
+  Real hub, same repo, valid HF_TOKEN set:
+      {"event":"plan","repo":"google/gemma-3-1b-it","revision":"dcc83ea8...",
+       "files":8,"total_bytes":2039043660}
+      ... {"event":"done","dest":".../gemma-gated"}              exit 0
+      .kiln-revision -> google/gemma-3-1b-it@dcc83ea841ab...
+  Token-secrecy audit:
+      sqlite3 jobs.sqlite .dump | grep -c <token>  -> 0
+      grep -c <token> event log                    -> 0
+  ```
+- Next: PR #37 carries the full change; acceptance is now complete on
+  every axis of the task. PM ruling on merge after CI. (The pasted
+  token should be revoked and reissued — it transited chat.)
