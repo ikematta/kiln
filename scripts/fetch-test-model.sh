@@ -7,6 +7,9 @@
 # The revisions below are FROZEN (CLAUDE.md). Bumping one invalidates every
 # golden fixture generated against it; do not change without instruction.
 #
+# Env: HF_ENDPOINT overrides the hub (mirrors/tests); HF_TOKEN authenticates
+# gated/private repos (unneeded for the public pins below; never printed).
+#
 # Usage:
 #   ./scripts/fetch-test-model.sh              # fetch all pinned models
 #   ./scripts/fetch-test-model.sh --only llama-3.2-1b-4bit [--only ...]
@@ -87,19 +90,64 @@ import pathlib
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 repo, rev, dest = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
 marker = dest / ".kiln-revision"
 
 SKIP_PREFIXES = (".", "README")
-# Standard hub override knob (mirrors; the stall tests point it at a local
-# misbehaving server). Default is the real hub — pins stay frozen either way.
+# Standard hub override knobs (same pair the kiln-jobs downloader honors):
+# HF_ENDPOINT repoints the hub (mirrors; the stall tests point it at a local
+# misbehaving server — pins stay frozen either way) and HF_TOKEN
+# authenticates gated/private repos. The token rides requests to the hub
+# host only — the redirect handler below strips it when the hub bounces us
+# to a different-host signed CDN URL — and is never printed.
 ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+TOKEN = os.environ.get("HF_TOKEN", "").strip()
 UA = {"User-Agent": "kiln-fetch-test-model"}
 STALL_TIMEOUT_S = 30  # no bytes on the socket for this long = dead connection
 MAX_ATTEMPTS = 4
 RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
+
+
+class AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Authorization must not follow a redirect off the original host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None:
+            old_host = urllib.parse.urlsplit(req.full_url).netloc
+            if urllib.parse.urlsplit(new.full_url).netloc != old_host:
+                new.remove_header("Authorization")
+        return new
+
+
+OPENER = urllib.request.build_opener(AuthStrippingRedirectHandler)
+
+
+def request_headers() -> dict:
+    headers = dict(UA)
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+    return headers
+
+
+def denied(code: int, url: str) -> None:
+    """Actionable 401/403 exit; never prints the token."""
+    if TOKEN:
+        hint = (
+            "the HF_TOKEN provided was refused — check that it is valid and "
+            "that its account has been granted access (gated repos also "
+            "require accepting the license on the repo page)"
+        )
+    else:
+        hint = (
+            "this repo may be gated or private — set HF_TOKEN to a Hugging "
+            "Face access token whose account has been granted access (gated "
+            "repos also require accepting the license on the repo page)"
+        )
+    sys.exit(f"HTTP {code} for {url}: {hint}")
 
 
 def backoff(attempt: int) -> None:
@@ -120,10 +168,12 @@ def fetch_json(url: str):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         backoff(attempt)
         try:
-            req = urllib.request.Request(url, headers=UA)
-            with urllib.request.urlopen(req, timeout=STALL_TIMEOUT_S) as resp:  # noqa: S310
+            req = urllib.request.Request(url, headers=request_headers())
+            with OPENER.open(req, timeout=STALL_TIMEOUT_S) as resp:  # noqa: S310
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                denied(e.code, url)
             if e.code not in RETRYABLE_HTTP:
                 sys.exit(f"HTTP {e.code} for {url}")
             last = e
@@ -145,12 +195,12 @@ def download(url: str, out: pathlib.Path, size: int, lfs_sha) -> None:
                 part.unlink()
                 offset = 0
             if offset < size:
-                headers = dict(UA)
+                headers = request_headers()
                 if offset:
                     print(f"    resuming {out.name} at {offset / 1e6:.1f} MB", flush=True)
                     headers["Range"] = f"bytes={offset}-"
                 req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=STALL_TIMEOUT_S) as resp:  # noqa: S310
+                with OPENER.open(req, timeout=STALL_TIMEOUT_S) as resp:  # noqa: S310
                     if offset and resp.status != 206:
                         offset = 0  # server ignored the Range; restart
                     with part.open("ab" if offset else "wb") as f:
@@ -169,6 +219,8 @@ def download(url: str, out: pathlib.Path, size: int, lfs_sha) -> None:
             part.replace(out)
             return
         except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                denied(e.code, url)
             if e.code == 416:  # resume window refused; start over
                 part.unlink(missing_ok=True)
             elif e.code not in RETRYABLE_HTTP:

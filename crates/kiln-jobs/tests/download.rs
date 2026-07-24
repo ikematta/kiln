@@ -65,22 +65,65 @@ struct StubState {
     resolve_requests: Mutex<Vec<Option<String>>>,
     /// 503s to serve on the tree endpoint before succeeding.
     tree_failures: AtomicU32,
+    /// When set, every endpoint 401s unless this exact Authorization header
+    /// is presented (a gated/private repo).
+    required_authorization: Option<String>,
+    /// Authorization header (or its absence) for every request, in order.
+    authorization_seen: Mutex<Vec<Option<String>>>,
+    /// When set, resolve requests 302 to the same path on this endpoint —
+    /// the hub-bounces-to-CDN shape.
+    redirect_resolve_to: Option<String>,
 }
 
 impl StubState {
     fn requests_for_file(&self) -> Vec<Option<String>> {
         self.resolve_requests.lock().expect("lock").clone()
     }
+
+    fn authorization_seen(&self) -> Vec<Option<String>> {
+        self.authorization_seen.lock().expect("lock").clone()
+    }
 }
 
-async fn revision(AxumPath((_org, _name, _rev)): AxumPath<(String, String, String)>) -> Response {
+/// Records the request's Authorization header; returns the 401 to serve when
+/// the stub requires one and it doesn't match.
+fn check_auth(state: &StubState, headers: &HeaderMap) -> Option<Response> {
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    state
+        .authorization_seen
+        .lock()
+        .expect("lock")
+        .push(auth.clone());
+    match &state.required_authorization {
+        Some(required) if auth.as_deref() != Some(required.as_str()) => {
+            Some(StatusCode::UNAUTHORIZED.into_response())
+        }
+        _ => None,
+    }
+}
+
+async fn revision(
+    State(state): State<Arc<StubState>>,
+    AxumPath((_org, _name, _rev)): AxumPath<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(denied) = check_auth(&state, &headers) {
+        return denied;
+    }
     axum::Json(serde_json::json!({ "sha": SHA })).into_response()
 }
 
 async fn tree(
     State(state): State<Arc<StubState>>,
     AxumPath((_org, _name, _rev)): AxumPath<(String, String, String)>,
+    headers: HeaderMap,
 ) -> Response {
+    if let Some(denied) = check_auth(&state, &headers) {
+        return denied;
+    }
     if state
         .tree_failures
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -108,9 +151,16 @@ async fn tree(
 
 async fn resolve(
     State(state): State<Arc<StubState>>,
-    AxumPath((_org, _name, _rev, path)): AxumPath<(String, String, String, String)>,
+    AxumPath((org, name, rev, path)): AxumPath<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
+    if let Some(denied) = check_auth(&state, &headers) {
+        return denied;
+    }
+    if let Some(target) = &state.redirect_resolve_to {
+        let location = format!("{target}/{org}/{name}/resolve/{rev}/{path}");
+        return (StatusCode::FOUND, [(header::LOCATION, location)]).into_response();
+    }
     let range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
@@ -177,8 +227,22 @@ async fn resolve(
     (status, body).into_response()
 }
 
+#[derive(Default)]
+struct StubOptions {
+    required_authorization: Option<String>,
+    redirect_resolve_to: Option<String>,
+}
+
 /// Starts the stub hub; returns its endpoint URL and shared state.
 async fn start_stub(files: Vec<(&str, StubFile)>, tree_failures: u32) -> (String, Arc<StubState>) {
+    start_stub_with(files, tree_failures, StubOptions::default()).await
+}
+
+async fn start_stub_with(
+    files: Vec<(&str, StubFile)>,
+    tree_failures: u32,
+    options: StubOptions,
+) -> (String, Arc<StubState>) {
     let state = Arc::new(StubState {
         files: files
             .into_iter()
@@ -186,6 +250,9 @@ async fn start_stub(files: Vec<(&str, StubFile)>, tree_failures: u32) -> (String
             .collect(),
         resolve_requests: Mutex::new(Vec::new()),
         tree_failures: AtomicU32::new(tree_failures),
+        required_authorization: options.required_authorization,
+        authorization_seen: Mutex::new(Vec::new()),
+        redirect_resolve_to: options.redirect_resolve_to,
     });
     let router = Router::new()
         .route("/api/models/{org}/{name}/revision/{rev}", get(revision))
@@ -473,6 +540,140 @@ async fn retryable_file_status_is_retried_then_succeeds() {
         weights
     );
     assert_eq!(state.requests_for_file().len(), 2);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[tokio::test]
+async fn token_rides_every_hub_request_and_gated_download_succeeds() {
+    let weights = file_bytes(1 << 20);
+    let (endpoint, state) = start_stub_with(
+        vec![
+            ("config.json", plain(br#"{"model_type":"llama"}"#.to_vec())),
+            ("model.safetensors", lfs(weights.clone(), Inject::None)),
+        ],
+        0,
+        StubOptions {
+            required_authorization: Some("Bearer sekrit-token-123".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dest = temp_dest("token");
+
+    client(&endpoint)
+        .with_token("sekrit-token-123")
+        .expect("token accepted")
+        .download_repo("org/gated", "main", &dest, &CaptureSink::default())
+        .await
+        .expect("gated download succeeds with the token");
+    assert_eq!(
+        std::fs::read(dest.join("model.safetensors")).expect("weights"),
+        weights
+    );
+    // revision + tree + both file downloads all carried the header.
+    let seen = state.authorization_seen();
+    assert!(seen.len() >= 4, "{seen:?}");
+    assert!(
+        seen.iter()
+            .all(|auth| auth.as_deref() == Some("Bearer sekrit-token-123")),
+        "{seen:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[tokio::test]
+async fn gated_repo_without_token_fails_fast_with_actionable_error() {
+    let (endpoint, state) = start_stub_with(
+        vec![("config.json", plain(b"{}".to_vec()))],
+        0,
+        StubOptions {
+            required_authorization: Some("Bearer sekrit".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dest = temp_dest("gated-anon");
+
+    let err = client(&endpoint)
+        .download_repo("org/gated", "main", &dest, &CaptureSink::default())
+        .await
+        .expect_err("401 without a token is fatal");
+    assert!(matches!(err, HubError::Denied { status: 401, .. }), "{err}");
+    let message = err.to_string();
+    assert!(message.contains("HF_TOKEN"), "not actionable: {message}");
+    assert!(message.contains("gated"), "cause unnamed: {message}");
+    // Denials are not retried: one request, on the revision endpoint.
+    assert_eq!(state.authorization_seen().len(), 1);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[tokio::test]
+async fn refused_token_error_is_actionable_and_never_leaks_the_token() {
+    let (endpoint, _state) = start_stub_with(
+        vec![("config.json", plain(b"{}".to_vec()))],
+        0,
+        StubOptions {
+            required_authorization: Some("Bearer the-right-token".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dest = temp_dest("refused");
+
+    let err = client(&endpoint)
+        .with_token("sekrit-do-not-print")
+        .expect("token accepted")
+        .download_repo("org/gated", "main", &dest, &CaptureSink::default())
+        .await
+        .expect_err("wrong token is fatal");
+    assert!(matches!(err, HubError::Denied { status: 401, .. }), "{err}");
+    let message = err.to_string();
+    assert!(message.contains("refused"), "cause unnamed: {message}");
+    assert!(
+        !message.contains("sekrit-do-not-print"),
+        "token leaked into the error: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[tokio::test]
+async fn authorization_never_follows_a_cross_host_redirect() {
+    let weights = file_bytes(1 << 20);
+    // The "CDN": a second stub on a different port (= cross-host for
+    // redirect purposes), no auth required, records what it receives.
+    let (cdn_endpoint, cdn_state) = start_stub(
+        vec![("model.safetensors", lfs(weights.clone(), Inject::None))],
+        0,
+    )
+    .await;
+    // The hub: requires the token and bounces file downloads to the CDN.
+    let (hub_endpoint, _hub_state) = start_stub_with(
+        vec![("model.safetensors", lfs(weights.clone(), Inject::None))],
+        0,
+        StubOptions {
+            required_authorization: Some("Bearer sekrit".into()),
+            redirect_resolve_to: Some(cdn_endpoint.clone()),
+        },
+    )
+    .await;
+    let dest = temp_dest("redirect");
+
+    client(&hub_endpoint)
+        .with_token("sekrit")
+        .expect("token accepted")
+        .download_repo("org/gated", "main", &dest, &CaptureSink::default())
+        .await
+        .expect("download succeeds through the redirect");
+    assert_eq!(
+        std::fs::read(dest.join("model.safetensors")).expect("weights"),
+        weights
+    );
+    let cdn_seen = cdn_state.authorization_seen();
+    assert!(!cdn_seen.is_empty(), "CDN stub never hit");
+    assert!(
+        cdn_seen.iter().all(Option::is_none),
+        "token crossed hosts: {cdn_seen:?}"
+    );
     let _ = std::fs::remove_dir_all(&dest);
 }
 

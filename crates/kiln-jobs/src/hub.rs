@@ -19,6 +19,12 @@
 //!   tree lists one) are skipped;
 //! - `HF_ENDPOINT` overrides the hub (mirrors; tests point it at a local
 //!   stub server).
+//! - `HF_TOKEN` authenticates gated/private repos: sent as
+//!   `Authorization: Bearer` on every hub request, dropped by reqwest on
+//!   cross-host redirects so the signed CDN URLs the hub bounces to never
+//!   see it. The token is never persisted (job specs are built before the
+//!   client reads the environment) and never appears in an error message
+//!   or event.
 //!
 //! Extensions over the script (it takes pinned commit shas; a general
 //! download tool cannot): the requested revision is resolved to a commit sha
@@ -48,6 +54,14 @@ pub const REVISION_MARKER: &str = ".kiln-revision";
 pub enum HubError {
     #[error("HTTP {status} for {url}")]
     Status { status: u16, url: String },
+    /// 401/403 from the hub: an access problem, not a transport one. The
+    /// hint says what to do about it and never contains the token.
+    #[error("HTTP {status} for {url}: {hint}")]
+    Denied {
+        status: u16,
+        url: String,
+        hint: String,
+    },
     #[error("giving up on {context} after {attempts} attempts: {last}")]
     Exhausted {
         context: String,
@@ -87,6 +101,9 @@ pub struct TreeEntry {
 pub struct HubClient {
     http: reqwest::Client,
     endpoint: String,
+    /// `Authorization: Bearer <token>`, marked sensitive; attached to every
+    /// hub request when set. reqwest strips it on cross-host redirects.
+    auth: Option<reqwest::header::HeaderValue>,
     backoff_base: Duration,
 }
 
@@ -100,15 +117,34 @@ impl HubClient {
         Ok(Self {
             http,
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
+            auth: None,
             backoff_base: Duration::from_secs(5),
         })
     }
 
-    /// Standard hub override knob (mirrors; the stub-server tests).
+    /// Standard hub override knobs: `HF_ENDPOINT` (mirrors; the stub-server
+    /// tests) and `HF_TOKEN` (gated/private repos).
     pub fn from_env() -> Result<Self, HubError> {
         let endpoint =
             std::env::var("HF_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
-        Self::new(endpoint)
+        let client = Self::new(endpoint)?;
+        match std::env::var("HF_TOKEN") {
+            Ok(token) if !token.trim().is_empty() => client.with_token(token.trim()),
+            _ => Ok(client),
+        }
+    }
+
+    /// Authenticates every hub request with `Authorization: Bearer <token>`
+    /// (gated/private repos).
+    pub fn with_token(mut self, token: &str) -> Result<Self, HubError> {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            // Never echo the rejected value: it is the secret.
+            .map_err(|_| {
+                HubError::Api("HF token contains characters not valid in an HTTP header".into())
+            })?;
+        value.set_sensitive(true);
+        self.auth = Some(value);
+        Ok(self)
     }
 
     /// Test hook: shrink the linear backoff so retry paths run in
@@ -121,6 +157,33 @@ impl HubClient {
     async fn backoff(&self, attempt: u32) {
         if attempt > 1 {
             tokio::time::sleep(self.backoff_base * (attempt - 1)).await;
+        }
+    }
+
+    /// Request builder with the auth header attached when configured.
+    fn get(&self, url: &str) -> reqwest::RequestBuilder {
+        let mut request = self.http.get(url);
+        if let Some(auth) = &self.auth {
+            request = request.header(reqwest::header::AUTHORIZATION, auth.clone());
+        }
+        request
+    }
+
+    /// Actionable 401/403 error. Never includes the token itself.
+    fn denied(&self, status: u16, url: &str) -> HubError {
+        let hint = if self.auth.is_some() {
+            "the HF token was refused — check that it is valid and that its \
+             account has been granted access (gated repos also require \
+             accepting the license on the repo page)"
+        } else {
+            "this repo may be gated or private — set HF_TOKEN to a Hugging \
+             Face access token whose account has been granted access (gated \
+             repos also require accepting the license on the repo page)"
+        };
+        HubError::Denied {
+            status,
+            url: url.to_string(),
+            hint: hint.to_string(),
         }
     }
 
@@ -159,7 +222,6 @@ impl HubClient {
     /// paginated.
     async fn try_get_bytes(&self, url: &str) -> Result<(Vec<u8>, Option<String>), AttemptError> {
         let response = self
-            .http
             .get(url)
             .send()
             .await
@@ -167,6 +229,9 @@ impl HubClient {
         let status = response.status().as_u16();
         if RETRYABLE_HTTP.contains(&status) {
             return Err(AttemptError::Retry(format!("HTTP {status}")));
+        }
+        if matches!(status, 401 | 403) {
+            return Err(AttemptError::Fatal(self.denied(status, url)));
         }
         if !response.status().is_success() {
             return Err(AttemptError::Fatal(HubError::Status {
@@ -360,7 +425,7 @@ impl HubClient {
                 size: entry.size,
                 resume_from: offset,
             });
-            let mut request = self.http.get(url);
+            let mut request = self.get(url);
             if offset > 0 {
                 request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
             }
@@ -376,6 +441,9 @@ impl HubClient {
             }
             if RETRYABLE_HTTP.contains(&status.as_u16()) {
                 return Err(AttemptError::Retry(format!("HTTP {}", status.as_u16())));
+            }
+            if matches!(status.as_u16(), 401 | 403) {
+                return Err(AttemptError::Fatal(self.denied(status.as_u16(), url)));
             }
             if !status.is_success() {
                 return Err(AttemptError::Fatal(HubError::Status {

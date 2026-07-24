@@ -11,6 +11,10 @@
 //!
 //! Progress goes to stdout as JSON lines; logs go to stderr. Every job is
 //! recorded in the SQLite store (default `~/.kiln/jobs.sqlite`).
+//!
+//! Environment: `HF_ENDPOINT` overrides the hub (mirrors); `HF_TOKEN`
+//! authenticates gated/private repo downloads (sent as an Authorization
+//! header to the hub only — never persisted or logged).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

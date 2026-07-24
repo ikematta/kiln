@@ -137,6 +137,8 @@ pub async fn execute(
 
 async fn run_download(spec_json: &str, sink: &dyn Sink) -> Result<String, String> {
     let job: DownloadJob = serde_json::from_str(spec_json).map_err(|err| err.to_string())?;
+    // Hub credentials (HF_TOKEN) are read from the environment at execution
+    // time, never from spec_json — persisted job state must stay secret-free.
     let hub = HubClient::from_env().map_err(|err| err.to_string())?;
     hub.download_repo(&job.repo, &job.revision, &job.dest, sink)
         .await
