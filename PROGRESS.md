@@ -8018,3 +8018,24 @@
       runs under the suite-wide pytest step in test-macos.
   ```
 - Next: nothing scheduled — PM ruling on merge after CI.
+
+## [2026-07-24] Gateway follow-up / SPEC §8.3 CORS — PR #40 MERGED (PM ruling) — DONE
+- What: PM ruled to merge on green CI (run 30112768570, all four jobs:
+  compile-linux 54s, lint 1m4s, test-macos-release 4m37s, test-macos
+  1h12m50s — both new e2e CORS tests ran live on the runner's real
+  Chrome under KILN_E2E_REQUIRE_BROWSER=1, including the full
+  preflight-then-POST dance asserted server-side in metrics). Merge
+  commit f66a1a6 (merge commit, not squash — PROGRESS commit references
+  stay valid on main). The opt-in `[server] cors_origins` allowlist is
+  now on main; the shipped default remains no CORS headers at all.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 40 -> 4/4 pass (run 30112768570)
+  $ gh run view --job 89546048853 --log | grep test_cors
+      test_cors_configured_and_unconfigured_origins PASSED (17:55:22)
+      test_no_cors_headers_by_default PASSED (17:55:25)
+  $ gh pr merge 40 --merge -> merged; origin/main head f66a1a6
+  ```
+- Next: nothing scheduled — SPEC §12 remains complete; §8.3 now covers
+  rate limits, timeouts, size limits, and CORS, all enforced.
