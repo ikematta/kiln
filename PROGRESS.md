@@ -8189,3 +8189,46 @@
       installs via the existing `uv sync --project tests/e2e`).
   ```
 - Next: nothing scheduled — PM ruling on merge after CI.
+
+## [2026-07-24] Gateway follow-up / SPEC §8.4 — CI flake diagnosis on PR #41 — PARTIAL
+- What: test-macos on run 30123388579 failed with exactly one e2e failure,
+  `test_rate_limit.py::test_tpm_reservation_is_reconciled_to_actual_usage`
+  (completion_tokens 200, expected ≤20). Diagnosed as RUNNER HARDWARE-CLASS
+  VARIANCE, not a regression from the MCP change:
+  - The same run's ADVISORY golden lane diverged on
+    gemma-3-1b-it-4bit/chat-basic (runner "GitHub Actions 1000000556"),
+    while both prior green runs' runners (1000000544, 1000000539) were
+    golden-EXACT — this host's device class produces different logits
+    (exactly the cross-device situation ADR 0004 made the golden lane
+    advisory for; continue-on-error confirmed, the lane did not fail the
+    job).
+  - The failing test asserts device-dependent greedy output: its `" "`
+    stop string must fire within 20 tokens of llama counting "1 to 100".
+    On the divergent host llama evidently counts WITHOUT spaces — no stop
+    match, natural EOS at exactly ~200 completion tokens (1–100 with bare
+    commas ≈ 200 tokens), which is the observed usage.
+  - The full rate-limit suite passes locally at the same commit (6/6,
+    48.6s) on a golden-exact machine, and all 11 test_mcp.py tests PASSED
+    on the divergent runner itself. The MCP diff leaves no-tools requests
+    on byte-identical code paths (51-test local regression on
+    tool_calls/chat/messages/timeouts, also green).
+- Decisions: not touching the test — CLAUDE.md forbids weakening a test to
+  make it pass. Flagging instead: the test's early-stop assertion encodes
+  a device-class-stable-output assumption that the fleet's runners do not
+  all satisfy; hardening it (e.g. asserting the refund via the follow-up
+  request's admission rather than the exact early-stop token count) is a
+  PM call. Pushing this note re-rolls CI on a fresh runner.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ uv run --project tests/e2e pytest tests/e2e/test_rate_limit.py -v
+    6 passed in 48.58s   (incl. test_tpm_reservation_is_reconciled_...)
+  $ gh api .../jobs 89546048853 89444855927 (green runs): golden advisory
+    step SUCCESS on runners 1000000544/1000000539; failing run's runner
+    1000000556 golden-diverged (gemma, gather path) — hardware-class delta.
+  $ CI run 30123388579: lint/compile-linux/test-macos-release pass;
+    test-macos: 11/11 test_mcp.py PASSED on the runner; sole e2e failure
+    is the flagged test.
+  ```
+- Next: PM ruling on merge once CI is green; separately, PM ruling on
+  hardening the flagged tpm-reconciliation assertion for runner variance.
