@@ -21,5 +21,6 @@ pub mod ratelimit;
 pub mod registry;
 pub mod supervisor;
 pub mod sysmem;
+pub mod timeout;
 pub mod uds;
 pub mod ui;

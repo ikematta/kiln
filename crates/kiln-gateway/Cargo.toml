@@ -11,6 +11,9 @@ argon2.workspace = true
 async-stream.workspace = true
 axum.workspace = true
 figment.workspace = true
+# Classifies body-over-limit read errors as 413 (SPEC §8.3); already a
+# transitive dep of axum — this only names the error type it defines.
+http-body-util.workspace = true
 hyper-util.workspace = true
 # Config-parsing surface only (no default features = no MLX): validates that
 # a worker="rust" model is an architecture the Rust worker can serve, at

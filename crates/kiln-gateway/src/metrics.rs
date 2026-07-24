@@ -47,6 +47,10 @@ pub struct Metrics {
     /// and exhausted scope (`requests | tokens`). Bounded cardinality: keys
     /// come from config.
     pub rate_limited_total: IntCounterVec,
+    /// Requests aborted by timeout enforcement (SPEC §8.3), by model and
+    /// expired budget (`ttft | total`). Distinct from `rate_limited_total`:
+    /// a timeout is abandoned work, not a quota rejection.
+    pub timeouts_total: IntCounterVec,
     /// Machine memory budget (SPEC §2.3): total unified memory ×
     /// `memory.budget_fraction`, or the explicit `memory.budget_bytes`.
     pub memory_budget_bytes: IntGauge,
@@ -259,6 +263,12 @@ impl Metrics {
              scope (requests | tokens)",
             &["key", "scope"],
         )?;
+        let timeouts_total = counter(
+            "kiln_timeout_total",
+            "Requests aborted by TTFT/total timeout enforcement, by model and \
+             expired budget (ttft | total)",
+            &["model", "scope"],
+        )?;
         let plain_gauge = |name: &str, help: &str| {
             let gauge = IntGauge::new(name, help)?;
             registry.register(Box::new(gauge.clone()))?;
@@ -421,6 +431,7 @@ impl Metrics {
             worker_unloads_total,
             admission_rejects_total,
             rate_limited_total,
+            timeouts_total,
             memory_budget_bytes,
             memory_used_bytes,
             memory_reserved_bytes,

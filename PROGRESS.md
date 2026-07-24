@@ -7817,3 +7817,109 @@
   ```
 - Next: SPEC §8.3 backlog — TTFT/total timeouts remain parsed-but-
   unenforced (the surviving half of the Phase 2 backlog line).
+
+## [2026-07-24] Phase 9 follow-up / SPEC §8.3 — TTFT/total timeouts ENFORCED + size limits closed — DONE
+- What:
+  - New `crates/kiln-gateway/src/timeout.rs`: `server.ttft_timeout_secs` /
+    `server.total_timeout_secs` (new config keys, absent = disabled,
+    validated: nonzero, ttft <= total), enforced in all six
+    stream-consumption sites (chat/completions/messages × stream/collect)
+    via a `Deadlines` tracker wrapping every worker-event await in
+    `tokio::time::timeout_at`. Both budgets anchor at request ARRIVAL at
+    the gateway; only a `Tokens` event retires the TTFT deadline (the
+    worker's `Admitted` enqueue ack does not).
+  - On expiry: `CompletionCtx::abort_for_timeout` cancels through the
+    existing worker.proto Cancel RPC — the same path as a stop-string
+    match / client disconnect, no ad-hoc teardown — logs the worker's
+    CancelAck `found`, and increments the new
+    `kiln_timeout_total{model,scope=ttft|total}` counter.
+  - Error shape: 504 + OpenAI envelope `type: "timeout_error"`,
+    `code: ttft_timeout|total_timeout`, no Retry-After — deliberately not
+    the 429 family. Anthropic envelope reports its 5xx catch-all
+    `api_error` (their taxonomy has no timeout type).
+  - Size limits (investigated first, per task): the raw byte cap was
+    already in effect — explicit 2 MiB `to_bytes` cap on the three
+    completion endpoints, axum's default 2 MB on Json-extractor admin
+    routes. Gap closed: over-limit bodies are now 413
+    `request_too_large` (Anthropic `request_too_large`) via a shared
+    `read_body` helper that walks the error source chain for
+    `http_body_util::LengthLimitError`, instead of a generic 400.
+  - SPEC §8.3 backlog blockquote updated: all three items closed, section
+    backlog CLOSED; §10 sample + kiln.toml.example show the new keys.
+  - Tests: +6 gateway unit (deadline transitions, config validation,
+    error shapes); new e2e `tests/e2e/test_timeouts.py` (4 tests, python
+    worker for real sequential-queue pressure).
+- Decisions:
+  - TTFT clock starts at ARRIVAL, not prefill start: queue wait under
+    Phase 9 admission pressure is exactly what a client experiences as
+    time-to-first-token; a prefill-anchored timer protects nothing for a
+    queued request. Considered a separate queue-wait budget vs
+    compute budget: rejected — SPEC §8.3 names TTFT and total explicitly,
+    both are client-experience bounds, a queue-only budget would exclude
+    unbounded prefill, and split knobs would have to be summed back into
+    the client-visible number anyway. Two knobs remain (ttft, total),
+    both arrival-anchored.
+  - 504 over "OpenAI's timeout shape": OpenAI has no server-emitted
+    timeout body to mirror (their SDK timeout errors are client-side), so
+    the honest choice is real HTTP semantics — this gateway literally
+    gave up waiting on its upstream worker (504), not 408 (client was
+    fine) and not 429 (nothing was quota-rejected; work was started and
+    abandoned). A dedicated `timeout_error` type keeps it distinguishable
+    in the OpenAI envelope.
+  - Timed-out tpm reservations forfeit (dropped unsettled), identical to
+    a client disconnect per the B1 rule: refunds for abandoned work would
+    let a client burn GPU without depleting its budget; self-heals within
+    the refill minute. Verified exactly-once accounting in e2e (not
+    refunded AND not double-charged).
+  - Partial output: non-streaming responses discard it (client gets only
+    the 504); streaming responses keep already-sent deltas and terminate
+    with the error event instead of [DONE]/message_stop.
+  - Pre-stream RPCs (Tokenize/Submit) are not deadline-wrapped: they are
+    enqueue-shaped calls, and a wedged worker gRPC layer is already
+    caught by the supervisor's 1s health poll → restart → normal crash
+    path. Elapsed time there still counts (absolute deadlines).
+  - No message-count ceiling beyond the 2 MiB byte cap: every downstream
+    cost (parse, template render, tokenize) is linear in body size, and
+    token-shaped ceilings already exist (model-context check, worker
+    CTX_OVERFLOW, per-key tpm reservation).
+  - New direct dep `http-body-util` (already in-tree via axum/hyper):
+    only names the `LengthLimitError` type needed to classify 413 vs 400.
+- Deviations: none from SPEC intent. One SPEC-history correction,
+  recorded in the §8.3 note: the backlog line's "TTFT/total timeouts are
+  parsed from kiln.toml since Phase 2" was inaccurate — no such fields
+  ever existed in `KilnConfig` (unknown TOML keys are silently ignored),
+  so the keys were ADDED here, not merely enforced.
+- Acceptance:
+  ```
+  $ uv run --project tests/e2e pytest tests/e2e/test_timeouts.py -v
+    test_ttft_timeout_cancels_queued_request_cleanly PASSED
+      (python worker held by a real 4000-token raw-continuation
+       generation; queued OpenAI + Anthropic victims 504 at the 4s TTFT
+       budget — elapsed asserted well before the holder's 12s hold ends —
+       CancelAck found=true in the gateway log for the queued victims;
+       after releasing the holder a fresh probe 200s immediately, which a
+       surviving max_tokens=3000 victim would have made impossible)
+    test_total_timeout_cancels_mid_stream_after_partial_output PASSED
+      (streaming request cancelled at the 12s total budget mid-stream;
+       partial deltas delivered, terminal error event, no [DONE]; worker
+       free immediately after)
+    test_ttft_timeout_forfeits_tpm_reservation_like_a_disconnect PASSED
+      (tpm=600 victim reserves ~315 then TTFT-times-out: a ~565-token
+       follow-up 429s — hold NOT refunded — while a ~265-token follow-up
+       200s — hold not double-counted)
+    test_oversized_body_is_413_on_both_surfaces PASSED
+    4 passed in 30.41s
+  $ cargo test --workspace -> 56 suites, 270 passed, 0 failed
+      (kiln-gateway 113, incl. new deadline-transition, timeout-config,
+       and 504/413 error-shape tests)
+  $ pytest tests/e2e/test_rate_limit.py tests/e2e/test_chat.py -> 18 passed
+  $ pytest tests/e2e/test_messages.py tests/e2e/test_completions.py -> 36 passed
+  CI shapes: cargo fmt --check clean; clippy -D warnings clean on default
+      AND --no-default-features; cargo build --workspace
+      --no-default-features clean (compile-linux shape); ruff check +
+      format --check clean on python/ tests/e2e scripts (lint shape); the
+      new e2e file runs under the suite-wide pytest step in test-macos.
+  ```
+- Next: nothing further in SPEC §8.3 — its backlog is fully closed
+  (rate limits 2026-07-24, timeouts + size limits this entry). PM ruling
+  on merge after CI.

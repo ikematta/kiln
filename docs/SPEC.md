@@ -272,7 +272,10 @@ API keys in config (hashed at rest, `argon2`); per-key rate limits (token bucket
 > **Backlog status.** The Phase 2 backlog note here read: "per-key rate limits (rpm/tpm) and TTFT/total timeouts are parsed from kiln.toml since Phase 2 but UNENFORCED — implement in Phase 9 alongside priority/admission control (PROGRESS.md 2026-07-04)". Its two halves have diverged:
 >
 > - **Rate limits (rpm/tpm): ENFORCED as of 2026-07-24** (PROGRESS.md 2026-07-24). rpm as a tower route-layer middleware after auth; tpm reserves `prompt + max_tokens` before `Submit` and refunds unused reservation when the request settles (reserve-then-reconcile, `kiln-gateway/src/ratelimit.rs` module docs). Rejections are OpenAI's 429 rate-limit shape (`type: requests|tokens`, `code: rate_limit_exceeded`) with `Retry-After`, or Anthropic's `rate_limit_error` envelope on `/v1/messages`.
-> - **BACKLOG — TTFT/total timeouts:** still parsed from kiln.toml since Phase 2 but UNENFORCED.
+> - **TTFT/total timeouts: ENFORCED as of 2026-07-24** (PROGRESS.md 2026-07-24), closing the backlog line. Correction to that line's history: the timeout keys were never actually parsed — no such fields existed in `KilnConfig`, and unknown kiln.toml keys are silently ignored — so `server.ttft_timeout_secs` / `server.total_timeout_secs` were **added** and enforced together. Both budgets anchor at request arrival (queue wait counts); expiry cancels through the worker's Cancel RPC (the same ≤2-step path as a user stop) and returns a 504 `timeout_error` (`code: ttft_timeout|total_timeout`) — deliberately not the 429 family — counted by `kiln_timeout_total{model,scope}`. Design rationale in `kiln-gateway/src/timeout.rs` module docs.
+> - **Request size limits: were already enforced** (2 MiB body cap on the completion endpoints since Phase 2, axum's default on `Json`-extractor routes); as of 2026-07-24 an over-limit body is a proper 413 (`code: request_too_large`, Anthropic `request_too_large`) instead of a generic 400. Token-shaped ceilings are the model-context check and the per-key tpm reservation; a separate message-count cap is unnecessary because every downstream cost is linear in the byte cap.
+>
+> **This section's backlog is closed** — nothing in §8.3 remains parsed-but-unenforced.
 
 ---
 
@@ -292,6 +295,7 @@ CLI + long-running job server: `kiln-jobs download <hf_repo>` (resumable, `hf_hu
 [server]
 host = "127.0.0.1"; port = 8080
 runtime_dir = "~/.kiln/run"; cache_dir = "~/.kiln/cache"; model_dir = "~/.kiln/models"
+# ttft_timeout_secs = 120; total_timeout_secs = 600   # §8.3 timeouts; omit = disabled
 
 [memory]
 budget_fraction = 0.80          # of unified memory

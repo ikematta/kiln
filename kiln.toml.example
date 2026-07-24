@@ -29,6 +29,12 @@ python_worker_argv = ["uv", "run", "--project", "python/kiln_worker_py", "python
 #jobs_argv = ["kiln-jobs"]
 # SQLite job store used by the spawned kiln-jobs server.
 jobs_db = "~/.kiln/jobs.sqlite"
+# Request timeouts (SPEC §8.3), both measured from request ARRIVAL at the
+# gateway so queue wait under admission pressure counts. Omitted = disabled
+# (the default). On expiry the request is cancelled through the worker's
+# Cancel path and the client gets a 504 `timeout_error`.
+#ttft_timeout_secs = 120     # arrival → first generated token
+#total_timeout_secs = 600    # arrival → last token (must be >= ttft)
 # Downloading gated/private Hugging Face repos (e.g. meta-llama/*): export
 # HF_TOKEN in the gateway's environment — the spawned kiln-jobs runner
 # inherits it and sends it as an Authorization header to the hub only.

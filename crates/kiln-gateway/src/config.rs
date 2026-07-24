@@ -76,6 +76,15 @@ pub struct ServerConfig {
     /// SQLite job store handed to the spawned kiln-jobs server.
     #[serde(default = "defaults::jobs_db")]
     pub jobs_db: PathBuf,
+    /// TTFT timeout (SPEC §8.3): seconds from request arrival to the first
+    /// generated token — queue wait and prefill both count. Absent =
+    /// disabled (crate::timeout module docs).
+    #[serde(default)]
+    pub ttft_timeout_secs: Option<u64>,
+    /// Total request timeout (SPEC §8.3): seconds from request arrival to
+    /// the terminal event. Absent = disabled.
+    #[serde(default)]
+    pub total_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -269,6 +278,26 @@ impl KilnConfig {
             ));
         }
 
+        // Timeouts (SPEC §8.3): zero would reject every request before the
+        // first poll; omit the field to mean disabled. TTFT above total
+        // would make the TTFT budget unreachable — the total timer always
+        // fires first — which can only be a configuration mistake.
+        if self.server.ttft_timeout_secs == Some(0) {
+            return invalid("server.ttft_timeout_secs must be >= 1 (omit to disable)".into());
+        }
+        if self.server.total_timeout_secs == Some(0) {
+            return invalid("server.total_timeout_secs must be >= 1 (omit to disable)".into());
+        }
+        if let (Some(ttft), Some(total)) = (
+            self.server.ttft_timeout_secs,
+            self.server.total_timeout_secs,
+        ) && ttft > total
+        {
+            return invalid(format!(
+                "server.ttft_timeout_secs ({ttft}) must be <= server.total_timeout_secs ({total})"
+            ));
+        }
+
         let mut seen_keys = std::collections::HashSet::new();
         for key in &self.auth.api_keys {
             // Rate limits (SPEC §8.3): zero would build a bucket that can
@@ -334,6 +363,8 @@ impl Default for ServerConfig {
             rust_worker_argv: defaults::rust_worker_argv(),
             jobs_argv: defaults::jobs_argv(),
             jobs_db: defaults::jobs_db(),
+            ttft_timeout_secs: None,
+            total_timeout_secs: None,
         }
     }
 }
@@ -601,6 +632,37 @@ mod tests {
                  [[auth.api_keys]]\nname = \"b\"\nkey_hash = \"h\"\n",
             )?;
             KilnConfig::load("kiln.toml").expect("valid limits parse");
+            Ok(())
+        });
+    }
+
+    /// SPEC §8.3 timeouts: zero would reject every request up front, and a
+    /// TTFT budget above the total budget could never fire — both are
+    /// config errors. Valid values parse, including via env override.
+    #[test]
+    fn timeout_validation_and_env_override() {
+        figment::Jail::expect_with(|jail| {
+            for bad in [
+                "[server]\nttft_timeout_secs = 0\n",
+                "[server]\ntotal_timeout_secs = 0\n",
+                "[server]\nttft_timeout_secs = 60\ntotal_timeout_secs = 30\n",
+            ] {
+                jail.create_file("kiln.toml", bad)?;
+                let err = KilnConfig::load("kiln.toml").unwrap_err();
+                assert!(matches!(err, ConfigError::Invalid(_)), "{bad}");
+            }
+
+            jail.create_file(
+                "kiln.toml",
+                "[server]\nttft_timeout_secs = 30\ntotal_timeout_secs = 600\n",
+            )?;
+            let config = KilnConfig::load("kiln.toml").expect("valid timeouts parse");
+            assert_eq!(config.server.ttft_timeout_secs, Some(30));
+            assert_eq!(config.server.total_timeout_secs, Some(600));
+
+            jail.set_env("KILN_SERVER__TTFT_TIMEOUT_SECS", "5");
+            let config = KilnConfig::load("kiln.toml").expect("env override applies");
+            assert_eq!(config.server.ttft_timeout_secs, Some(5));
             Ok(())
         });
     }

@@ -44,16 +44,19 @@ use crate::anthropic::{
 };
 use crate::app::{AppState, RequestId};
 use crate::chat::{
-    CompletionCtx, MAX_BODY_BYTES, StreamEnd, TextPipeline, ToolRoute, admit_memory,
-    classify_finished, encode_prompt, ready_entry,
+    CompletionCtx, StreamEnd, TextPipeline, ToolRoute, admit_memory, classify_finished,
+    encode_prompt, read_body, ready_entry,
 };
 use crate::error::ApiError;
 use crate::registry::ModelEntry;
+use crate::timeout::{Deadlines, WorkerEvent, next_event};
 
 pub async fn messages(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> Response {
+    // Timeout budgets anchor at arrival (crate::timeout module docs).
+    let arrival = tokio::time::Instant::now();
     let request_id = request
         .extensions()
         .get::<RequestId>()
@@ -64,12 +67,9 @@ pub async fn messages(
         .get::<crate::ratelimit::RateLimitHandle>()
         .cloned();
 
-    let bytes = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
+    let bytes = match read_body(request).await {
         Ok(bytes) => bytes,
-        Err(err) => {
-            return ApiError::invalid_request(format!("failed to read request body: {err}"))
-                .into_anthropic_response();
-        }
+        Err(err) => return err.into_anthropic_response(),
     };
     let parsed: MessagesRequest = match serde_json::from_slice(&bytes) {
         Ok(parsed) => parsed,
@@ -80,7 +80,7 @@ pub async fn messages(
     };
 
     let model = parsed.model.clone();
-    match handle(Arc::clone(&state), parsed, request_id, rate).await {
+    match handle(Arc::clone(&state), parsed, request_id, rate, arrival).await {
         Ok(response) => response,
         Err(err) => {
             state
@@ -100,7 +100,9 @@ async fn handle(
     request: MessagesRequest,
     request_id: RequestId,
     rate: Option<crate::ratelimit::RateLimitHandle>,
+    arrival: tokio::time::Instant,
 ) -> Result<Response, ApiError> {
+    let deadlines = Deadlines::start(&state.timeouts, arrival);
     let entry = ready_entry(&state, &request.model)?;
     admit_memory(&state, &entry)?;
     let validated = request.validate()?;
@@ -211,11 +213,19 @@ async fn handle(
             route,
             prompt_tokens,
             validated.stop_sequences,
+            deadlines,
         ))
     } else {
-        collect_response(ctx, events, pipeline, route, validated.stop_sequences)
-            .await
-            .map(IntoResponse::into_response)
+        collect_response(
+            ctx,
+            events,
+            pipeline,
+            route,
+            validated.stop_sequences,
+            deadlines,
+        )
+        .await
+        .map(IntoResponse::into_response)
     }
 }
 
@@ -451,11 +461,12 @@ async fn collect_response(
     mut pipeline: TextPipeline,
     mut route: SegmentRoute,
     stop_sequences: Vec<String>,
+    mut deadlines: Deadlines,
 ) -> Result<axum::Json<MessagesResponse>, ApiError> {
     let mut assembler = BlockAssembler::default();
     let (end, matched) = loop {
-        match events.message().await {
-            Ok(Some(event)) => match event.event {
+        match next_event(&mut events, &mut deadlines).await {
+            WorkerEvent::Event(event) => match event.event {
                 Some(token_event::Event::Tokens(chunk)) => {
                     let was_matched = pipeline.stop_matched();
                     let text = pipeline.push(chunk)?;
@@ -481,7 +492,7 @@ async fn collect_response(
                 // Admitted / PrefixCacheHit are observability-only here.
                 _ => {}
             },
-            Ok(None) => {
+            WorkerEvent::Closed => {
                 break (
                     StreamEnd::Failed(ApiError::worker_crashed(
                         "the worker stream ended without a result (worker crashed mid-request)",
@@ -489,11 +500,15 @@ async fn collect_response(
                     None,
                 );
             }
-            Err(status) => {
+            WorkerEvent::Rpc(status) => {
                 break (
                     StreamEnd::Failed(ApiError::from_worker_status(&status)),
                     None,
                 );
+            }
+            // Partial output on the non-streaming path is discarded.
+            WorkerEvent::TimedOut(scope) => {
+                break (StreamEnd::Failed(ctx.abort_for_timeout(scope).await), None);
             }
         }
     };
@@ -667,6 +682,7 @@ fn stream_response(
     mut route: SegmentRoute,
     prompt_tokens: u32,
     stop_sequences: Vec<String>,
+    mut deadlines: Deadlines,
 ) -> Response {
     let stream = async_stream::stream! {
         // message_start carries the message skeleton; deltas fill it in.
@@ -687,8 +703,8 @@ fn stream_response(
 
         let mut streamer = BlockStreamer::new();
         loop {
-            let (end, matched) = match events.message().await {
-                Ok(Some(event)) => match event.event {
+            let (end, matched) = match next_event(&mut events, &mut deadlines).await {
+                WorkerEvent::Event(event) => match event.event {
                     Some(token_event::Event::Tokens(chunk)) => {
                         let was_matched = pipeline.stop_matched();
                         let text = match pipeline.push(chunk) {
@@ -737,10 +753,13 @@ fn stream_response(
                     }
                     _ => continue,
                 },
-                Ok(None) => (StreamEnd::Failed(ApiError::worker_crashed(
+                WorkerEvent::Closed => (StreamEnd::Failed(ApiError::worker_crashed(
                     "the worker stream ended without a result (worker crashed mid-request)",
                 )), None),
-                Err(status) => (StreamEnd::Failed(ApiError::from_worker_status(&status)), None),
+                WorkerEvent::Rpc(status) => (StreamEnd::Failed(ApiError::from_worker_status(&status)), None),
+                // Frames already sent stand; the stream ends with the
+                // terminal `error` event instead of message_stop.
+                WorkerEvent::TimedOut(scope) => (StreamEnd::Failed(ctx.abort_for_timeout(scope).await), None),
             };
 
             match end {

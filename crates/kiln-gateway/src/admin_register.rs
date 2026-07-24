@@ -472,6 +472,7 @@ mod tests {
             metrics,
             auth: Auth::from_config(&config.auth).expect("auth"),
             rate: crate::ratelimit::RateLimiter::from_config(&config.auth),
+            timeouts: crate::timeout::Timeouts::from_config(&config.server),
             jobs: crate::admin::JobsProxy::external(PathBuf::from("/tmp/kiln-regadd.sock"))
                 .expect("proxy"),
             registrar,

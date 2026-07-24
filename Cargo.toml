@@ -60,6 +60,10 @@ sha2 = "0.10"
 # for API keys hashed at rest, async-stream for SSE translation streams.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "time", "io-util", "sync", "fs"] }
 axum = "0.8"
+# Already in-tree via axum/hyper; direct dep so the gateway can classify a
+# body-over-limit read error (LengthLimitError in the source chain) as a
+# 413 instead of a generic 400 (SPEC §8.3 request size limits). MIT.
+http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tracing = "0.1"
