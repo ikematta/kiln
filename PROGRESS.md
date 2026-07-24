@@ -7797,3 +7797,23 @@
       TTFT/total timeouts BACKLOG (unchanged claim, PROGRESS 2026-07-04)
   ```
 - Next: SPEC §8.3 backlog — TTFT/total timeouts (unchanged).
+
+## [2026-07-24] Phase 9 follow-up / SPEC §8.3 — PR #38 MERGED (PM ruling) — DONE
+- What: PM ruled to merge on green CI (run 30074653010, all four jobs:
+  lint 39s, compile-linux 2m22s, test-macos-release 4m7s, test-macos
+  1h4m22s — the six new e2e rate-limit tests ran live on the runner
+  under the suite-wide pytest step). Merge commit a738400 (merge
+  commit, not squash — PROGRESS commit references stay valid on main).
+  Per-key rpm/tpm rate limiting is now enforced on main. Note: the
+  docs-only tip commit was reworded on the PR branch (83a6945 →
+  2fe4553) solely to drop its `[skip ci]` tag, which was suppressing
+  the pull_request workflow on the PR head — content unchanged;
+  enforcement commit 4c6b458 untouched.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 38 -> 4/4 pass (run 30074653010)
+  $ gh pr merge 38 --merge -> merged; origin/main head a738400
+  ```
+- Next: SPEC §8.3 backlog — TTFT/total timeouts remain parsed-but-
+  unenforced (the surviving half of the Phase 2 backlog line).
