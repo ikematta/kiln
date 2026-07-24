@@ -7923,3 +7923,23 @@
 - Next: nothing further in SPEC §8.3 — its backlog is fully closed
   (rate limits 2026-07-24, timeouts + size limits this entry). PM ruling
   on merge after CI.
+
+## [2026-07-24] Phase 9 follow-up / SPEC §8.3 — PR #39 MERGED (PM ruling) — DONE
+- What: PM ruled to merge on green CI (run 30081803529, all four jobs:
+  lint 47s, compile-linux 48s, test-macos-release 6m3s, test-macos
+  1h7m21s — the four new e2e timeout/size-limit tests ran live on the
+  runner under the suite-wide pytest step, including the real
+  queue-pressure TTFT scenario on the sequential python worker). Merge
+  commit 1367f73 (merge commit, not squash — PROGRESS commit references
+  stay valid on main). TTFT/total timeout enforcement and the 413
+  size-limit shape are now on main; SPEC §8.3's backlog is fully closed.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 39 -> 4/4 pass (run 30081803529)
+  $ gh run view --job 89444855927 --log | grep test_timeouts
+      4/4 PASSED on the runner (09:48:25-09:48:43)
+  $ gh pr merge 39 --merge -> merged; origin/main head 1367f73
+  ```
+- Next: nothing scheduled — SPEC §12 remains complete and §8.3's backlog
+  is closed.
