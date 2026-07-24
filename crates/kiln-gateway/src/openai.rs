@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::ApiError;
 
 /// Generated tokens cap when the client sends no max_tokens and the worker
-/// has not reported a context length.
-const FALLBACK_MAX_TOKENS: u32 = 1024;
+/// has not reported a context length. Shared with the MCP loop's per-round
+/// recomputation (crate::chat::McpRounds).
+pub(crate) const FALLBACK_MAX_TOKENS: u32 = 1024;
 
 // ---------------------------------------------------------------------------
 // Request
@@ -139,6 +140,9 @@ pub struct ValidatedChat {
     pub priority: Priority,
     pub stream: bool,
     pub include_usage: bool,
+    /// `tool_choice: "none"` — the request opted out of tools entirely,
+    /// which also keeps MCP tools out of scope (SPEC §8.4).
+    pub tools_disabled: bool,
 }
 
 impl ChatCompletionRequest {
@@ -187,11 +191,15 @@ impl ChatCompletionRequest {
             }
             Some(_) => return Err(invalid("'tools' must be an array")),
         };
+        let mut tools_disabled = false;
         match &self.tool_choice {
             None => {}
             Some(serde_json::Value::String(choice)) => match choice.as_str() {
                 "auto" => {}
-                "none" => tools.clear(),
+                "none" => {
+                    tools.clear();
+                    tools_disabled = true;
+                }
                 other => {
                     return Err(ApiError::invalid_request(format!(
                         "'tool_choice' '{other}' is not supported (only 'auto' or 'none'; \
@@ -311,6 +319,7 @@ impl ChatCompletionRequest {
                 .stream_options
                 .as_ref()
                 .is_some_and(|o| o.include_usage),
+            tools_disabled,
         })
     }
 }

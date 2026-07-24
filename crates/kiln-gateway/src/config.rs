@@ -40,6 +40,10 @@ pub struct KilnConfig {
     pub defaults: EngineDefaults,
     #[serde(default, rename = "model")]
     pub models: Vec<ModelConfig>,
+    /// External MCP tool servers (SPEC §8.4). Like `[[model]]`, file-only —
+    /// not env-addressable.
+    #[serde(default, rename = "mcp_server")]
+    pub mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
     pub auth: AuthConfig,
 }
@@ -182,6 +186,42 @@ pub struct SpeculativeConfig {
     /// Tokens proposed per speculation round.
     #[serde(default = "defaults::gamma")]
     pub gamma: u32,
+}
+
+/// One external MCP tool server (SPEC §8.4): the gateway connects at
+/// startup, discovers its tools, merges them into chat/messages requests,
+/// and executes matching tool calls server-side (crate::mcp module docs).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct McpServerConfig {
+    /// Unique name: admin listing, metric label, log key. `[A-Za-z0-9_-]`.
+    pub name: String,
+    pub transport: McpTransportKind,
+    /// stdio only: the server's argv (spawned as a child of the gateway,
+    /// speaking newline-delimited JSON-RPC on stdin/stdout).
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// stdio only: extra environment for the child (on top of the
+    /// gateway's own environment) — the ecosystem-standard way MCP server
+    /// configs carry per-server settings.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// http only: the server's streamable-HTTP endpoint URL.
+    pub url: Option<String>,
+    /// Per-tool-call timeout (crate::mcp module docs: expiry feeds an
+    /// error tool-result to the model; it does NOT fail the request).
+    /// Independent of `server.total_timeout_secs`, which also bounds MCP
+    /// execution and DOES fail the request on expiry.
+    #[serde(default = "defaults::mcp_tool_timeout_secs")]
+    pub tool_timeout_secs: u64,
+}
+
+/// MCP transport (SPEC §8.4): a spawned stdio child or a streamable-HTTP
+/// endpoint — the two transports the MCP spec defines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransportKind {
+    Stdio,
+    Http,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -347,6 +387,66 @@ impl KilnConfig {
             // (both entries would share one identity's buckets).
             if !seen_keys.insert(key.name.as_str()) {
                 return invalid(format!("duplicate api key name '{}'", key.name));
+            }
+        }
+
+        // MCP servers (SPEC §8.4): names are metric labels and log keys, so
+        // constrain the charset; transport-specific fields must match the
+        // transport — a stdio `url` or an http `command` is certainly a
+        // mixed-up block, not an intent.
+        let mut seen_mcp = std::collections::HashSet::new();
+        for server in &self.mcp_servers {
+            let name = &server.name;
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            {
+                return invalid(format!(
+                    "mcp_server name '{name}' must be non-empty [A-Za-z0-9_-]"
+                ));
+            }
+            if !seen_mcp.insert(name.as_str()) {
+                return invalid(format!("duplicate mcp_server name '{name}'"));
+            }
+            if server.tool_timeout_secs == 0 {
+                return invalid(format!(
+                    "mcp_server '{name}': tool_timeout_secs must be >= 1"
+                ));
+            }
+            match server.transport {
+                McpTransportKind::Stdio => {
+                    if server.command.is_empty() || server.command[0].is_empty() {
+                        return invalid(format!(
+                            "mcp_server '{name}': stdio transport requires a non-empty 'command'"
+                        ));
+                    }
+                    if server.url.is_some() {
+                        return invalid(format!(
+                            "mcp_server '{name}': 'url' is only valid with transport = \"http\""
+                        ));
+                    }
+                }
+                McpTransportKind::Http => {
+                    let url = server.url.as_deref().unwrap_or("");
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        return invalid(format!(
+                            "mcp_server '{name}': http transport requires a 'url' starting \
+                             with http:// or https://"
+                        ));
+                    }
+                    if !server.command.is_empty() {
+                        return invalid(format!(
+                            "mcp_server '{name}': 'command' is only valid with \
+                             transport = \"stdio\""
+                        ));
+                    }
+                    if !server.env.is_empty() {
+                        return invalid(format!(
+                            "mcp_server '{name}': 'env' is only valid with transport = \"stdio\""
+                        ));
+                    }
+                }
             }
         }
 
@@ -521,6 +621,9 @@ mod defaults {
     }
     pub(super) fn gamma() -> u32 {
         4
+    }
+    pub(super) fn mcp_tool_timeout_secs() -> u64 {
+        30
     }
 }
 
@@ -761,6 +864,65 @@ mod tests {
             jail.create_file("kiln.toml", "")?;
             let config = KilnConfig::load("kiln.toml").expect("default valid");
             assert!(config.server.cors_origins.is_empty());
+            Ok(())
+        });
+    }
+
+    /// SPEC §8.4 MCP servers: transport-mismatched fields, bad names, and
+    /// duplicates are config errors up front; valid stdio and http blocks
+    /// parse with the documented default tool timeout.
+    #[test]
+    fn mcp_server_validation() {
+        figment::Jail::expect_with(|jail| {
+            for bad in [
+                // Missing command on stdio.
+                "[[mcp_server]]\nname = \"a\"\ntransport = \"stdio\"\n",
+                // url on stdio.
+                "[[mcp_server]]\nname = \"a\"\ntransport = \"stdio\"\n\
+                 command = [\"srv\"]\nurl = \"http://x\"\n",
+                // Missing/invalid url on http.
+                "[[mcp_server]]\nname = \"a\"\ntransport = \"http\"\n",
+                "[[mcp_server]]\nname = \"a\"\ntransport = \"http\"\nurl = \"srv:9000\"\n",
+                // command/env on http.
+                "[[mcp_server]]\nname = \"a\"\ntransport = \"http\"\n\
+                 url = \"http://x\"\ncommand = [\"srv\"]\n",
+                "[[mcp_server]]\nname = \"a\"\ntransport = \"http\"\n\
+                 url = \"http://x\"\n[mcp_server.env]\nK = \"v\"\n",
+                // Bad name (metric label), empty name, duplicate name.
+                "[[mcp_server]]\nname = \"a b\"\ntransport = \"stdio\"\ncommand = [\"srv\"]\n",
+                "[[mcp_server]]\nname = \"\"\ntransport = \"stdio\"\ncommand = [\"srv\"]\n",
+                "[[mcp_server]]\nname = \"a\"\ntransport = \"stdio\"\ncommand = [\"srv\"]\n\
+                 [[mcp_server]]\nname = \"a\"\ntransport = \"stdio\"\ncommand = [\"srv\"]\n",
+                // Zero timeout.
+                "[[mcp_server]]\nname = \"a\"\ntransport = \"stdio\"\n\
+                 command = [\"srv\"]\ntool_timeout_secs = 0\n",
+            ] {
+                jail.create_file("kiln.toml", bad)?;
+                let err = KilnConfig::load("kiln.toml").unwrap_err();
+                assert!(matches!(err, ConfigError::Invalid(_)), "{bad}");
+            }
+
+            jail.create_file(
+                "kiln.toml",
+                "[[mcp_server]]\nname = \"fs\"\ntransport = \"stdio\"\n\
+                 command = [\"uvx\", \"mcp-server-fs\"]\n\
+                 [mcp_server.env]\nFS_ROOT = \"/tmp\"\n\
+                 [[mcp_server]]\nname = \"web\"\ntransport = \"http\"\n\
+                 url = \"http://127.0.0.1:9000/mcp\"\ntool_timeout_secs = 5\n",
+            )?;
+            let config = KilnConfig::load("kiln.toml").expect("valid mcp servers parse");
+            assert_eq!(config.mcp_servers.len(), 2);
+            assert_eq!(config.mcp_servers[0].name, "fs");
+            assert_eq!(config.mcp_servers[0].transport, McpTransportKind::Stdio);
+            assert_eq!(config.mcp_servers[0].tool_timeout_secs, 30);
+            assert_eq!(config.mcp_servers[0].env["FS_ROOT"], "/tmp");
+            assert_eq!(config.mcp_servers[1].transport, McpTransportKind::Http);
+            assert_eq!(config.mcp_servers[1].tool_timeout_secs, 5);
+
+            // Default: none configured.
+            jail.create_file("kiln.toml", "")?;
+            let config = KilnConfig::load("kiln.toml").expect("default valid");
+            assert!(config.mcp_servers.is_empty());
             Ok(())
         });
     }

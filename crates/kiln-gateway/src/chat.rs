@@ -229,6 +229,75 @@ async fn handle(
     admit_memory(&state, &entry)?;
 
     let mut validated = request.validate()?;
+
+    // MCP tools in scope (SPEC §8.4, crate::mcp module docs): merged into
+    // the request unless it opted out of tools, a structured-output
+    // grammar constrains the decode, or the model has no tool-call format
+    // (it cannot emit calls — requests without client tools keep working
+    // rather than turning into 400s). A non-empty set switches the request
+    // onto the multi-round execution path; empty leaves the historical
+    // single-round path untouched.
+    let format = entry
+        .template
+        .as_ref()
+        .and_then(|template| template.tool_call_format());
+    let mut mcp_tools =
+        if validated.tools_disabled || validated.grammar.is_some() || format.is_none() {
+            crate::mcp::McpToolSet::empty()
+        } else {
+            state.mcp.snapshot()
+        };
+    if !mcp_tools.is_empty() {
+        mcp_tools.merge_into(&mut validated.tools, &entry.id);
+    }
+    if let (false, Some(format)) = (mcp_tools.is_empty(), format) {
+        let mut rounds = McpRounds {
+            state: Arc::clone(&state),
+            entry: Arc::clone(&entry),
+            messages: std::mem::take(&mut validated.messages),
+            tools: std::mem::take(&mut validated.tools),
+            format,
+            sampling: validated.sampling,
+            client_max_tokens: validated.max_tokens,
+            stop_strings: validated.stop_strings.clone(),
+            priority: validated.priority as i32,
+            rate,
+            base_request_id: request_id.0.clone(),
+            thinking_disabled: false,
+            mcp: mcp_tools,
+            round: 0,
+            prompt_tokens_total: 0,
+            completion_tokens_total: 0,
+        };
+        let mut ctx = CompletionCtx {
+            state: Arc::clone(&state),
+            model: entry.id.clone(),
+            completion_id: format!("chatcmpl-{}", request_id.0.replace('-', "")),
+            created: unix_now(),
+            request_id: request_id.0.clone(),
+            channel: entry.channel.clone(),
+            requests_total: state.metrics.chat_completions_total.clone(),
+            tpm: None,
+        };
+        // Round 1 submits here so its failures surface as proper HTTP
+        // errors, exactly like the single-round path; only rounds 2+ can
+        // fail mid-stream.
+        let first = rounds.submit_round(&mut ctx).await?;
+        return if validated.stream {
+            Ok(stream_mcp_response(
+                ctx,
+                rounds,
+                first,
+                validated.include_usage,
+                deadlines,
+            ))
+        } else {
+            collect_mcp_response(ctx, rounds, first, deadlines)
+                .await
+                .map(IntoResponse::into_response)
+        };
+    }
+
     let prompt = render_prompt(&entry, &validated)?;
     // Tool-call parsing (SPEC §8.2): the family format comes from the
     // model's own chat template; a model without a known format cannot
@@ -236,16 +305,12 @@ async fn handle(
     let tool_parser = if validated.tools.is_empty() {
         None
     } else {
-        let format = entry
-            .template
-            .as_ref()
-            .and_then(|template| template.tool_call_format())
-            .ok_or_else(|| {
-                ApiError::invalid_request(format!(
-                    "model '{}' has no known tool-call format; 'tools' is not supported for it",
-                    entry.id
-                ))
-            })?;
+        let format = format.ok_or_else(|| {
+            ApiError::invalid_request(format!(
+                "model '{}' has no known tool-call format; 'tools' is not supported for it",
+                entry.id
+            ))
+        })?;
         Some(ToolCallParser::new(format, &validated.tools))
     };
 
@@ -757,6 +822,602 @@ pub(crate) fn classify_finished(finished: Finished, stop_matched: bool) -> Strea
             ApiError::worker_crashed("request could not be completed (preempted); retry"),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// MCP execution loop (SPEC §8.4, crate::mcp module docs)
+// ---------------------------------------------------------------------------
+
+/// Drives the MCP execution loop's generation rounds: each round renders
+/// the accumulated conversation, tokenizes, reserves tpm, and submits —
+/// the same pipeline the single-round path runs once. Shared with
+/// `/v1/messages` (crate::messages), whose loop differs only in framing.
+pub(crate) struct McpRounds {
+    pub(crate) state: Arc<AppState>,
+    pub(crate) entry: Arc<ModelEntry>,
+    /// The conversation, growing by an assistant turn + tool results per
+    /// executed round.
+    pub(crate) messages: Vec<kiln_tokenize::ChatMessage>,
+    /// Merged tool definitions (client + MCP), rendered every round.
+    pub(crate) tools: Vec<serde_json::Value>,
+    pub(crate) format: kiln_tokenize::ToolCallFormat,
+    pub(crate) sampling: kiln_proto::v1::SamplingParams,
+    /// The client's explicit max_tokens; None = fill the remaining context
+    /// per round (chat surface only — messages requires it). Bounds each
+    /// round's generation; response usage sums the rounds.
+    pub(crate) client_max_tokens: Option<u32>,
+    pub(crate) stop_strings: Vec<String>,
+    pub(crate) priority: i32,
+    pub(crate) rate: Option<crate::ratelimit::RateLimitHandle>,
+    pub(crate) base_request_id: String,
+    /// Messages-surface render flag (`enable_thinking=false`).
+    pub(crate) thinking_disabled: bool,
+    pub(crate) mcp: crate::mcp::McpToolSet,
+    pub(crate) round: usize,
+    /// Client-visible usage accumulated across rounds.
+    pub(crate) prompt_tokens_total: u64,
+    pub(crate) completion_tokens_total: u64,
+}
+
+/// One round's live worker stream plus its fresh text/tool pipelines.
+pub(crate) struct RoundStream {
+    pub(crate) events: Streaming<TokenEvent>,
+    pub(crate) pipeline: TextPipeline,
+    pub(crate) parser: ToolCallParser,
+    pub(crate) prompt_tokens: u32,
+}
+
+impl McpRounds {
+    /// Renders, tokenizes, reserves, submits the next round; `ctx` is
+    /// updated to the round's worker request id and tpm hold so cancel and
+    /// settlement always target the live round.
+    pub(crate) async fn submit_round(
+        &mut self,
+        ctx: &mut CompletionCtx,
+    ) -> Result<RoundStream, ApiError> {
+        self.round += 1;
+        // Per-round memory admission: a later round's prompt has grown and
+        // headroom may have moved since arrival — same live gate as the
+        // single-round path.
+        admit_memory(&self.state, &self.entry)?;
+        let template = self.entry.template.as_ref().ok_or_else(|| {
+            // Guaranteed by construction: the loop path requires a
+            // tool-call format, which only a template provides.
+            ApiError::internal("MCP loop on a model without a chat template")
+        })?;
+        let extra: &[(&str, serde_json::Value)] = if self.thinking_disabled {
+            &[("enable_thinking", serde_json::Value::Bool(false))]
+        } else {
+            &[]
+        };
+        let prompt = template
+            .render_full(&self.messages, true, &self.tools, extra)
+            .map_err(|err| {
+                ApiError::invalid_request(format!("chat template rejected messages: {err}"))
+            })?;
+        let mut client = WorkerClient::new(self.entry.channel.clone());
+        let token_ids = encode_prompt(&self.entry, &mut client, prompt, false).await?;
+        if token_ids.is_empty() {
+            return Err(ApiError::invalid_request("rendered prompt is empty"));
+        }
+        let prompt_tokens = token_ids.len() as u32;
+
+        let max_context_len = {
+            let info = self.entry.info.read().await;
+            info.as_ref().map(|info| info.max_context_len).unwrap_or(0)
+        };
+        // Same policy as ValidatedChat::effective_max_tokens, recomputed
+        // per round because the prompt grows with every executed round.
+        if max_context_len > 0 && prompt_tokens >= max_context_len {
+            return Err(ApiError::context_length_exceeded(format!(
+                "prompt is {prompt_tokens} tokens but the model's context is {max_context_len}"
+            )));
+        }
+        let max_tokens = match self.client_max_tokens {
+            Some(requested) => requested,
+            None if max_context_len > 0 => max_context_len - prompt_tokens,
+            None => crate::openai::FALLBACK_MAX_TOKENS,
+        };
+
+        let pipeline = TextPipeline::for_entry(&self.entry, &self.stop_strings);
+        let worker_stop_strings = match pipeline {
+            TextPipeline::Passthrough => self.stop_strings.clone(),
+            TextPipeline::Decode { .. } => Vec::new(),
+        };
+        // Round ids stay tied to the request id for log correlation; the
+        // suffix keeps each worker submission unique.
+        let round_request_id = if self.round == 1 {
+            self.base_request_id.clone()
+        } else {
+            format!("{}-r{}", self.base_request_id, self.round)
+        };
+        let submit = SubmitRequest {
+            request_id: round_request_id.clone(),
+            input: Some(submit_request::Input::TokenIds(TokenIds { ids: token_ids })),
+            sampling: Some(self.sampling),
+            stopping: Some(StoppingParams {
+                max_tokens,
+                stop_token_ids: Vec::new(),
+                stop_strings: worker_stop_strings,
+                ignore_eos: false,
+            }),
+            grammar: None, // grammar requests never enter the loop path
+            priority: self.priority,
+            prefix_hint: 0,
+            echo_prompt: false,
+        };
+        // tpm reserves per round (crate::mcp module docs): every round is
+        // real work, priced like the single-round path prices its one.
+        let tpm = crate::ratelimit::reserve_completion_tokens(
+            &self.state,
+            self.rate.as_ref(),
+            prompt_tokens,
+            max_tokens,
+        )?;
+        let events = match client.submit(submit).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                if let Some(tpm) = &tpm {
+                    tpm.settle(0);
+                }
+                return Err(ApiError::from_worker_status(&status));
+            }
+        };
+        ctx.request_id = round_request_id;
+        ctx.tpm = tpm;
+        Ok(RoundStream {
+            events,
+            pipeline,
+            parser: ToolCallParser::new(self.format, &self.tools),
+            prompt_tokens,
+        })
+    }
+
+    /// Whether a finished round's calls should be executed gateway-side:
+    /// natural stop, at least one call, every call complete, every name
+    /// MCP-sourced, and the round cap not yet reached (crate::mcp module
+    /// docs — anything else returns the turn to the client).
+    pub(crate) fn should_execute(
+        &self,
+        finish_reason: &str,
+        stop_matched: bool,
+        calls: &[(String, String)],
+        calls_completed: usize,
+    ) -> bool {
+        finish_reason == "stop"
+            && !stop_matched
+            && !calls.is_empty()
+            && calls_completed == calls.len()
+            && calls.iter().all(|(name, _)| self.mcp.contains(name))
+            && self.round < crate::mcp::MAX_ROUNDS
+    }
+
+    /// Executes the round's calls and appends the assistant turn plus one
+    /// `tool` message per result — the Phase 7 round-trip message flow,
+    /// driven gateway-side. `assistant_content` is the round's client-shaped
+    /// content (chat: verbatim including any think text; messages: text
+    /// segments only — each surface feeds back exactly what a faithful
+    /// client of that surface would). Err = the total budget expired
+    /// mid-call; abort the request.
+    pub(crate) async fn execute_round(
+        &mut self,
+        assistant_content: String,
+        calls: Vec<(String, String)>,
+        deadlines: &Deadlines,
+    ) -> Result<(), TimeoutScope> {
+        let tool_calls = calls
+            .iter()
+            .map(|(name, arguments)| kiln_tokenize::MessageToolCall {
+                call_type: "function".to_owned(),
+                function: kiln_tokenize::MessageToolFunction {
+                    name: name.clone(),
+                    // Completed calls carry parseable JSON in practice; a
+                    // degenerate emission falls back to {} — mirroring the
+                    // wire validation's treatment of empty arguments.
+                    arguments: serde_json::from_str(arguments)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                },
+            })
+            .collect();
+        self.messages.push(kiln_tokenize::ChatMessage {
+            role: "assistant".to_owned(),
+            content: assistant_content,
+            tool_calls: Some(tool_calls),
+        });
+        for (name, arguments) in &calls {
+            let result = self
+                .mcp
+                .call(&self.state.metrics, name, arguments, deadlines.total())
+                .await;
+            match result {
+                crate::mcp::ToolCallResult::Text(text) => {
+                    self.messages
+                        .push(kiln_tokenize::ChatMessage::text("tool", text));
+                }
+                crate::mcp::ToolCallResult::TotalTimeout => return Err(TimeoutScope::Total),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CompletionCtx {
+    /// Settles an intermediate MCP-loop round: reconcile its tpm hold to
+    /// actuals and count its tokens. `requests_total` is deliberately not
+    /// touched — the request counts once, at its terminal round.
+    pub(crate) fn settle_round(&mut self, finished: &Finished) {
+        if let Some(tpm) = self.tpm.take() {
+            tpm.settle(u64::from(finished.prompt_tokens) + u64::from(finished.completion_tokens));
+        }
+        let metrics = &self.state.metrics;
+        metrics
+            .prompt_tokens_total
+            .with_label_values(&[&self.model])
+            .inc_by(u64::from(finished.prompt_tokens));
+        metrics
+            .completion_tokens_total
+            .with_label_values(&[&self.model])
+            .inc_by(u64::from(finished.completion_tokens));
+    }
+}
+
+/// Non-streaming chat under the MCP loop: rounds accumulate content (the
+/// client-visible completion concatenates every round, matching what a
+/// streaming client would have watched arrive); executed rounds' calls
+/// vanish into the conversation, a terminal round's calls surface as
+/// normal `tool_calls`.
+async fn collect_mcp_response(
+    mut ctx: CompletionCtx,
+    mut rounds: McpRounds,
+    first: RoundStream,
+    mut deadlines: Deadlines,
+) -> Result<axum::Json<ChatCompletion>, ApiError> {
+    let mut content_all = String::new();
+    let mut next_round = Some(first);
+    loop {
+        let RoundStream {
+            mut events,
+            mut pipeline,
+            parser,
+            ..
+        } = match next_round.take() {
+            Some(round) => round,
+            None => rounds.submit_round(&mut ctx).await?,
+        };
+        let mut route = ToolRoute::new(Some(parser));
+        let mut content = String::new();
+        let mut calls: Vec<(String, String)> = Vec::new();
+        let apply = |events: Vec<ToolEvent>, content: &mut String, calls: &mut Vec<_>| {
+            for event in events {
+                match event {
+                    ToolEvent::Content(text) => content.push_str(&text),
+                    ToolEvent::CallStart { name, .. } => calls.push((name, String::new())),
+                    ToolEvent::CallArgs { index, delta } => calls[index].1.push_str(&delta),
+                    ToolEvent::CallEnd { .. } => {}
+                }
+            }
+        };
+        let end = loop {
+            match next_event(&mut events, &mut deadlines).await {
+                WorkerEvent::Event(event) => match event.event {
+                    Some(token_event::Event::Tokens(chunk)) => {
+                        let was_matched = pipeline.stop_matched();
+                        let text = pipeline.push(chunk)?;
+                        apply(route.push(text), &mut content, &mut calls);
+                        if !was_matched && pipeline.stop_matched() {
+                            ctx.cancel_worker().await;
+                        }
+                    }
+                    Some(token_event::Event::Finished(mut finished)) => {
+                        let tail = pipeline.finish()?;
+                        apply(route.finish(tail), &mut content, &mut calls);
+                        pipeline.apply_usage(&mut finished);
+                        break classify_finished(finished, pipeline.stop_matched());
+                    }
+                    _ => {}
+                },
+                WorkerEvent::Closed => {
+                    break StreamEnd::Failed(ApiError::worker_crashed(
+                        "the worker stream ended without a result (worker crashed mid-request)",
+                    ));
+                }
+                WorkerEvent::Rpc(status) => {
+                    break StreamEnd::Failed(ApiError::from_worker_status(&status));
+                }
+                WorkerEvent::TimedOut(scope) => {
+                    break StreamEnd::Failed(ctx.abort_for_timeout(scope).await);
+                }
+            }
+        };
+
+        match end {
+            StreamEnd::Failed(err) => return Err(err),
+            StreamEnd::Done {
+                finished,
+                finish_reason,
+            } => {
+                rounds.prompt_tokens_total += u64::from(finished.prompt_tokens);
+                rounds.completion_tokens_total += u64::from(finished.completion_tokens);
+                if rounds.should_execute(
+                    finish_reason,
+                    pipeline.stop_matched(),
+                    &calls,
+                    route.calls_completed(),
+                ) {
+                    ctx.settle_round(&finished);
+                    content_all.push_str(&content);
+                    if let Err(scope) = rounds.execute_round(content, calls, &deadlines).await {
+                        return Err(ctx.abort_for_timeout(scope).await);
+                    }
+                    continue;
+                }
+
+                content_all.push_str(&content);
+                ctx.record_ok(&finished);
+                let tool_calls = (!calls.is_empty()).then(|| {
+                    calls
+                        .into_iter()
+                        .map(|(name, arguments)| ResponseToolCall {
+                            id: new_call_id(),
+                            call_type: "function",
+                            function: ResponseFunction { name, arguments },
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let content = match &tool_calls {
+                    Some(_) if content_all.is_empty() => None,
+                    _ => Some(content_all),
+                };
+                return Ok(axum::Json(ChatCompletion {
+                    id: ctx.completion_id.clone(),
+                    object: "chat.completion",
+                    created: ctx.created,
+                    model: ctx.model.clone(),
+                    choices: vec![Choice {
+                        index: 0,
+                        message: AssistantMessage {
+                            role: "assistant",
+                            content,
+                            tool_calls,
+                        },
+                        logprobs: None,
+                        finish_reason: route.adjust_reason(finish_reason),
+                    }],
+                    usage: rounds_usage(&rounds),
+                }));
+            }
+        }
+    }
+}
+
+/// Summed usage across the loop's rounds — the client pays for (and sees)
+/// every round, like the reference APIs' server-side tools.
+pub(crate) fn rounds_usage(rounds: &McpRounds) -> Usage {
+    let prompt = u32::try_from(rounds.prompt_tokens_total).unwrap_or(u32::MAX);
+    let completion = u32::try_from(rounds.completion_tokens_total).unwrap_or(u32::MAX);
+    Usage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt.saturating_add(completion),
+    }
+}
+
+/// Streaming chat under the MCP loop: one SSE stream spans every round.
+/// Content deltas stream live; tool-call deltas are withheld until the
+/// round settles — an executed round's calls are internal plumbing the
+/// client never sees, a terminal round's flush as ordinary `tool_calls`
+/// deltas (OpenAI's accumulation contract doesn't constrain granularity).
+fn stream_mcp_response(
+    mut ctx: CompletionCtx,
+    mut rounds: McpRounds,
+    first: RoundStream,
+    include_usage: bool,
+    mut deadlines: Deadlines,
+) -> Response {
+    let usage_null: Option<Option<Usage>> = if include_usage { Some(None) } else { None };
+
+    // Captured by value: the chunk closures must not borrow `ctx`, which
+    // the round loop needs mutably.
+    let completion_id = ctx.completion_id.clone();
+    let created = ctx.created;
+    let model = ctx.model.clone();
+    let stream = async_stream::stream! {
+        let chunk = move |choices: Vec<ChunkChoice>, usage: Option<Option<Usage>>| ChatCompletionChunk {
+            id: completion_id.clone(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.clone(),
+            choices,
+            usage,
+        };
+        let delta_chunk = |delta: Delta, usage: Option<Option<Usage>>| chunk(
+            vec![ChunkChoice {
+                index: 0,
+                delta,
+                logprobs: None,
+                finish_reason: None,
+            }],
+            usage,
+        );
+
+        // Role preamble chunk, once for the whole loop.
+        yield Ok::<SseEvent, Infallible>(sse_json(&delta_chunk(
+            Delta { role: Some("assistant"), content: Some(String::new()), tool_calls: None },
+            usage_null,
+        )));
+
+        let mut next_round = Some(first);
+        'rounds: loop {
+            let RoundStream { mut events, mut pipeline, parser, .. } = match next_round.take() {
+                Some(round) => round,
+                None => match rounds.submit_round(&mut ctx).await {
+                    Ok(round) => round,
+                    Err(err) => {
+                        ctx.record_err(&err);
+                        yield Ok(sse_json(&err.body()));
+                        return;
+                    }
+                },
+            };
+            let mut route = ToolRoute::new(Some(parser));
+            let mut content = String::new();
+            let mut calls: Vec<(String, String)> = Vec::new();
+
+            let end = loop {
+                match next_event(&mut events, &mut deadlines).await {
+                    WorkerEvent::Event(event) => match event.event {
+                        Some(token_event::Event::Tokens(tc)) => {
+                            let was_matched = pipeline.stop_matched();
+                            let text = match pipeline.push(tc) {
+                                Ok(text) => text,
+                                Err(err) => {
+                                    ctx.record_err(&err);
+                                    yield Ok(sse_json(&err.body()));
+                                    return;
+                                }
+                            };
+                            if !was_matched && pipeline.stop_matched() {
+                                ctx.cancel_worker().await;
+                            }
+                            for event in route.push(text) {
+                                match event {
+                                    ToolEvent::Content(text) => {
+                                        content.push_str(&text);
+                                        yield Ok(sse_json(&delta_chunk(Delta {
+                                            content: Some(text),
+                                            ..Delta::default()
+                                        }, usage_null)));
+                                    }
+                                    ToolEvent::CallStart { name, .. } =>
+                                        calls.push((name, String::new())),
+                                    ToolEvent::CallArgs { index, delta } =>
+                                        calls[index].1.push_str(&delta),
+                                    ToolEvent::CallEnd { .. } => {}
+                                }
+                            }
+                            continue;
+                        }
+                        Some(token_event::Event::Finished(mut finished)) => {
+                            match pipeline.finish() {
+                                Ok(tail) => {
+                                    for event in route.finish(tail) {
+                                        match event {
+                                            ToolEvent::Content(text) => {
+                                                content.push_str(&text);
+                                                yield Ok(sse_json(&delta_chunk(Delta {
+                                                    content: Some(text),
+                                                    ..Delta::default()
+                                                }, usage_null)));
+                                            }
+                                            ToolEvent::CallStart { name, .. } =>
+                                                calls.push((name, String::new())),
+                                            ToolEvent::CallArgs { index, delta } =>
+                                                calls[index].1.push_str(&delta),
+                                            ToolEvent::CallEnd { .. } => {}
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    ctx.record_err(&err);
+                                    yield Ok(sse_json(&err.body()));
+                                    return;
+                                }
+                            }
+                            pipeline.apply_usage(&mut finished);
+                            break classify_finished(finished, pipeline.stop_matched());
+                        }
+                        _ => continue,
+                    },
+                    WorkerEvent::Closed => break StreamEnd::Failed(ApiError::worker_crashed(
+                        "the worker stream ended without a result (worker crashed mid-request)",
+                    )),
+                    WorkerEvent::Rpc(status) =>
+                        break StreamEnd::Failed(ApiError::from_worker_status(&status)),
+                    WorkerEvent::TimedOut(scope) =>
+                        break StreamEnd::Failed(ctx.abort_for_timeout(scope).await),
+                }
+            };
+
+            match end {
+                StreamEnd::Failed(err) => {
+                    tracing::warn!(target: "kiln::chat", model = %ctx.model, code = err.code,
+                        "streaming completion failed mid-stream: {}", err.message);
+                    ctx.record_err(&err);
+                    yield Ok(sse_json(&err.body()));
+                    return;
+                }
+                StreamEnd::Done { finished, finish_reason } => {
+                    rounds.prompt_tokens_total += u64::from(finished.prompt_tokens);
+                    rounds.completion_tokens_total += u64::from(finished.completion_tokens);
+                    if rounds.should_execute(
+                        finish_reason,
+                        pipeline.stop_matched(),
+                        &calls,
+                        route.calls_completed(),
+                    ) {
+                        ctx.settle_round(&finished);
+                        if let Err(scope) = rounds.execute_round(content, calls, &deadlines).await {
+                            let err = ctx.abort_for_timeout(scope).await;
+                            ctx.record_err(&err);
+                            yield Ok(sse_json(&err.body()));
+                            return;
+                        }
+                        continue 'rounds;
+                    }
+
+                    // Terminal round: flush withheld calls as deltas, then
+                    // finish exactly like the single-round stream.
+                    for (index, (name, arguments)) in calls.iter().enumerate() {
+                        yield Ok(sse_json(&delta_chunk(Delta {
+                            tool_calls: Some(vec![DeltaToolCall {
+                                index,
+                                id: Some(new_call_id()),
+                                call_type: Some("function"),
+                                function: DeltaFunction {
+                                    name: Some(name.clone()),
+                                    arguments: String::new(),
+                                },
+                            }]),
+                            ..Delta::default()
+                        }, usage_null)));
+                        if !arguments.is_empty() {
+                            yield Ok(sse_json(&delta_chunk(Delta {
+                                tool_calls: Some(vec![DeltaToolCall {
+                                    index,
+                                    id: None,
+                                    call_type: None,
+                                    function: DeltaFunction {
+                                        name: None,
+                                        arguments: arguments.clone(),
+                                    },
+                                }]),
+                                ..Delta::default()
+                            }, usage_null)));
+                        }
+                    }
+                    yield Ok(sse_json(&chunk(
+                        vec![ChunkChoice {
+                            index: 0,
+                            delta: Delta::default(),
+                            logprobs: None,
+                            finish_reason: Some(route.adjust_reason(finish_reason)),
+                        }],
+                        usage_null,
+                    )));
+                    if include_usage {
+                        yield Ok(sse_json(&chunk(Vec::new(), Some(Some(rounds_usage(&rounds))))));
+                    }
+                    yield Ok(SseEvent::default().data("[DONE]"));
+                    ctx.record_ok(&finished);
+                    return;
+                }
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

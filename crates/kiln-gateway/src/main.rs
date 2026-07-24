@@ -85,10 +85,11 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         registry,
         lifecycle,
-        metrics,
+        metrics: Arc::clone(&metrics),
         auth,
         rate: kiln_gateway::ratelimit::RateLimiter::from_config(&config.auth),
         timeouts: kiln_gateway::timeout::Timeouts::from_config(&config.server),
+        mcp: kiln_gateway::mcp::McpRegistry::start(&config.mcp_servers, metrics),
         jobs,
         registrar,
         shutdown: http_shutdown_rx,
@@ -99,6 +100,7 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(addr = %addr, config = %config_path, "kiln-gateway listening");
 
     let cors = kiln_gateway::cors::layer(&config.server);
+    let mcp = Arc::clone(&state.mcp);
     axum::serve(listener, app::router(state, cors))
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
@@ -108,6 +110,7 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("http server stopped; shutting down workers");
     supervisor.shutdown().await;
+    mcp.shutdown().await;
     Ok(())
 }
 

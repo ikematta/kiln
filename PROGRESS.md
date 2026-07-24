@@ -8039,3 +8039,153 @@
   ```
 - Next: nothing scheduled — SPEC §12 remains complete; §8.3 now covers
   rate limits, timeouts, size limits, and CORS, all enforced.
+
+## [2026-07-24] Gateway follow-up / SPEC §8.4 — MCP client — DONE
+- What:
+  - MCP client in kiln-gateway (new SPEC §8.4; full design in
+    `crates/kiln-gateway/src/mcp.rs` module docs). `[[mcp_server]]` blocks
+    in kiln.toml: name; `transport = "stdio"` (spawned `command` + optional
+    `env`, newline-delimited JSON-RPC) or `"http"` (streamable-HTTP `url`);
+    per-server `tool_timeout_secs` (default 30). Zero new Rust deps —
+    tokio process/io + reqwest + serde_json, all already direct deps.
+  - Per-server supervision task: initialize handshake → paginated
+    tools/list (re-list on tools/list_changed) → serve; on death/failure,
+    reconnect on the worker supervisor's exact backoff curve
+    (`supervisor::backoff`, now pub(crate)), retrying indefinitely — an
+    unreachable external server is transient, not a crash loop, and the
+    gateway serves normally without it.
+  - Tool merge: discovered tools convert to the OpenAI function shape both
+    adapters already normalize client tools into and append to
+    `validated.tools` before template render — model-indistinguishable
+    from client tools. Client tools shadow same-named MCP tools (the
+    gateway never executes a name the client redefined); cross-server
+    duplicates resolve config-order-first. Merge skipped for
+    `tool_choice:"none"` (new `tools_disabled` flag on both validated
+    types), grammar-constrained requests, and models without a tool-call
+    format (they keep working instead of turning into 400s).
+  - Execution loop on BOTH surfaces, streaming and non-streaming: a turn
+    whose completed calls are all MCP-sourced executes gateway-side —
+    assistant turn + `tool` results appended, re-render, resubmit (the
+    Phase 7 round-trip message flow, driven server-side), ≤8 rounds
+    (MAX_ROUNDS), then hand the turn to the client as normal `tool_calls`;
+    mixed turns hand over whole. tpm reserves per round; usage sums
+    rounds; memory admission per round. Streaming: one SSE stream spans
+    rounds — content deltas live, tool-call deltas withheld (executed
+    calls invisible; terminal calls flush as ordinary deltas); round 1
+    submits before the stream so its failures stay proper HTTP errors.
+    Requests with no MCP tools in scope take the historical code paths
+    untouched.
+  - Timeouts (decided, held to the tpm-reservation/TTFT-anchor standard):
+    `server.total_timeout_secs` COUNTS MCP execution — the request's
+    Deadlines survive across rounds and every call runs under
+    min(per-tool, total); total expiry mid-call is the same 504
+    `total_timeout` as B1 (tool round trips are wall-clock the client
+    waits; excluding them would let one request hold a slot past the
+    operator's cap). Independently, `tool_timeout_secs` bounds each call,
+    and its expiry feeds an error tool-result to the model instead of
+    failing the request (MCP's own isError convention) — which is what
+    bounds a hung MCP server even in the DEFAULT config, where no total
+    timeout is armed. TTFT semantics unchanged (arrival → first token of
+    round 1).
+  - Operator surface: `GET /admin/mcp` (per server: transport, state,
+    attempt/last_error, protocol version, discovered tools with
+    cross-server shadowing marked `active:false`); metrics `kiln_mcp_up`,
+    `kiln_mcp_connect_attempts_total{server,outcome}`,
+    `kiln_mcp_tool_calls_total{server,tool,outcome}`. Client-supplied
+    tools are per-request and never listed; a client tool shadowing an MCP
+    tool logs at info.
+  - Process hygiene: stdio children spawn in their own process group and
+    connection teardown kills the group via /bin/kill — the worker
+    supervisor's exact discipline — so a `uv run`/`npx` wrapper or a
+    server stuck mid-tool-call cannot orphan (first smoke run leaked
+    exactly that; e2e now asserts no tagged processes survive shutdown).
+  - Tests: +10 gateway unit (stdio JSON-RPC framing over duplex pipes:
+    handshake/call round trip, caller-side timeout + notifications/
+    cancelled + late-reply discard, EOF → pending failure + broken flag,
+    server ping answered, list_changed surfaced, rpc-error typing; merge
+    shadowing; content flattening; admin listing JSON incl. shadowing +
+    retrying states; config validation matrix). New e2e
+    `tests/e2e/mcp_server.py` — a REAL MCP server on the official `mcp`
+    SDK (FastMCP, the protocol's reference implementation; test-only e2e
+    dep, MIT) — and `tests/e2e/test_mcp.py` (11 tests, 4 stacks,
+    Qwen3-0.6B rust worker).
+- Decisions:
+  - Executed MCP rounds are hidden from clients (one final completion,
+    like the reference APIs' server-side tools): the wire has no way to
+    attach results to some calls and hand over others, and the acceptance
+    bar is "final answer using the real result".
+  - Per-tool expiry = error tool-result, not request death: the model can
+    answer without the tool, and it is the bound that protects the default
+    config. Verified live: 300s-hanging server + tool_timeout 2 + NO total
+    timeout → request terminal in ~21s (greedy 0.6B retried to the round
+    cap; 7 timeout-outcome calls); tool_timeout 60 + total_timeout 12 →
+    504 total_timeout at ~12.3s mid-call.
+  - MAX_ROUNDS=8 is a const, not config — a loop-safety net, not a knob;
+    on cap the turn returns as `tool_calls` (still OpenAI-legal, a client
+    can continue manually).
+  - MCP reconnect retries forever (vs the worker's 3-attempt cap):
+    documented in mcp.rs — a worker crash loop is our own binary
+    misbehaving; an absent external server is a normal condition.
+  - Streamable-HTTP SSE parsing normalizes CRLF framing (uvicorn-style
+    servers emit \r\n; the first e2e run caught the gateway never
+    completing an event) and parses a final unterminated event at EOF.
+- Deviations:
+  - SPEC.md gains §8.4 (same dated-annotation pattern as §8.3's CORS
+    entry) — recording the shipped design, not changing prior spec.
+  - docs/CONFIGURATION.md still described rpm/tpm and timeouts as
+    parsed-but-unenforced and lacked the timeout keys — stale since the
+    merged PRs #38/#39 and directly contradicted by the new MCP docs that
+    reference total_timeout semantics, so this change fixes that section
+    (enforcement notes + ttft/total rows) rather than shipping
+    contradictory pages side by side.
+- Acceptance:
+  ```
+  $ uv run --project tests/e2e pytest tests/e2e/test_mcp.py -v
+    test_mcp_round_trip_openai PASSED
+      (openai SDK, NO tools in the request: model calls MCP get_weather,
+       gateway executes it against the real FastMCP server, model answers
+       "21°C / clear"; finish_reason stop, no tool_calls in the response,
+       kiln_mcp_tool_calls_total{outcome="ok"} incremented, usage summed
+       across rounds)
+    test_mcp_streaming_matches_non_streaming PASSED
+      (one SSE stream spans rounds; zero tool_call deltas leak; streamed
+       content and summed usage byte-equal the non-streaming response —
+       greedy determinism holds through the loop)
+    test_mcp_round_trip_anthropic PASSED
+      (anthropic SDK: end_turn, thinking + text blocks, no tool_use
+       blocks, answer carries the real result)
+    test_client_tool_merges_alongside_mcp_tools PASSED
+    test_client_tool_shadows_mcp_tool PASSED
+      (client-supplied get_weather comes back as ordinary tool_calls;
+       MCP execution counter frozen)
+    test_admin_mcp_listing PASSED (connected state + tools + input_schema
+       via admin bearer; 401 without)
+    test_reconnect_after_server_death PASSED
+      (SIGKILL the tagged server process: reconnect on backoff, fresh
+       child, tools work again)
+    test_hung_tool_bounded_by_per_tool_timeout PASSED
+      (300s-sleeping tool, tool_timeout 2, NO total timeout: request
+       terminal well under the hang — real timed assertion)
+    test_hung_tool_bounded_by_total_timeout PASSED
+      (same hang, tool_timeout 60, total_timeout 12: HTTP 504
+       code=total_timeout in <30s, kiln_timeout_total{scope="total"}++)
+    test_unreachable_server_retries_while_gateway_serves PASSED
+      (nonexistent stdio command: /readyz 200, ≥2 backoff attempts
+       counted, dead server's kiln_mcp_up 0 while the http server's is 1)
+    test_http_transport_round_trip PASSED
+      (streamable-HTTP transport end-to-end against the FastMCP http
+       server spawned by the test)
+    11 passed in 88.85s
+  $ cargo test --workspace -> 56 suites, 287 passed, 0 failed
+      (kiln-gateway 130, incl. the 10 new MCP unit tests)
+  $ pytest tests/e2e/test_tool_calls.py test_chat.py test_messages.py
+      test_timeouts.py -> 51 passed (the pipelines the loop touches,
+      unregressed)
+  CI shapes: cargo fmt --check clean; clippy -D warnings clean on default
+      AND --no-default-features; cargo build --workspace
+      --no-default-features clean (compile-linux shape); ruff check +
+      format --check clean on python/ tests/e2e scripts; test_mcp.py runs
+      under the suite-wide pytest step in test-macos (the `mcp` e2e dep
+      installs via the existing `uv sync --project tests/e2e`).
+  ```
+- Next: nothing scheduled — PM ruling on merge after CI.

@@ -71,7 +71,9 @@ const DRAIN_POLL: Duration = Duration::from_millis(250);
 /// so admissions racing a load window cannot consume unprojected bytes.
 pub(crate) const LOAD_OVERHEAD_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 
-fn backoff(attempt: u32) -> Duration {
+/// Crash-restart backoff curve; also reused by the MCP client's reconnect
+/// loop (crate::mcp) so external-server retries pace like worker restarts.
+pub(crate) fn backoff(attempt: u32) -> Duration {
     // 500ms, 1s, 2s, ... capped at 10s.
     let exp = attempt.saturating_sub(1).min(5);
     Duration::from_millis(500 << exp).min(Duration::from_secs(10))

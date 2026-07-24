@@ -98,6 +98,29 @@ ssd_tier = true
 # verifies parity on your hardware either way.
 paged_attention_kernel = true
 
+# External MCP tool servers (SPEC §8.4), one optional [[mcp_server]] block
+# each. The gateway connects at startup, discovers the server's tools, and
+# merges them into every chat/messages request; when the model calls one,
+# the GATEWAY executes it against the server and feeds the result back,
+# looping until the model answers (clients just see the final answer).
+# Unreachable servers retry forever with backoff and cost nothing; state is
+# visible at GET /admin/mcp and in the kiln_mcp_* metrics. A client tool
+# with the same name as an MCP tool wins for that request. Full design:
+# crates/kiln-gateway/src/mcp.rs module docs; reference:
+# docs/CONFIGURATION.md.
+#[[mcp_server]]
+#name = "fetch"                       # unique [A-Za-z0-9_-]; metric label
+#transport = "stdio"                  # "stdio" | "http"
+#command = ["uvx", "mcp-server-fetch"] # stdio: spawned as a child (own
+#                                      # process group, killed as a tree)
+## env = { SOME_VAR = "value" }        # stdio: extra child environment
+## url = "http://127.0.0.1:9000/mcp"   # http: streamable-HTTP endpoint
+#tool_timeout_secs = 30               # per-call bound; expiry feeds an
+#                                      # error tool-result to the model, it
+#                                      # does NOT fail the request. The
+#                                      # server.total_timeout_secs budget
+#                                      # ALSO counts MCP execution and does.
+
 # One [[model]] block per servable model.
 [[model]]
 id = "qwen3-14b-4bit"

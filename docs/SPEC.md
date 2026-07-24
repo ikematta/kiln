@@ -279,6 +279,14 @@ CORS (added 2026-07-24, PROGRESS.md): the gateway sends **no CORS headers by def
 >
 > **This section's backlog is closed** — nothing in §8.3 remains parsed-but-unenforced.
 
+### 8.4 MCP tool servers (added 2026-07-24, PROGRESS.md)
+
+The gateway embeds an MCP client: `[[mcp_server]]` blocks in kiln.toml (name; `transport = "stdio"` with a spawned `command`, or `"http"` with a streamable-HTTP `url`; optional stdio `env`; per-server `tool_timeout_secs`, default 30). Per server, a supervision task connects at startup (`initialize` → `notifications/initialized` → paginated `tools/list`), re-lists on `tools/list_changed`, and reconnects on the §2.2 worker-supervisor backoff curve — retrying **indefinitely**, since an unreachable external server is a transient condition, not a crash loop; the gateway serves normally without it. Live state: `GET /admin/mcp` (servers, connection state, discovered tools, shadowing) and `kiln_mcp_up` / `kiln_mcp_connect_attempts_total` / `kiln_mcp_tool_calls_total`.
+
+Discovered tools convert to the OpenAI function shape of §8.2 and merge into chat/messages requests (client tools shadow same-named MCP tools; across servers config order wins; the merge is skipped for `tool_choice: "none"`, grammar-constrained requests, and models without a tool-call format). A turn whose completed calls are **all** MCP-sourced is executed by the gateway — results feed back as `tool` messages, re-render, resubmit, at most 8 rounds — so the client only sees the final answer, with usage summed across rounds and the tpm reservation (§8.3) taken per round. Any client-supplied call hands the whole turn to the client unchanged.
+
+Timeout interaction (decided, §8.3-grade): **`total_timeout_secs` counts MCP execution** — it is a client-experience bound anchored at arrival, and tool round trips are wall-clock the client waits, so expiry mid-call is the same 504 `total_timeout`; independently, **`tool_timeout_secs` bounds each call** and its expiry feeds an error tool-result back to the model instead of failing the request (MCP's `isError` convention) — which is what bounds a hung MCP server even in the default configuration where no total timeout is set. Rationale and full design: `kiln-gateway/src/mcp.rs` module docs.
+
 ---
 
 ## 9. `kiln-jobs` and Python worker
