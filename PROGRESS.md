@@ -7685,3 +7685,21 @@
 - Next: PR #37 carries the full change; acceptance is now complete on
   every axis of the task. PM ruling on merge after CI. (The pasted
   token should be revoked and reissued — it transited chat.)
+
+## [2026-07-23] Phase 9 follow-up / kiln-jobs — PR #37 MERGED (PM ruling) — DONE
+- What: PM ruled to merge on green CI (run 30058431692, all four jobs:
+  lint 47s, compile-linux 2m4s, test-macos-release 4m2s, test-macos
+  1h4m26s — the four new download-auth stub tests ran live on the
+  runner). Merge commit 4ad3b9f (merge commit, not squash — PROGRESS
+  commit references stay valid on main). HF_TOKEN now authenticates
+  gated/private hub downloads on main, in both kiln-jobs and
+  fetch-test-model.sh; behavior without the variable is unchanged.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 37 -> 4/4 pass (run 30058431692)
+  $ gh pr merge 37 --merge -> merged; origin/main head 4ad3b9f
+  ```
+- Next: nothing scheduled — SPEC §12 remains complete. (Reminder for
+  the PM: revoke/reissue the read token used for the acceptance run —
+  it transited chat.)
