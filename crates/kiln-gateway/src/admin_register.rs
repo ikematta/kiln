@@ -202,6 +202,7 @@ fn hub_error(message: String) -> ApiError {
         error_type: "server_error",
         code: "hub_unavailable",
         message,
+        retry_after_secs: None,
     }
 }
 
@@ -470,6 +471,7 @@ mod tests {
             lifecycle,
             metrics,
             auth: Auth::from_config(&config.auth).expect("auth"),
+            rate: crate::ratelimit::RateLimiter::from_config(&config.auth),
             jobs: crate::admin::JobsProxy::external(PathBuf::from("/tmp/kiln-regadd.sock"))
                 .expect("proxy"),
             registrar,

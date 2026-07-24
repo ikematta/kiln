@@ -87,6 +87,7 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         lifecycle,
         metrics,
         auth,
+        rate: kiln_gateway::ratelimit::RateLimiter::from_config(&config.auth),
         jobs,
         registrar,
         shutdown: http_shutdown_rx,

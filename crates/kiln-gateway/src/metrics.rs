@@ -43,6 +43,10 @@ pub struct Metrics {
     /// Requests refused by per-request memory admission (SPEC §2.3/§8.2,
     /// Phase 9 part 2), per model.
     pub admission_rejects_total: IntCounterVec,
+    /// Requests rejected by per-key rate limiting (SPEC §8.3), by key name
+    /// and exhausted scope (`requests | tokens`). Bounded cardinality: keys
+    /// come from config.
+    pub rate_limited_total: IntCounterVec,
     /// Machine memory budget (SPEC §2.3): total unified memory ×
     /// `memory.budget_fraction`, or the explicit `memory.budget_bytes`.
     pub memory_budget_bytes: IntGauge,
@@ -249,6 +253,12 @@ impl Metrics {
              exceeded the machine budget headroom)",
             &["model"],
         )?;
+        let rate_limited_total = counter(
+            "kiln_rate_limited_total",
+            "Requests rejected by per-key rate limiting, by key name and exhausted \
+             scope (requests | tokens)",
+            &["key", "scope"],
+        )?;
         let plain_gauge = |name: &str, help: &str| {
             let gauge = IntGauge::new(name, help)?;
             registry.register(Box::new(gauge.clone()))?;
@@ -410,6 +420,7 @@ impl Metrics {
             worker_up,
             worker_unloads_total,
             admission_rejects_total,
+            rate_limited_total,
             memory_budget_bytes,
             memory_used_bytes,
             memory_reserved_bytes,

@@ -7703,3 +7703,97 @@
 - Next: nothing scheduled — SPEC §12 remains complete. (Reminder for
   the PM: revoke/reissue the read token used for the acceptance run —
   it transited chat.)
+
+## [2026-07-24] Phase 9 follow-up / SPEC §8.3 — per-key rpm/tpm rate limiting ENFORCED — DONE
+- What:
+  - New `crates/kiln-gateway/src/ratelimit.rs`: per-key token buckets
+    (continuous refill at limit/60 per second, start full) built from the
+    existing `auth.api_keys` rpm/tpm fields. rpm enforced by a tower
+    route-layer middleware (`from_fn_with_state`, same pattern as auth)
+    layered directly inside auth on `/v1/*` and `/v1/messages`; auth
+    stamps the verified key's limiter handle into request extensions.
+  - tpm enforced reserve-then-reconcile in all three completion handlers
+    (chat, completions, messages): `prompt_tokens + max_tokens` reserved
+    atomically right before `Submit`, refunded down to client-visible
+    usage in `CompletionCtx::record_ok`; a request whose worst case
+    exceeds the whole per-minute budget is rejected up front with an
+    actionable message; abandoned/errored requests forfeit their
+    reservation until refill (anti-abuse; self-heals within a minute).
+  - `ApiError` grew `retry_after_secs` (emitted as a `Retry-After` header
+    on both envelopes) plus OpenAI-shape 429 constructors
+    (`type: requests|tokens`, `code: rate_limit_exceeded`); the Anthropic
+    envelope already mapped 429 → `rate_limit_error`.
+  - New `kiln_rate_limited_total{key,scope}` counter. Config validation
+    now rejects `rpm = 0` / `tpm = 0` and duplicate api-key names.
+    SPEC §8.3 backlog note updated: rate limits enforced, TTFT/total
+    timeouts remain backlogged.
+  - Tests: 8 ratelimit unit tests; new e2e `tests/e2e/test_rate_limit.py`
+    (6 tests on a dedicated stack, one dedicated key per test).
+- Decisions:
+  - tpm = reserve worst case up front, reconcile at settle (vs. simpler
+    after-the-fact deduction): pure post-deduction lets N concurrent
+    requests all pass a "budget left?" check and jointly overshoot by up
+    to N×max_tokens — the same over-admission class the Phase 9
+    admission ledger needed a real fix for. Reservation makes
+    check-and-take one atomic operation under the bucket lock. Cost: a
+    large max_tokens holds budget while in flight; restored at settle.
+  - Unsettled reservations (mid-stream disconnect, post-submit error)
+    forfeit rather than refund: refunding would let a client burn GPU via
+    disconnect-spam without ever depleting tpm.
+  - No Retry-After on can-never-fit tpm rejections (waiting cannot help;
+    the message says to lower max_tokens instead).
+  - Buckets are in-memory; a gateway restart forgives spent budget
+    (single-host server, no distributed state to reconcile).
+- Deviations: none.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-gateway -> 107 passed, 0 failed (incl. new
+      ratelimit tests: 32 threads racing one rpm=8 bucket admit exactly
+      8; two concurrent 330-token reservations on a 400 tpm bucket admit
+      exactly 1; settle idempotent + capped; deterministic refill via
+      fabricated Instants)
+  $ cargo test --workspace -> 56 suites, 264 passed, 0 failed
+  $ uv run --project tests/e2e pytest tests/e2e/test_rate_limit.py -v
+      test_rpm_limit_429_then_recovers_after_the_window PASSED
+        (rpm=2: 2x200 -> 429 w/ Retry-After -> still 429 inside window
+         -> 200 only after sleeping the advertised Retry-After)
+      test_concurrent_burst_admits_exactly_the_limit PASSED
+        (12 simultaneous on rpm=5: exactly 5x200 + 7x429)
+      test_anthropic_surface_gets_rate_limit_error_envelope PASSED
+      test_tpm_request_that_can_never_fit_is_rejected_up_front PASSED
+        (max_tokens=1000 vs tpm=300: immediate 429 "tokens", no
+         Retry-After, zero consumption proven by a following 200)
+      test_tpm_reservation_is_reconciled_to_actual_usage PASSED
+        (450-token reservation stop-string-truncated to ~50 actual;
+         the refund is what lets the next ~490 reservation fit)
+      test_tpm_concurrent_reservations_cannot_overcommit PASSED
+        (two simultaneous 280-token requests on tpm=400: exactly one 200)
+      6 passed in 59.52s
+  $ pytest tests/e2e/test_chat.py -k rust -> 6 passed (the unlimited
+      default key's behavior is unchanged)
+  CI shapes: cargo fmt --check clean; clippy -D warnings clean on default
+      AND --no-default-features; cargo build --workspace
+      --no-default-features clean (compile-linux shape); ruff check +
+      format --check clean (lint shape); the new e2e file runs under the
+      suite-wide `pytest tests/e2e -v` in test-macos unchanged.
+  ```
+- Next: SPEC §8.3 backlog — TTFT/total timeouts remain parsed-but-
+  unenforced (out of scope here; recorded in the updated backlog line).
+
+## [2026-07-24] Phase 9 follow-up / SPEC §8.3 — B1 CLOSED (PM ruling) + backlog-note wording fix — DONE
+- What: PM approved commit 4c6b458 — rate-limit enforcement closes B1.
+  One PM-flagged polish applied: the SPEC §8.3 blockquote now quotes the
+  original Phase 2 backlog line verbatim and shows its two halves
+  diverging (rate limits ENFORCED 2026-07-24; TTFT/total timeouts still
+  BACKLOG), instead of an enforcement note that dropped the rate-limit
+  half's "parsed since Phase 2 but unenforced" history. That line has
+  been the canonical statement of the gap across sessions; it should
+  stay greppable as the canonical statement of the gap being closed.
+- Deviations: none. Docs-only; no code changes.
+- Acceptance:
+  ```
+  $ sed -n '/### 8.3/,/^---$/p' docs/SPEC.md -> original backlog line
+      quoted verbatim; per-half status: rpm/tpm ENFORCED 2026-07-24,
+      TTFT/total timeouts BACKLOG (unchanged claim, PROGRESS 2026-07-04)
+  ```
+- Next: SPEC §8.3 backlog — TTFT/total timeouts (unchanged).

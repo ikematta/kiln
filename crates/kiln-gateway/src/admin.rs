@@ -402,6 +402,7 @@ mod tests {
             lifecycle,
             metrics,
             auth: Auth::from_config(&config.auth).expect("valid auth config"),
+            rate: crate::ratelimit::RateLimiter::from_config(&config.auth),
             jobs: JobsProxy::external(socket).expect("proxy"),
             registrar,
             shutdown: tokio::sync::watch::channel(false).1,
