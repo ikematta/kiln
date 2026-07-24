@@ -381,10 +381,12 @@ def test_reconnect_after_server_death(mcp_stack, mcp_client):
     for pid in pids:
         os.kill(pid, signal.SIGKILL)
     wait_for(
-        lambda: metric_value(
-            stack, "kiln_mcp_connect_attempts_total", server="e2e", outcome="ok"
-        )
-        > ok_connects_before,
+        lambda: (
+            metric_value(
+                stack, "kiln_mcp_connect_attempts_total", server="e2e", outcome="ok"
+            )
+            > ok_connects_before
+        ),
         30,
         "MCP reconnect after server death",
     )
@@ -560,10 +562,12 @@ def test_unreachable_server_retries_while_gateway_serves(mixed_stack):
     # The gateway is fully up (wait_ready passed) with a dead MCP server
     # configured; the supervision loop keeps retrying on the backoff curve.
     wait_for(
-        lambda: metric_value(
-            stack, "kiln_mcp_connect_attempts_total", server="dead", outcome="error"
-        )
-        >= 2,
+        lambda: (
+            metric_value(
+                stack, "kiln_mcp_connect_attempts_total", server="dead", outcome="error"
+            )
+            >= 2
+        ),
         30,
         "backoff retries against the dead MCP server",
     )
