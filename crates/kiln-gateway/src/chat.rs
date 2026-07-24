@@ -154,6 +154,10 @@ pub async fn chat_completions(
         .get::<RequestId>()
         .cloned()
         .unwrap_or_else(|| RequestId(uuid::Uuid::now_v7().to_string()));
+    let rate = request
+        .extensions()
+        .get::<crate::ratelimit::RateLimitHandle>()
+        .cloned();
 
     // Manual body handling so malformed JSON still yields an OpenAI-shaped
     // error instead of axum's plain-text rejection.
@@ -173,7 +177,7 @@ pub async fn chat_completions(
     };
 
     let model = parsed.model.clone();
-    match handle(Arc::clone(&state), parsed, request_id).await {
+    match handle(Arc::clone(&state), parsed, request_id, rate).await {
         Ok(response) => response,
         Err(err) => {
             state
@@ -192,6 +196,7 @@ async fn handle(
     state: Arc<AppState>,
     request: ChatCompletionRequest,
     request_id: RequestId,
+    rate: Option<crate::ratelimit::RateLimitHandle>,
 ) -> Result<Response, ApiError> {
     let entry = ready_entry(&state, &request.model)?;
     admit_memory(&state, &entry)?;
@@ -272,11 +277,26 @@ async fn handle(
         prefix_hint: 0,
         echo_prompt: false,
     };
-    let events = client
-        .submit(submit)
-        .await
-        .map_err(|status| ApiError::from_worker_status(&status))?
-        .into_inner();
+    // tpm reservation (SPEC §8.3): the worst case (prompt + max_tokens) is
+    // held from here until the request settles; record_ok refunds the
+    // unused remainder (crate::ratelimit module docs). Taken last, right
+    // before Submit, so validation failures never forfeit budget.
+    let tpm = crate::ratelimit::reserve_completion_tokens(
+        &state,
+        rate.as_ref(),
+        prompt_tokens,
+        max_tokens,
+    )?;
+    let events = match client.submit(submit).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            // The request never reached the engine: release the hold.
+            if let Some(tpm) = &tpm {
+                tpm.settle(0);
+            }
+            return Err(ApiError::from_worker_status(&status));
+        }
+    };
 
     let requests_total = state.metrics.chat_completions_total.clone();
     let ctx = CompletionCtx {
@@ -287,6 +307,7 @@ async fn handle(
         request_id: request_id.0.clone(),
         channel: entry.channel.clone(),
         requests_total,
+        tpm,
     };
     if validated.stream {
         Ok(stream_response(
@@ -576,6 +597,11 @@ pub(crate) struct CompletionCtx {
     pub(crate) channel: Channel,
     /// `kiln_chat_completions_total` or `kiln_completions_total`.
     pub(crate) requests_total: prometheus::IntCounterVec,
+    /// The key's tpm hold (SPEC §8.3), settled to actual usage in
+    /// [`Self::record_ok`]. Errors and client disconnects drop it
+    /// unsettled, forfeiting the full reservation until the bucket
+    /// refills — deliberate (crate::ratelimit module docs).
+    pub(crate) tpm: Option<crate::ratelimit::TpmReservation>,
 }
 
 impl CompletionCtx {
@@ -599,6 +625,11 @@ impl CompletionCtx {
 
 impl CompletionCtx {
     pub(crate) fn record_ok(&self, finished: &Finished) {
+        // Reconcile the tpm hold to client-visible usage (`finished` has
+        // already been through apply_usage at every call site).
+        if let Some(tpm) = &self.tpm {
+            tpm.settle(u64::from(finished.prompt_tokens) + u64::from(finished.completion_tokens));
+        }
         let metrics = &self.state.metrics;
         self.requests_total
             .with_label_values(&[&self.model, "ok"])

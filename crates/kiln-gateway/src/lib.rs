@@ -17,6 +17,7 @@ pub mod lifecycle;
 pub mod messages;
 pub mod metrics;
 pub mod openai;
+pub mod ratelimit;
 pub mod registry;
 pub mod supervisor;
 pub mod sysmem;

@@ -269,6 +269,29 @@ impl KilnConfig {
             ));
         }
 
+        let mut seen_keys = std::collections::HashSet::new();
+        for key in &self.auth.api_keys {
+            // Rate limits (SPEC §8.3): zero would build a bucket that can
+            // never admit anything; omit the field to mean unlimited.
+            if key.rpm == Some(0) {
+                return invalid(format!(
+                    "api key '{}': rpm must be >= 1 (omit for unlimited)",
+                    key.name
+                ));
+            }
+            if key.tpm == Some(0) {
+                return invalid(format!(
+                    "api key '{}': tpm must be >= 1 (omit for unlimited)",
+                    key.name
+                ));
+            }
+            // Duplicate names would make per-key rate limits ill-defined
+            // (both entries would share one identity's buckets).
+            if !seen_keys.insert(key.name.as_str()) {
+                return invalid(format!("duplicate api key name '{}'", key.name));
+            }
+        }
+
         let mut seen = std::collections::HashSet::new();
         for model in &self.models {
             if model.id.is_empty() {
@@ -551,6 +574,33 @@ mod tests {
             jail.create_file("kiln.toml", "[defaults]\nblock_size = 48\n")?;
             let err = KilnConfig::load("kiln.toml").unwrap_err();
             assert!(matches!(err, ConfigError::Invalid(_)));
+            Ok(())
+        });
+    }
+
+    /// SPEC §8.3 rate limits: a zero limit would build a bucket that can
+    /// never admit anything, and duplicate key names would make per-key
+    /// buckets ill-defined — both are config errors, not silent surprises.
+    #[test]
+    fn zero_rate_limits_and_duplicate_key_names_are_rejected() {
+        figment::Jail::expect_with(|jail| {
+            for bad in [
+                "[[auth.api_keys]]\nname = \"k\"\nkey_hash = \"h\"\nrpm = 0\n",
+                "[[auth.api_keys]]\nname = \"k\"\nkey_hash = \"h\"\ntpm = 0\n",
+                "[[auth.api_keys]]\nname = \"k\"\nkey_hash = \"h\"\n\
+                 [[auth.api_keys]]\nname = \"k\"\nkey_hash = \"h2\"\n",
+            ] {
+                jail.create_file("kiln.toml", bad)?;
+                let err = KilnConfig::load("kiln.toml").unwrap_err();
+                assert!(matches!(err, ConfigError::Invalid(_)), "{bad}");
+            }
+            // Positive control: distinct names with sane limits pass.
+            jail.create_file(
+                "kiln.toml",
+                "[[auth.api_keys]]\nname = \"a\"\nkey_hash = \"h\"\nrpm = 1\ntpm = 1\n\
+                 [[auth.api_keys]]\nname = \"b\"\nkey_hash = \"h\"\n",
+            )?;
+            KilnConfig::load("kiln.toml").expect("valid limits parse");
             Ok(())
         });
     }

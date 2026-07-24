@@ -350,6 +350,7 @@ mod tests {
             lifecycle,
             metrics,
             auth: Auth::from_config(&config.auth).expect("auth"),
+            rate: crate::ratelimit::RateLimiter::from_config(&config.auth),
             jobs: crate::admin::JobsProxy::external(PathBuf::from("/tmp/kiln-admin-models.sock"))
                 .expect("proxy"),
             registrar,

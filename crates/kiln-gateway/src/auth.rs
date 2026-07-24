@@ -172,7 +172,11 @@ fn presented_key(request: &Request) -> Option<&str> {
 
 /// Ok(request) when authenticated (or auth is disabled), Err(()) otherwise;
 /// the route-shape-specific middlewares below own the error envelope.
-async fn authenticate(state: &AppState, request: Request) -> Result<Request, ()> {
+/// A verified key with configured limits gets its [`RateLimitHandle`]
+/// stamped into the request extensions for the rpm middleware layered
+/// inside this one and for the handlers' tpm reservation (SPEC §8.3).
+/// No key identity (auth disabled) ⇒ no limits.
+async fn authenticate(state: &AppState, mut request: Request) -> Result<Request, ()> {
     if !state.auth.enabled() {
         return Ok(request);
     }
@@ -182,6 +186,11 @@ async fn authenticate(state: &AppState, request: Request) -> Result<Request, ()>
     match state.auth.verify(presented).await {
         Some(name) => {
             tracing::debug!(api_key = %name, "authenticated");
+            if let Some(handle) = state.rate.handle(&name) {
+                request
+                    .extensions_mut()
+                    .insert(crate::ratelimit::RateLimitHandle(handle));
+            }
             Ok(request)
         }
         None => Err(()),

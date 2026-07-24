@@ -13,6 +13,9 @@ pub struct ApiError {
     pub error_type: &'static str,
     pub code: &'static str,
     pub message: String,
+    /// Emitted as a `Retry-After` header (whole seconds) on both the OpenAI
+    /// and Anthropic envelopes; set by the rate-limit rejections.
+    pub retry_after_secs: Option<u64>,
 }
 
 impl ApiError {
@@ -22,6 +25,7 @@ impl ApiError {
             error_type: "invalid_request_error",
             code: "invalid_request",
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -31,6 +35,7 @@ impl ApiError {
             error_type: "invalid_request_error",
             code: "invalid_api_key",
             message: "Incorrect or missing API key.".into(),
+            retry_after_secs: None,
         }
     }
 
@@ -40,6 +45,7 @@ impl ApiError {
             error_type: "invalid_request_error",
             code: "model_not_found",
             message: format!("The model '{model}' does not exist or is not configured."),
+            retry_after_secs: None,
         }
     }
 
@@ -49,6 +55,7 @@ impl ApiError {
             error_type: "invalid_request_error",
             code: "context_length_exceeded",
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -59,6 +66,7 @@ impl ApiError {
             error_type: "server_error",
             code: "model_loading",
             message: format!("The model '{model}' is still loading; retry shortly."),
+            retry_after_secs: None,
         }
     }
 
@@ -70,6 +78,7 @@ impl ApiError {
             error_type: "server_error",
             code: "model_unloading",
             message: format!("The model '{model}' is being unloaded; retry shortly."),
+            retry_after_secs: None,
         }
     }
 
@@ -101,6 +110,60 @@ impl ApiError {
                  retry later or free memory",
                 denial.needed_bytes, denial.headroom_bytes
             ),
+            retry_after_secs: None,
+        }
+    }
+
+    /// Per-key requests-per-minute rejection (SPEC §8.3). OpenAI's
+    /// rate-limit shape: `type` names the exhausted scope ("requests"),
+    /// `code` is "rate_limit_exceeded", and `Retry-After` says when one
+    /// request's worth of budget will have refilled.
+    pub fn rate_limited_requests(key: &str, limit_rpm: u32, retry_after_secs: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            error_type: "requests",
+            code: "rate_limit_exceeded",
+            message: format!(
+                "Rate limit reached for API key '{key}': {limit_rpm} requests per minute. \
+                 Retry after {retry_after_secs}s."
+            ),
+            retry_after_secs: Some(retry_after_secs),
+        }
+    }
+
+    /// Per-key tokens-per-minute rejection (SPEC §8.3): the worst-case
+    /// reservation (`prompt + max_tokens`, crate::ratelimit module docs) did
+    /// not fit the key's budget. `retry_after_secs: None` means the request
+    /// alone exceeds the whole per-minute budget — waiting can never help,
+    /// so no `Retry-After` is emitted and the message says what to change.
+    pub fn rate_limited_tokens(
+        key: &str,
+        limit_tpm: u32,
+        prompt_tokens: u32,
+        max_tokens: u32,
+        retry_after_secs: Option<u64>,
+    ) -> Self {
+        let needed = u64::from(prompt_tokens) + u64::from(max_tokens);
+        let message = match retry_after_secs {
+            Some(secs) => format!(
+                "Rate limit reached for API key '{key}': {limit_tpm} tokens per minute. \
+                 This request reserves {needed} tokens ({prompt_tokens} prompt + up to \
+                 {max_tokens} completion); unused reservation is refunded when the \
+                 response finishes. Retry after {secs}s."
+            ),
+            None => format!(
+                "Request exceeds the rate limit for API key '{key}': it could consume up \
+                 to {needed} tokens ({prompt_tokens} prompt + up to {max_tokens} \
+                 completion), more than the key's whole budget of {limit_tpm} tokens per \
+                 minute. Lower max_tokens or raise the key's tpm."
+            ),
+        };
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            error_type: "tokens",
+            code: "rate_limit_exceeded",
+            message,
+            retry_after_secs,
         }
     }
 
@@ -112,6 +175,7 @@ impl ApiError {
             error_type: "server_error",
             code: "worker_crashed",
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -125,6 +189,7 @@ impl ApiError {
             message: format!(
                 "The worker for model '{model}' crashed repeatedly and requires manual reset."
             ),
+            retry_after_secs: None,
         }
     }
 
@@ -134,6 +199,7 @@ impl ApiError {
             error_type: "server_error",
             code: "internal_error",
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -148,6 +214,7 @@ impl ApiError {
             message: "The admin API is disabled: set auth.admin_token_hash in kiln.toml \
                       (hash a token with `kiln-gateway hash-key`)."
                 .into(),
+            retry_after_secs: None,
         }
     }
 
@@ -159,6 +226,7 @@ impl ApiError {
             error_type: "invalid_request_error",
             code,
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -169,6 +237,7 @@ impl ApiError {
             error_type: "invalid_request_error",
             code: "not_found",
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -179,6 +248,7 @@ impl ApiError {
             error_type: "server_error",
             code: "jobs_unavailable",
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -198,18 +268,21 @@ impl ApiError {
                 error_type: "invalid_request_error",
                 code: "grammar_unsupported",
                 message: detail.clone(),
+                retry_after_secs: None,
             },
             WorkerErrorCode::WorkerErrorOomRejected => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 error_type: "server_error",
                 code: "overloaded",
                 message: format!("worker rejected request for memory headroom: {detail}"),
+                retry_after_secs: None,
             },
             WorkerErrorCode::WorkerErrorDraining => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 error_type: "server_error",
                 code: "worker_draining",
                 message: "the worker is draining; retry shortly".into(),
+                retry_after_secs: None,
             },
             WorkerErrorCode::WorkerErrorInternal | WorkerErrorCode::WorkerErrorUnspecified => {
                 Self::internal(format!("worker error: {detail}"))
@@ -284,15 +357,28 @@ impl ApiError {
     }
 
     /// [`IntoResponse`] with the Anthropic envelope instead of the OpenAI
-    /// one; same status code.
+    /// one; same status code and headers.
     pub fn into_anthropic_response(self) -> Response {
-        (self.status, Json(self.anthropic_body())).into_response()
+        let retry_after_secs = self.retry_after_secs;
+        let response = (self.status, Json(self.anthropic_body())).into_response();
+        with_retry_after(response, retry_after_secs)
     }
+}
+
+fn with_retry_after(mut response: Response, retry_after_secs: Option<u64>) -> Response {
+    if let Some(secs) = retry_after_secs {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, secs.into());
+    }
+    response
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.body())).into_response()
+        let retry_after_secs = self.retry_after_secs;
+        let response = (self.status, Json(self.body())).into_response();
+        with_retry_after(response, retry_after_secs)
     }
 }
 
@@ -334,6 +420,45 @@ mod tests {
         assert_eq!(
             ApiError::worker_crashed("x").anthropic_body()["error"]["type"],
             "api_error"
+        );
+    }
+
+    /// SPEC §8.3: rate-limit rejections are OpenAI's 429 shape (`type` =
+    /// exhausted scope, `code` = "rate_limit_exceeded") plus a `Retry-After`
+    /// header; the Anthropic envelope maps them to `rate_limit_error`.
+    #[test]
+    fn rate_limit_shape_and_retry_after_header() {
+        let err = ApiError::rate_limited_requests("alice", 60, 17);
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+        let body = err.body();
+        assert_eq!(body["error"]["type"], "requests");
+        assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(err.anthropic_body()["error"]["type"], "rate_limit_error");
+        let response = err.into_response();
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from(17u64))
+        );
+
+        let err = ApiError::rate_limited_tokens("alice", 1000, 40, 200, Some(9));
+        assert_eq!(err.body()["error"]["type"], "tokens");
+        assert_eq!(err.retry_after_secs, Some(9));
+        let response = err.into_anthropic_response();
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from(9u64))
+        );
+
+        // A request that can never fit gets no Retry-After — waiting cannot
+        // help; the message says what to change instead.
+        let err = ApiError::rate_limited_tokens("alice", 100, 40, 200, None);
+        assert!(err.message.contains("max_tokens"), "{}", err.message);
+        let response = err.into_response();
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
         );
     }
 

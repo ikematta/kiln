@@ -59,6 +59,10 @@ pub async fn messages(
         .get::<RequestId>()
         .cloned()
         .unwrap_or_else(|| RequestId(uuid::Uuid::now_v7().to_string()));
+    let rate = request
+        .extensions()
+        .get::<crate::ratelimit::RateLimitHandle>()
+        .cloned();
 
     let bytes = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
@@ -76,7 +80,7 @@ pub async fn messages(
     };
 
     let model = parsed.model.clone();
-    match handle(Arc::clone(&state), parsed, request_id).await {
+    match handle(Arc::clone(&state), parsed, request_id, rate).await {
         Ok(response) => response,
         Err(err) => {
             state
@@ -95,6 +99,7 @@ async fn handle(
     state: Arc<AppState>,
     request: MessagesRequest,
     request_id: RequestId,
+    rate: Option<crate::ratelimit::RateLimitHandle>,
 ) -> Result<Response, ApiError> {
     let entry = ready_entry(&state, &request.model)?;
     admit_memory(&state, &entry)?;
@@ -163,11 +168,25 @@ async fn handle(
         prefix_hint: 0,
         echo_prompt: false,
     };
-    let events = client
-        .submit(submit)
-        .await
-        .map_err(|status| ApiError::from_worker_status(&status))?
-        .into_inner();
+    // tpm reservation (SPEC §8.3): worst case held until settle, unused
+    // remainder refunded by record_ok — same flow as chat. The wrapper
+    // converts a denial into the Anthropic rate_limit_error envelope.
+    let tpm = crate::ratelimit::reserve_completion_tokens(
+        &state,
+        rate.as_ref(),
+        prompt_tokens,
+        max_tokens,
+    )?;
+    let events = match client.submit(submit).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            // The request never reached the engine: release the hold.
+            if let Some(tpm) = &tpm {
+                tpm.settle(0);
+            }
+            return Err(ApiError::from_worker_status(&status));
+        }
+    };
 
     let requests_total = state.metrics.messages_total.clone();
     let ctx = CompletionCtx {
@@ -178,6 +197,7 @@ async fn handle(
         request_id: request_id.0.clone(),
         channel: entry.channel.clone(),
         requests_total,
+        tpm,
     };
     let route = SegmentRoute {
         tools: ToolRoute::new(tool_parser),

@@ -24,6 +24,9 @@ pub struct AppState {
     pub lifecycle: Arc<Lifecycle>,
     pub metrics: Arc<Metrics>,
     pub auth: Auth,
+    /// Per-key rpm/tpm token buckets (SPEC §8.3), built from the same
+    /// config entries as `auth`.
+    pub rate: crate::ratelimit::RateLimiter,
     pub jobs: crate::admin::JobsProxy,
     /// Runtime model registration (`POST /admin/models`): live insert +
     /// kiln.toml persistence in one flow.
@@ -42,10 +45,18 @@ pub struct AppState {
 pub struct RequestId(pub String);
 
 pub fn router(state: Arc<AppState>) -> Router {
+    // Layer order (route_layer wraps: last added runs first): auth runs
+    // before the rpm limiter, which needs the RateLimitHandle auth stamps
+    // onto the request. tpm is enforced inside the handlers, where
+    // prompt/max_tokens are known (crate::ratelimit module docs).
     let api = Router::new()
         .route("/v1/chat/completions", post(crate::chat::chat_completions))
         .route("/v1/completions", post(crate::completions::completions))
         .route("/v1/models", get(list_models))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::ratelimit::enforce_rpm,
+        ))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::auth::require_api_key,
@@ -54,6 +65,10 @@ pub fn router(state: Arc<AppState>) -> Router {
     // error envelope (SPEC §8.1).
     let anthropic_api = Router::new()
         .route("/v1/messages", post(crate::messages::messages))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::ratelimit::enforce_rpm_anthropic,
+        ))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::auth::require_api_key_anthropic,
