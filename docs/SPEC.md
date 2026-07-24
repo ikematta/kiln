@@ -269,9 +269,10 @@ parse → validate → resolve model → apply chat template (minijinja, templat
 ### 8.3 Cross-cutting
 API keys in config (hashed at rest, `argon2`); per-key rate limits (token bucket: requests/min and tokens/min) via `tower` middleware; request size limits; timeouts (TTFT timeout and total). Structured request logs with request_id propagated to worker spans.
 
-> Per-key rate limits are ENFORCED as of 2026-07-24 (PROGRESS.md): rpm as a tower route-layer middleware after auth; tpm reserves `prompt + max_tokens` before `Submit` and refunds unused reservation when the request settles (reserve-then-reconcile, `kiln-gateway/src/ratelimit.rs` module docs). Rejections are OpenAI's 429 rate-limit shape (`type: requests|tokens`, `code: rate_limit_exceeded`) with `Retry-After`, or Anthropic's `rate_limit_error` envelope on `/v1/messages`.
+> **Backlog status.** The Phase 2 backlog note here read: "per-key rate limits (rpm/tpm) and TTFT/total timeouts are parsed from kiln.toml since Phase 2 but UNENFORCED — implement in Phase 9 alongside priority/admission control (PROGRESS.md 2026-07-04)". Its two halves have diverged:
 >
-> **BACKLOG:** TTFT/total timeouts are parsed from kiln.toml since Phase 2 but remain UNENFORCED (PROGRESS.md 2026-07-04).
+> - **Rate limits (rpm/tpm): ENFORCED as of 2026-07-24** (PROGRESS.md 2026-07-24). rpm as a tower route-layer middleware after auth; tpm reserves `prompt + max_tokens` before `Submit` and refunds unused reservation when the request settles (reserve-then-reconcile, `kiln-gateway/src/ratelimit.rs` module docs). Rejections are OpenAI's 429 rate-limit shape (`type: requests|tokens`, `code: rate_limit_exceeded`) with `Retry-After`, or Anthropic's `rate_limit_error` envelope on `/v1/messages`.
+> - **BACKLOG — TTFT/total timeouts:** still parsed from kiln.toml since Phase 2 but UNENFORCED.
 
 ---
 

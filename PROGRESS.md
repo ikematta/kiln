@@ -7779,3 +7779,21 @@
   ```
 - Next: SPEC §8.3 backlog — TTFT/total timeouts remain parsed-but-
   unenforced (out of scope here; recorded in the updated backlog line).
+
+## [2026-07-24] Phase 9 follow-up / SPEC §8.3 — B1 CLOSED (PM ruling) + backlog-note wording fix — DONE
+- What: PM approved commit 4c6b458 — rate-limit enforcement closes B1.
+  One PM-flagged polish applied: the SPEC §8.3 blockquote now quotes the
+  original Phase 2 backlog line verbatim and shows its two halves
+  diverging (rate limits ENFORCED 2026-07-24; TTFT/total timeouts still
+  BACKLOG), instead of an enforcement note that dropped the rate-limit
+  half's "parsed since Phase 2 but unenforced" history. That line has
+  been the canonical statement of the gap across sessions; it should
+  stay greppable as the canonical statement of the gap being closed.
+- Deviations: none. Docs-only; no code changes.
+- Acceptance:
+  ```
+  $ sed -n '/### 8.3/,/^---$/p' docs/SPEC.md -> original backlog line
+      quoted verbatim; per-half status: rpm/tpm ENFORCED 2026-07-24,
+      TTFT/total timeouts BACKLOG (unchanged claim, PROGRESS 2026-07-04)
+  ```
+- Next: SPEC §8.3 backlog — TTFT/total timeouts (unchanged).
