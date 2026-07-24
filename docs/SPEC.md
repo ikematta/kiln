@@ -269,6 +269,8 @@ parse → validate → resolve model → apply chat template (minijinja, templat
 ### 8.3 Cross-cutting
 API keys in config (hashed at rest, `argon2`); per-key rate limits (token bucket: requests/min and tokens/min) via `tower` middleware; request size limits; timeouts (TTFT timeout and total). Structured request logs with request_id propagated to worker spans.
 
+CORS (added 2026-07-24, PROGRESS.md): the gateway sends **no CORS headers by default** — cross-origin browser JS is blocked by the browser, non-browser clients unaffected. `server.cors_origins` opts an explicit origin allowlist (or a lone `"*"`) into cross-origin access via `tower-http`'s CORS layer (the §3 stack already names it for this). Preflight `OPTIONS` is answered before auth — browsers send no credentials on preflights — and allowed methods/headers mirror the preflight request; design rationale in `kiln-gateway/src/cors.rs` module docs.
+
 > **Backlog status.** The Phase 2 backlog note here read: "per-key rate limits (rpm/tpm) and TTFT/total timeouts are parsed from kiln.toml since Phase 2 but UNENFORCED — implement in Phase 9 alongside priority/admission control (PROGRESS.md 2026-07-04)". Its two halves have diverged:
 >
 > - **Rate limits (rpm/tpm): ENFORCED as of 2026-07-24** (PROGRESS.md 2026-07-24). rpm as a tower route-layer middleware after auth; tpm reserves `prompt + max_tokens` before `Submit` and refunds unused reservation when the request settles (reserve-then-reconcile, `kiln-gateway/src/ratelimit.rs` module docs). Rejections are OpenAI's 429 rate-limit shape (`type: requests|tokens`, `code: rate_limit_exceeded`) with `Retry-After`, or Anthropic's `rate_limit_error` envelope on `/v1/messages`.
@@ -296,6 +298,7 @@ CLI + long-running job server: `kiln-jobs download <hf_repo>` (resumable, `hf_hu
 host = "127.0.0.1"; port = 8080
 runtime_dir = "~/.kiln/run"; cache_dir = "~/.kiln/cache"; model_dir = "~/.kiln/models"
 # ttft_timeout_secs = 120; total_timeout_secs = 600   # §8.3 timeouts; omit = disabled
+# cors_origins = ["http://localhost:5173"]   # §8.3 CORS allowlist; omit = no CORS headers
 
 [memory]
 budget_fraction = 0.80          # of unified memory

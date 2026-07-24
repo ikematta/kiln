@@ -37,6 +37,9 @@ tonic.workspace = true
 # comments/formatting; figment stays the read path).
 toml_edit.workspace = true
 tower.workspace = true
+# CORS layer for the server.cors_origins allowlist (SPEC §8.3); already a
+# transitive dep via reqwest — only the `cors` feature is new.
+tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true

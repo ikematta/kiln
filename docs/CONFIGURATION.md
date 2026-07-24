@@ -33,6 +33,7 @@ KILN_DEFAULTS__SSD_TIER=false
 | `rust_worker_argv` | sibling `kiln-worker` binary | Command prefix launching the Rust worker. Defaults to the `kiln-worker` next to the running gateway binary, falling back to `$PATH`. |
 | `jobs_argv` | sibling `kiln-jobs` binary | Command prefix for the on-demand jobs server; the gateway appends `serve --socket <path> --db <path> --dest-root <model_dir>`. Flags may precede the subcommand, so `["kiln-jobs", "--venv", "<uv-project-dir>"]` points quantization at a packaged jobs venv. |
 | `jobs_db` | `~/.kiln/jobs.sqlite` | SQLite job store used by the spawned `kiln-jobs` server (SPEC §9.1). |
+| `cors_origins` | `[]` | CORS allowlist for browser clients (SPEC §8.3). Empty (the default) = the gateway sends no CORS headers, so cross-origin browser JS is blocked by the browser; non-browser clients and same-origin pages are unaffected. Entries are exact origins (`scheme://host[:port]`, no trailing slash or path) matched case-insensitively against the browser's `Origin` header; `"*"` alone allows any origin (explicit opt-in, and cannot be mixed with specific entries). For allowlisted origins, preflight `OPTIONS` is answered before auth (browsers send no credentials on preflights), allowed methods/headers mirror the preflight request, and `x-request-id`/`Retry-After` are readable by page JS. Rationale: `kiln-gateway/src/cors.rs` module docs. |
 
 ## `[memory]`
 

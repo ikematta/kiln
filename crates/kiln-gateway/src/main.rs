@@ -98,7 +98,8 @@ async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(addr = %addr, config = %config_path, "kiln-gateway listening");
 
-    axum::serve(listener, app::router(state))
+    let cors = kiln_gateway::cors::layer(&config.server);
+    axum::serve(listener, app::router(state, cors))
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             let _ = http_shutdown_tx.send(true);

@@ -7943,3 +7943,78 @@
   ```
 - Next: nothing scheduled — SPEC §12 remains complete and §8.3's backlog
   is closed.
+
+## [2026-07-24] Gateway follow-up / SPEC §8.3 CORS — DONE
+- What:
+  - Opt-in CORS for browser clients: new `[server] cors_origins` origin
+    allowlist in kiln.toml, enforced by tower-http's CorsLayer. New module
+    `crates/kiln-gateway/src/cors.rs` (policy rationale in its module
+    docs); config field + validation in `config.rs`; router wiring in
+    `app.rs`; docs in SPEC §8.3/§10, kiln.toml.example, CONFIGURATION.md.
+  - Shipped default unchanged and conservative: empty list → `cors::layer`
+    returns None and the router carries no CORS machinery — responses are
+    byte-for-byte the historical ones (e2e-verified), and no wildcard
+    anywhere by default. A lone `"*"` is the explicit wildcard opt-in.
+  - Layer placement: outside every auth route_layer (browsers send no
+    credentials on a preflight OPTIONS — without the layer, preflights
+    died as auth 401s, which is why no browser client could ever get
+    through), inside `observe` (preflights get request ids and
+    `kiln_http_requests_total{method="OPTIONS",...}` samples).
+  - Tests: +7 gateway unit (preflight short-circuits before an auth-shaped
+    route_layer; mirrored allow-methods/headers + expose + max-age shape;
+    unknown-origin denial; config-entry lowercasing; lone wildcard;
+    empty-config = no layer; origin-shape validation). New e2e
+    `tests/e2e/test_cors.py` (2 tests) driving REAL browser fetch()es from
+    a real HTML page (playwright, reusing the admin-UI browser fixture +
+    CI's KILN_E2E_REQUIRE_BROWSER gate).
+- Decisions:
+  - Preflight allow-methods/headers MIRROR the request instead of
+    enumerating the API surface: the origin allowlist is the security
+    boundary, and a maintained header list would silently desync from SDK
+    header conventions (authorization, x-api-key, anthropic-version, ...)
+    — the naive-CORS failure where preflights break while simple requests
+    keep working. Credentials stay off (auth rides request headers, not
+    cookies), which is also what keeps the `"*"` opt-in legal.
+  - Config validation rejects origin shapes the browser's Origin header
+    can never equal — trailing slash, path, missing scheme — as errors
+    naming the fix, instead of silently allowing nothing; entries are
+    lowercased at layer build (browsers normalize Origin). Any scheme is
+    accepted (macOS Tauri apps present tauri://localhost), and `"*"`
+    mixed with specific origins is rejected.
+  - `x-request-id` and `Retry-After` are exposed to page JS (error
+    correlation, 429 backoff); preflight max-age 3600s.
+  - tower-http was already in the dependency graph (transitive via
+    reqwest) and SPEC §3 names it for CORS; it becomes a direct
+    kiln-gateway dep with only the `cors` feature enabled (MIT).
+  - The e2e proves the preflight case end-to-end, not in isolation: the
+    browser's OPTIONS AND its followed-through POST are both asserted
+    server-side in kiln_http_requests_total for the allowed origin; for
+    the unconfigured origin the OPTIONS arrives but the POST count stays
+    frozen (browser refused after the failed preflight) while the simple
+    GET arrives and is withheld from page JS — CORS being client-side
+    enforcement is the reason header inspection alone can't prove this.
+- Deviations: none. SPEC §8.3/§10 updated to record the new key (same
+  pattern as the 2026-07-24 timeout entry).
+- Acceptance:
+  ```
+  $ uv run --project tests/e2e pytest tests/e2e/test_cors.py -v
+    test_cors_configured_and_unconfigured_origins PASSED
+      (real Chrome: a page on the configured origin completes a genuine
+       preflighted chat completion — OPTIONS 200 and POST 200 both
+       counted in kiln_http_requests_total, x-request-id readable by
+       page JS via expose-headers; the same page on an unconfigured
+       origin: simple GET reaches the server but is withheld from JS,
+       preflight answered without allow-origin, POST NEVER sent)
+    test_no_cors_headers_by_default PASSED
+      (no cors_origins: zero access-control-* headers; preflight OPTIONS
+       falls into the auth route_layer's 401 — the pre-CORS behavior)
+    2 passed
+  $ cargo test -p kiln-gateway --lib -> 120 passed (113 + 7 new)
+  $ cargo test --workspace -> 56 suites, 277 passed, 0 failed
+  CI shapes: cargo fmt --check clean; clippy -D warnings clean on default
+      AND --no-default-features; cargo build --workspace
+      --no-default-features clean (compile-linux shape); ruff check +
+      format --check clean on python/ tests/e2e scripts; test_cors.py
+      runs under the suite-wide pytest step in test-macos.
+  ```
+- Next: nothing scheduled — PM ruling on merge after CI.

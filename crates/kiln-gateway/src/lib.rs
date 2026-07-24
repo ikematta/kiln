@@ -12,6 +12,7 @@ pub mod chat;
 pub mod completions;
 pub mod config;
 pub mod config_write;
+pub mod cors;
 pub mod error;
 pub mod lifecycle;
 pub mod messages;
