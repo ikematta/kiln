@@ -24,16 +24,19 @@ use tonic::Streaming;
 
 use crate::app::{AppState, RequestId};
 use crate::chat::{
-    CompletionCtx, MAX_BODY_BYTES, StreamEnd, TextPipeline, admit_memory, classify_finished,
-    encode_prompt, ready_entry, sse_json, unix_now, usage_of,
+    CompletionCtx, StreamEnd, TextPipeline, admit_memory, classify_finished, encode_prompt,
+    read_body, ready_entry, sse_json, unix_now, usage_of,
 };
 use crate::error::ApiError;
 use crate::openai::{CompletionChoice, CompletionRequest, TextCompletion, Usage};
+use crate::timeout::{Deadlines, WorkerEvent, next_event};
 
 pub async fn completions(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> Response {
+    // Timeout budgets anchor at arrival (crate::timeout module docs).
+    let arrival = tokio::time::Instant::now();
     let request_id = request
         .extensions()
         .get::<RequestId>()
@@ -46,12 +49,9 @@ pub async fn completions(
 
     // Manual body handling so malformed JSON still yields an OpenAI-shaped
     // error instead of axum's plain-text rejection (as in chat).
-    let bytes = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
+    let bytes = match read_body(request).await {
         Ok(bytes) => bytes,
-        Err(err) => {
-            return ApiError::invalid_request(format!("failed to read request body: {err}"))
-                .into_response();
-        }
+        Err(err) => return err.into_response(),
     };
     let parsed: CompletionRequest = match serde_json::from_slice(&bytes) {
         Ok(parsed) => parsed,
@@ -62,7 +62,7 @@ pub async fn completions(
     };
 
     let model = parsed.model.clone();
-    match handle(Arc::clone(&state), parsed, request_id, rate).await {
+    match handle(Arc::clone(&state), parsed, request_id, rate, arrival).await {
         Ok(response) => response,
         Err(err) => {
             state
@@ -82,7 +82,9 @@ async fn handle(
     request: CompletionRequest,
     request_id: RequestId,
     rate: Option<crate::ratelimit::RateLimitHandle>,
+    arrival: tokio::time::Instant,
 ) -> Result<Response, ApiError> {
+    let deadlines = Deadlines::start(&state.timeouts, arrival);
     let entry = ready_entry(&state, &request.model)?;
     admit_memory(&state, &entry)?;
     let validated = request.validate()?;
@@ -164,9 +166,10 @@ async fn handle(
             events,
             pipeline,
             validated.include_usage,
+            deadlines,
         ))
     } else {
-        collect_response(ctx, events, pipeline)
+        collect_response(ctx, events, pipeline, deadlines)
             .await
             .map(IntoResponse::into_response)
     }
@@ -180,11 +183,12 @@ async fn collect_response(
     ctx: CompletionCtx,
     mut events: Streaming<TokenEvent>,
     mut pipeline: TextPipeline,
+    mut deadlines: Deadlines,
 ) -> Result<axum::Json<TextCompletion>, ApiError> {
     let mut text = String::new();
     let end = loop {
-        match events.message().await {
-            Ok(Some(event)) => match event.event {
+        match next_event(&mut events, &mut deadlines).await {
+            WorkerEvent::Event(event) => match event.event {
                 Some(token_event::Event::Tokens(chunk)) => {
                     let was_matched = pipeline.stop_matched();
                     text.push_str(&pipeline.push(chunk)?);
@@ -200,12 +204,18 @@ async fn collect_response(
                 // Admitted / PrefixCacheHit are observability-only here.
                 _ => {}
             },
-            Ok(None) => {
+            WorkerEvent::Closed => {
                 break StreamEnd::Failed(ApiError::worker_crashed(
                     "the worker stream ended without a result (worker crashed mid-request)",
                 ));
             }
-            Err(status) => break StreamEnd::Failed(ApiError::from_worker_status(&status)),
+            WorkerEvent::Rpc(status) => {
+                break StreamEnd::Failed(ApiError::from_worker_status(&status));
+            }
+            // Partial output on the non-streaming path is discarded.
+            WorkerEvent::TimedOut(scope) => {
+                break StreamEnd::Failed(ctx.abort_for_timeout(scope).await);
+            }
         }
     };
 
@@ -242,6 +252,7 @@ fn stream_response(
     mut events: Streaming<TokenEvent>,
     mut pipeline: TextPipeline,
     include_usage: bool,
+    mut deadlines: Deadlines,
 ) -> Response {
     // With include_usage, data chunks carry `"usage": null` and a final
     // chunk carries the usage object (OpenAI semantics, as in chat).
@@ -264,8 +275,8 @@ fn stream_response(
         };
 
         loop {
-            let end = match events.message().await {
-                Ok(Some(event)) => match event.event {
+            let end = match next_event(&mut events, &mut deadlines).await {
+                WorkerEvent::Event(event) => match event.event {
                     Some(token_event::Event::Tokens(tc)) => {
                         let was_matched = pipeline.stop_matched();
                         let text = match pipeline.push(tc) {
@@ -303,10 +314,13 @@ fn stream_response(
                     }
                     _ => continue,
                 },
-                Ok(None) => StreamEnd::Failed(ApiError::worker_crashed(
+                WorkerEvent::Closed => StreamEnd::Failed(ApiError::worker_crashed(
                     "the worker stream ended without a result (worker crashed mid-request)",
                 )),
-                Err(status) => StreamEnd::Failed(ApiError::from_worker_status(&status)),
+                WorkerEvent::Rpc(status) => StreamEnd::Failed(ApiError::from_worker_status(&status)),
+                // Deltas already sent stand; the stream ends with the
+                // terminal timeout error event instead of [DONE].
+                WorkerEvent::TimedOut(scope) => StreamEnd::Failed(ctx.abort_for_timeout(scope).await),
             };
 
             match end {

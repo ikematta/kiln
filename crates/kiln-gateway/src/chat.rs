@@ -60,10 +60,35 @@ use crate::openai::{
     ValidatedChat,
 };
 use crate::registry::{ModelEntry, WorkerStatus};
+use crate::timeout::{Deadlines, TimeoutScope, WorkerEvent, next_event};
 
-/// Request body cap; completion requests are text, not uploads. Shared with
-/// `/v1/completions` (crate::completions).
+/// Request body cap (SPEC §8.3 request size limits); completion requests
+/// are text, not uploads, and every downstream cost (JSON parse, template
+/// render, tokenization) is linear in this bound. Token-shaped ceilings are
+/// enforced separately: the model-context check in `effective_max_tokens`
+/// and the per-key tpm reservation. Shared with `/v1/completions` and
+/// `/v1/messages`.
 pub(crate) const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Reads the request body under [`MAX_BODY_BYTES`], distinguishing the
+/// over-limit case (413, SPEC §8.3) from a malformed or interrupted body
+/// (400). Callers render their surface's error envelope.
+pub(crate) async fn read_body(
+    request: axum::extract::Request,
+) -> Result<axum::body::Bytes, ApiError> {
+    axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES)
+        .await
+        .map_err(|err| {
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+            while let Some(cause) = source {
+                if cause.is::<http_body_util::LengthLimitError>() {
+                    return ApiError::request_too_large(MAX_BODY_BYTES);
+                }
+                source = cause.source();
+            }
+            ApiError::invalid_request(format!("failed to read request body: {err}"))
+        })
+}
 
 /// Registry lookup + worker-status gate shared by every completion-shaped
 /// endpoint: only a Ready worker receives requests; every other state maps
@@ -149,6 +174,9 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> Response {
+    // Timeout budgets anchor here — arrival, not prefill start — so queue
+    // wait under admission pressure counts (crate::timeout module docs).
+    let arrival = tokio::time::Instant::now();
     let request_id = request
         .extensions()
         .get::<RequestId>()
@@ -161,12 +189,9 @@ pub async fn chat_completions(
 
     // Manual body handling so malformed JSON still yields an OpenAI-shaped
     // error instead of axum's plain-text rejection.
-    let bytes = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
+    let bytes = match read_body(request).await {
         Ok(bytes) => bytes,
-        Err(err) => {
-            return ApiError::invalid_request(format!("failed to read request body: {err}"))
-                .into_response();
-        }
+        Err(err) => return err.into_response(),
     };
     let parsed: ChatCompletionRequest = match serde_json::from_slice(&bytes) {
         Ok(parsed) => parsed,
@@ -177,7 +202,7 @@ pub async fn chat_completions(
     };
 
     let model = parsed.model.clone();
-    match handle(Arc::clone(&state), parsed, request_id, rate).await {
+    match handle(Arc::clone(&state), parsed, request_id, rate, arrival).await {
         Ok(response) => response,
         Err(err) => {
             state
@@ -197,7 +222,9 @@ async fn handle(
     request: ChatCompletionRequest,
     request_id: RequestId,
     rate: Option<crate::ratelimit::RateLimitHandle>,
+    arrival: tokio::time::Instant,
 ) -> Result<Response, ApiError> {
+    let deadlines = Deadlines::start(&state.timeouts, arrival);
     let entry = ready_entry(&state, &request.model)?;
     admit_memory(&state, &entry)?;
 
@@ -316,9 +343,10 @@ async fn handle(
             pipeline,
             tool_parser,
             validated.include_usage,
+            deadlines,
         ))
     } else {
-        collect_response(ctx, events, pipeline, tool_parser)
+        collect_response(ctx, events, pipeline, tool_parser, deadlines)
             .await
             .map(IntoResponse::into_response)
     }
@@ -605,21 +633,60 @@ pub(crate) struct CompletionCtx {
 }
 
 impl CompletionCtx {
-    /// Best-effort worker-side cancellation after a gateway-side stop-string
-    /// match; generation past the match is wasted work, not a correctness
-    /// problem, so failures only log.
-    pub(crate) async fn cancel_worker(&self) {
+    /// Best-effort worker-side cancellation through the Cancel RPC (the
+    /// ≤2-step stop bound the workers promise), used after a gateway-side
+    /// stop-string match and by timeout aborts. Returns the worker's
+    /// `CancelAck.found`; RPC failures only log — generation past the
+    /// abort point is wasted work, not a correctness problem.
+    pub(crate) async fn cancel_worker(&self) -> bool {
         let mut client = WorkerClient::new(self.channel.clone());
-        if let Err(status) = client
+        match client
             .cancel(CancelRequest {
                 request_id: self.request_id.clone(),
             })
             .await
         {
-            tracing::debug!(target: "kiln::chat", model = %self.model,
-                request_id = %self.request_id, code = ?status.code(),
-                "cancel after stop-string match failed");
+            Ok(ack) => ack.into_inner().found,
+            Err(status) => {
+                tracing::debug!(target: "kiln::chat", model = %self.model,
+                    request_id = %self.request_id, code = ?status.code(),
+                    "worker cancel RPC failed");
+                false
+            }
         }
+    }
+
+    /// Aborts a timed-out request (SPEC §8.3): cancels through the worker's
+    /// Cancel path — the same mechanism as a user-initiated stop, no
+    /// separate teardown — bumps `kiln_timeout_total`, and returns the
+    /// client-facing 504. The tpm reservation is deliberately left
+    /// unsettled: it forfeits exactly like a client disconnect
+    /// (crate::ratelimit module docs — refunds for abandoned work would
+    /// let a client burn GPU without depleting its budget), and the
+    /// forfeit self-heals within the refill minute.
+    pub(crate) async fn abort_for_timeout(&self, scope: TimeoutScope) -> ApiError {
+        let cancel_found = self.cancel_worker().await;
+        self.state
+            .metrics
+            .timeouts_total
+            .with_label_values(&[&self.model, scope.label()])
+            .inc();
+        let timeouts = &self.state.timeouts;
+        let (budget, err) = match scope {
+            TimeoutScope::Ttft => {
+                let secs = timeouts.ttft.map(|d| d.as_secs()).unwrap_or(0);
+                (secs, ApiError::ttft_timeout(&self.model, secs))
+            }
+            TimeoutScope::Total => {
+                let secs = timeouts.total.map(|d| d.as_secs()).unwrap_or(0);
+                (secs, ApiError::total_timeout(&self.model, secs))
+            }
+        };
+        tracing::info!(target: "kiln::timeout", model = %self.model,
+            request_id = %self.request_id, scope = scope.label(),
+            budget_secs = budget, cancel_found,
+            "request aborted by timeout; cancelled via worker Cancel");
+        err
     }
 }
 
@@ -701,6 +768,7 @@ async fn collect_response(
     mut events: Streaming<TokenEvent>,
     mut pipeline: TextPipeline,
     tool_parser: Option<ToolCallParser>,
+    mut deadlines: Deadlines,
 ) -> Result<axum::Json<ChatCompletion>, ApiError> {
     let mut route = ToolRoute::new(tool_parser);
     let mut content = String::new();
@@ -717,8 +785,8 @@ async fn collect_response(
         }
     };
     let end = loop {
-        match events.message().await {
-            Ok(Some(event)) => match event.event {
+        match next_event(&mut events, &mut deadlines).await {
+            WorkerEvent::Event(event) => match event.event {
                 Some(token_event::Event::Tokens(chunk)) => {
                     let was_matched = pipeline.stop_matched();
                     let text = pipeline.push(chunk)?;
@@ -739,12 +807,19 @@ async fn collect_response(
                 // Admitted / PrefixCacheHit are observability-only here.
                 _ => {}
             },
-            Ok(None) => {
+            WorkerEvent::Closed => {
                 break StreamEnd::Failed(ApiError::worker_crashed(
                     "the worker stream ended without a result (worker crashed mid-request)",
                 ));
             }
-            Err(status) => break StreamEnd::Failed(ApiError::from_worker_status(&status)),
+            WorkerEvent::Rpc(status) => {
+                break StreamEnd::Failed(ApiError::from_worker_status(&status));
+            }
+            // Partial output on the non-streaming path is discarded: the
+            // client gets the 504, never a truncated completion.
+            WorkerEvent::TimedOut(scope) => {
+                break StreamEnd::Failed(ctx.abort_for_timeout(scope).await);
+            }
         }
     };
 
@@ -801,6 +876,7 @@ fn stream_response(
     mut pipeline: TextPipeline,
     tool_parser: Option<ToolCallParser>,
     include_usage: bool,
+    mut deadlines: Deadlines,
 ) -> Response {
     // With include_usage, data chunks carry `"usage": null` and a final
     // chunk carries the usage object (OpenAI semantics).
@@ -833,8 +909,8 @@ fn stream_response(
         )));
 
         loop {
-            let end = match events.message().await {
-                Ok(Some(event)) => match event.event {
+            let end = match next_event(&mut events, &mut deadlines).await {
+                WorkerEvent::Event(event) => match event.event {
                     Some(token_event::Event::Tokens(tc)) => {
                         let was_matched = pipeline.stop_matched();
                         let text = match pipeline.push(tc) {
@@ -877,10 +953,13 @@ fn stream_response(
                     }
                     _ => continue,
                 },
-                Ok(None) => StreamEnd::Failed(ApiError::worker_crashed(
+                WorkerEvent::Closed => StreamEnd::Failed(ApiError::worker_crashed(
                     "the worker stream ended without a result (worker crashed mid-request)",
                 )),
-                Err(status) => StreamEnd::Failed(ApiError::from_worker_status(&status)),
+                WorkerEvent::Rpc(status) => StreamEnd::Failed(ApiError::from_worker_status(&status)),
+                // Deltas already sent stand as delivered; the stream ends
+                // with the terminal timeout error event instead of [DONE].
+                WorkerEvent::TimedOut(scope) => StreamEnd::Failed(ctx.abort_for_timeout(scope).await),
             };
 
             match end {

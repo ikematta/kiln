@@ -27,6 +27,8 @@ pub struct AppState {
     /// Per-key rpm/tpm token buckets (SPEC §8.3), built from the same
     /// config entries as `auth`.
     pub rate: crate::ratelimit::RateLimiter,
+    /// TTFT/total request budgets (SPEC §8.3), from `[server]`.
+    pub timeouts: crate::timeout::Timeouts,
     pub jobs: crate::admin::JobsProxy,
     /// Runtime model registration (`POST /admin/models`): live insert +
     /// kiln.toml persistence in one flow.

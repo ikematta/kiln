@@ -167,6 +167,65 @@ impl ApiError {
         }
     }
 
+    /// Request body over the size cap (SPEC §8.3 request size limits):
+    /// 413, Anthropic's `request_too_large`. Distinct from a malformed or
+    /// interrupted body, which stays a 400 — a client fixes the two
+    /// differently.
+    pub fn request_too_large(limit_bytes: usize) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            error_type: "invalid_request_error",
+            code: "request_too_large",
+            message: format!(
+                "Request body exceeds the {limit_bytes}-byte limit. Completion requests \
+                 are text; send less conversation history or fewer/shorter messages."
+            ),
+            retry_after_secs: None,
+        }
+    }
+
+    /// TTFT timeout (SPEC §8.3): no token was generated within
+    /// `server.ttft_timeout_secs` of arrival — the request was queued or
+    /// prefilling for too long and has been cancelled through the worker's
+    /// Cancel path (crate::timeout module docs). 504: this gateway gave up
+    /// waiting on its upstream worker — deliberately NOT the 429 family
+    /// (nothing was rejected for quota; work was started and abandoned)
+    /// and not 408 (the client sent its request just fine). OpenAI has no
+    /// server-emitted timeout body to mirror — its SDKs' timeout errors
+    /// are client-side — so the honest shape is real HTTP semantics plus
+    /// the OpenAI envelope with a dedicated `timeout_error` type.
+    pub fn ttft_timeout(model: &str, budget_secs: u64) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            error_type: "timeout_error",
+            code: "ttft_timeout",
+            message: format!(
+                "No token was generated within the time-to-first-token budget \
+                 (server.ttft_timeout_secs = {budget_secs}) for model '{model}'; \
+                 the request was cancelled while queued or prefilling. Retry \
+                 later or under less load."
+            ),
+            retry_after_secs: None,
+        }
+    }
+
+    /// Total request timeout (SPEC §8.3): generation exceeded
+    /// `server.total_timeout_secs` and was cancelled through the worker's
+    /// Cancel path. Same 504 rationale as [`Self::ttft_timeout`].
+    pub fn total_timeout(model: &str, budget_secs: u64) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            error_type: "timeout_error",
+            code: "total_timeout",
+            message: format!(
+                "The request exceeded the total time budget \
+                 (server.total_timeout_secs = {budget_secs}) for model '{model}' \
+                 and was cancelled. Lower max_tokens or split the request."
+            ),
+            retry_after_secs: None,
+        }
+    }
+
     /// Worker died (mid-request or before it): the SPEC §2.2 structured 502
     /// with a retriable code.
     pub fn worker_crashed(message: impl Into<String>) -> Self {
@@ -306,6 +365,8 @@ impl ApiError {
     pub fn outcome(&self) -> &'static str {
         if self.code == "worker_crashed" || self.code == "worker_failed" {
             "worker_crashed"
+        } else if self.status == StatusCode::GATEWAY_TIMEOUT {
+            "timeout"
         } else if self.status.is_client_error() {
             "client_error"
         } else if self.status == StatusCode::SERVICE_UNAVAILABLE {
@@ -468,5 +529,53 @@ mod tests {
         assert_eq!(ApiError::worker_crashed("x").outcome(), "worker_crashed");
         assert_eq!(ApiError::model_loading("m").outcome(), "unavailable");
         assert_eq!(ApiError::internal("x").outcome(), "worker_error");
+        assert_eq!(ApiError::ttft_timeout("m", 30).outcome(), "timeout");
+        assert_eq!(ApiError::total_timeout("m", 600).outcome(), "timeout");
+    }
+
+    /// SPEC §8.3 timeouts: 504 with a dedicated `timeout_error` type and a
+    /// per-budget code — never the 429 rate-limit family (a timeout is
+    /// abandoned work, not a quota rejection) and no Retry-After. The
+    /// Anthropic taxonomy has no timeout type, so its envelope reports the
+    /// 5xx catch-all `api_error`.
+    #[test]
+    fn timeout_shape_is_504_not_rate_limited() {
+        let ttft = ApiError::ttft_timeout("m", 30);
+        assert_eq!(ttft.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(ttft.body()["error"]["type"], "timeout_error");
+        assert_eq!(ttft.body()["error"]["code"], "ttft_timeout");
+        assert!(
+            ttft.message.contains("ttft_timeout_secs = 30"),
+            "{}",
+            ttft.message
+        );
+        assert_eq!(ttft.anthropic_body()["error"]["type"], "api_error");
+
+        let total = ApiError::total_timeout("m", 600);
+        assert_eq!(total.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(total.body()["error"]["type"], "timeout_error");
+        assert_eq!(total.body()["error"]["code"], "total_timeout");
+
+        let response = ttft.into_response();
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none(),
+            "timeouts are not rate-limit rejections; no Retry-After"
+        );
+    }
+
+    /// SPEC §8.3 request size limits: an over-limit body is a 413 mapping
+    /// to Anthropic's `request_too_large`, distinct from the 400 a
+    /// malformed body gets.
+    #[test]
+    fn request_too_large_shape() {
+        let err = ApiError::request_too_large(2 * 1024 * 1024);
+        assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(err.body()["error"]["code"], "request_too_large");
+        assert_eq!(err.anthropic_body()["error"]["type"], "request_too_large");
+        assert_eq!(err.outcome(), "client_error");
+        assert!(err.message.contains("2097152"), "{}", err.message);
     }
 }
