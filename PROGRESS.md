@@ -8232,3 +8232,24 @@
   ```
 - Next: PM ruling on merge once CI is green; separately, PM ruling on
   hardening the flagged tpm-reconciliation assertion for runner variance.
+
+## [2026-07-25] Gateway follow-up / SPEC §8.4 MCP client — PR #41 MERGED (PM ruling) — DONE
+- What: PM ruled to merge on green CI (run 30127063010, all four jobs:
+  compile-linux 42s, lint 1m5s, test-macos-release 5m4s, test-macos
+  1h9m50s — all 11 test_mcp.py tests ran live on the runner under the
+  suite-wide pytest step, including the real timed hung-tool bounds and
+  the streamable-HTTP transport round trip). Merge commit 5fd0d54 (merge
+  commit, not squash — PROGRESS commit references stay valid on main).
+  The MCP client (SPEC §8.4) is now on main: [[mcp_server]] config, stdio
+  + streamable-HTTP transports, backoff reconnect, tool merge, gateway-
+  side execution loop on both API surfaces, admin/mcp listing, and the
+  documented total_timeout/tool_timeout interaction.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 41 -> 4/4 pass (run 30127063010)
+  $ gh pr merge 41 --merge -> merged; origin/main head 5fd0d54
+  ```
+- Next: nothing scheduled. Open PM item from the 2026-07-24 flake entry:
+  ruling on hardening test_rate_limit's device-dependent early-stop
+  assertion (spurious failure risk on golden-divergent runner classes).
