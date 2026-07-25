@@ -352,6 +352,7 @@ mod tests {
             auth: Auth::from_config(&config.auth).expect("auth"),
             rate: crate::ratelimit::RateLimiter::from_config(&config.auth),
             timeouts: crate::timeout::Timeouts::from_config(&config.server),
+            mcp: crate::mcp::McpRegistry::disabled(),
             jobs: crate::admin::JobsProxy::external(PathBuf::from("/tmp/kiln-admin-models.sock"))
                 .expect("proxy"),
             registrar,

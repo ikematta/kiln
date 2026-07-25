@@ -33,6 +33,8 @@ KILN_DEFAULTS__SSD_TIER=false
 | `rust_worker_argv` | sibling `kiln-worker` binary | Command prefix launching the Rust worker. Defaults to the `kiln-worker` next to the running gateway binary, falling back to `$PATH`. |
 | `jobs_argv` | sibling `kiln-jobs` binary | Command prefix for the on-demand jobs server; the gateway appends `serve --socket <path> --db <path> --dest-root <model_dir>`. Flags may precede the subcommand, so `["kiln-jobs", "--venv", "<uv-project-dir>"]` points quantization at a packaged jobs venv. |
 | `jobs_db` | `~/.kiln/jobs.sqlite` | SQLite job store used by the spawned `kiln-jobs` server (SPEC §9.1). |
+| `ttft_timeout_secs` | unset | Seconds from request **arrival** to the first generated token (queue wait and prefill count); expiry cancels through the worker's Cancel path and returns a 504 `ttft_timeout`. Unset = disabled. Must be ≤ `total_timeout_secs` when both are set. Rationale: `kiln-gateway/src/timeout.rs` module docs. |
+| `total_timeout_secs` | unset | Seconds from request arrival to the terminal event — the whole request, **including gateway-side MCP tool execution** (SPEC §8.4). Expiry is a 504 `total_timeout`. Unset = disabled. |
 | `cors_origins` | `[]` | CORS allowlist for browser clients (SPEC §8.3). Empty (the default) = the gateway sends no CORS headers, so cross-origin browser JS is blocked by the browser; non-browser clients and same-origin pages are unaffected. Entries are exact origins (`scheme://host[:port]`, no trailing slash or path) matched case-insensitively against the browser's `Origin` header; `"*"` alone allows any origin (explicit opt-in, and cannot be mixed with specific entries). For allowlisted origins, preflight `OPTIONS` is answered before auth (browsers send no credentials on preflights), allowed methods/headers mirror the preflight request, and `x-request-id`/`Retry-After` are readable by page JS. Rationale: `kiln-gateway/src/cors.rs` module docs. |
 
 ## `[memory]`
@@ -127,12 +129,45 @@ per-request under wide batches or sustained low acceptance.
 | `admin_token_hash` | `""` | argon2 (PHC) hash of the admin bearer token — generate with `kiln-gateway hash-key`. Empty/unset ⇒ the whole `/admin/*` surface (and the `/ui` dashboard's data) is **disabled, fail-closed** (403). A non-empty value that does not parse as a PHC string is a startup error, not a warning. API keys never grant admin. |
 | `[[auth.api_keys]]` | none | Per-key: `name`, `key_hash` (argon2), optional `rpm`, `tpm`. With **no** keys configured the `/v1/*` API is open (a warning is logged) — the admin surface is the opposite, closed until configured. |
 
-> **Known gap — rate limits are parsed, not enforced.** `rpm`/`tpm` have
-> been accepted by the config schema since Phase 2, but no token-bucket
-> middleware was ever built (SPEC §8.3 BACKLOG; re-recorded at the Phase 9
-> closeout, PROGRESS 2026-07-15). The same applies to the TTFT/total
-> request timeouts SPEC §8.3 names. Keys authenticate; they do not
-> currently limit.
+`rpm`/`tpm` are **enforced** (SPEC §8.3, since 2026-07-24): rpm as a
+token-bucket middleware after auth; tpm reserves `prompt + max_tokens`
+before submit and refunds the unused remainder when the request settles
+(`kiln-gateway/src/ratelimit.rs` module docs). Rejections are the
+OpenAI/Anthropic 429 rate-limit shapes with `Retry-After`. Under the MCP
+execution loop (SPEC §8.4) the tpm reservation is taken per generation
+round. (An earlier revision of this page described both rate limits and
+timeouts as parsed-but-unenforced; that was true until 2026-07-24 and is
+no longer.)
+
+## `[[mcp_server]]` (optional, one block per external MCP tool server)
+
+The gateway connects to each configured [MCP](https://modelcontextprotocol.io)
+server at startup, discovers its tools, and merges them into every
+chat/messages request the model can honor — from the model's perspective
+an MCP tool and a client-supplied tool are indistinguishable. When the
+model calls an MCP-sourced tool, the **gateway** executes it and feeds the
+result back through the normal tool-result message flow, looping until the
+model produces its final answer (at most 8 rounds). A server that is down
+retries forever on the worker-supervisor backoff curve without affecting
+anything else; inspect live state via `GET /admin/mcp` (admin bearer) or
+the `kiln_mcp_*` metrics. Full design: `kiln-gateway/src/mcp.rs` module
+docs.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `name` | required | Unique `[A-Za-z0-9_-]` name: admin listing, metric label, log key. |
+| `transport` | required | `"stdio"` (the gateway spawns `command` as a child speaking newline-delimited JSON-RPC) or `"http"` (streamable-HTTP endpoint at `url`). |
+| `command` | — | stdio only: the server's argv, e.g. `["uvx", "mcp-server-fetch"]`. Spawned in its own process group, killed as a tree on teardown. |
+| `env` | `{}` | stdio only: extra environment for the child, on top of the gateway's own. |
+| `url` | — | http only: the endpoint URL (`http[s]://…`). |
+| `tool_timeout_secs` | `30` | Per-tool-call bound. Expiry does **not** fail the request: the call resolves to an error tool-result the model can react to (MCP's own `isError` convention) — this is what keeps a hung MCP server from stalling requests even with no `total_timeout_secs` configured. `server.total_timeout_secs` additionally counts MCP execution and *does* 504 the request at the budget. |
+
+Collision rules: a client-supplied tool of the same name shadows the MCP
+tool for that request (the call returns to the client, never executed
+gateway-side); across servers, config order wins and the admin listing
+marks the loser `active: false`. MCP tools stay out of a request when it
+sends `tool_choice: "none"`, uses structured output (`response_format`
+grammars), or targets a model with no known tool-call format.
 
 ## Unauthenticated endpoints
 

@@ -404,6 +404,7 @@ mod tests {
             auth: Auth::from_config(&config.auth).expect("valid auth config"),
             rate: crate::ratelimit::RateLimiter::from_config(&config.auth),
             timeouts: crate::timeout::Timeouts::from_config(&config.server),
+            mcp: crate::mcp::McpRegistry::disabled(),
             jobs: JobsProxy::external(socket).expect("proxy"),
             registrar,
             shutdown: tokio::sync::watch::channel(false).1,

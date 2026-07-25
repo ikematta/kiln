@@ -29,6 +29,8 @@ pub struct AppState {
     pub rate: crate::ratelimit::RateLimiter,
     /// TTFT/total request budgets (SPEC §8.3), from `[server]`.
     pub timeouts: crate::timeout::Timeouts,
+    /// External MCP tool servers (SPEC §8.4), from `[[mcp_server]]`.
+    pub mcp: Arc<crate::mcp::McpRegistry>,
     pub jobs: crate::admin::JobsProxy,
     /// Runtime model registration (`POST /admin/models`): live insert +
     /// kiln.toml persistence in one flow.
@@ -103,6 +105,7 @@ pub fn router(state: Arc<AppState>, cors: Option<tower_http::cors::CorsLayer>) -
             post(crate::admin_models::pin_model),
         )
         .route("/admin/stats", get(crate::admin_models::stats_sse))
+        .route("/admin/mcp", get(crate::mcp::admin_mcp))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::auth::require_admin,

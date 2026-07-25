@@ -120,6 +120,13 @@ impl Deadlines {
     fn first_token(&mut self) {
         self.ttft = None;
     }
+
+    /// The absolute total-budget deadline, if configured — the bound MCP
+    /// tool execution runs under between generation rounds (crate::mcp
+    /// module docs: MCP round trips spend total budget).
+    pub(crate) fn total(&self) -> Option<Instant> {
+        self.total
+    }
 }
 
 /// Next worker event under the request's deadlines, flattened for a

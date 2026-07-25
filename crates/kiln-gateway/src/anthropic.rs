@@ -161,6 +161,9 @@ pub struct ValidatedMessages {
     pub stream: bool,
     /// `thinking: {"type": "disabled"}` — render with `enable_thinking=false`.
     pub thinking_disabled: bool,
+    /// `tool_choice: {"type": "none"}` — the request opted out of tools
+    /// entirely, which also keeps MCP tools out of scope (SPEC §8.4).
+    pub tools_disabled: bool,
 }
 
 impl MessagesRequest {
@@ -213,6 +216,7 @@ impl MessagesRequest {
                 .map(convert_tool)
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        let mut tools_disabled = false;
         match &self.tool_choice {
             None => {}
             Some(serde_json::Value::Object(choice)) => {
@@ -228,7 +232,10 @@ impl MessagesRequest {
                 }
                 match choice.get("type").and_then(|t| t.as_str()) {
                     Some("auto") => {}
-                    Some("none") => tools.clear(),
+                    Some("none") => {
+                        tools.clear();
+                        tools_disabled = true;
+                    }
                     Some(other @ ("any" | "tool")) => {
                         return Err(ApiError::invalid_request(format!(
                             "'tool_choice' type '{other}' is not supported \
@@ -282,6 +289,7 @@ impl MessagesRequest {
             priority: validate_priority(self.priority.as_deref())?,
             stream: self.stream,
             thinking_disabled,
+            tools_disabled,
         })
     }
 }

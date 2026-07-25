@@ -44,8 +44,8 @@ use crate::anthropic::{
 };
 use crate::app::{AppState, RequestId};
 use crate::chat::{
-    CompletionCtx, StreamEnd, TextPipeline, ToolRoute, admit_memory, classify_finished,
-    encode_prompt, read_body, ready_entry,
+    CompletionCtx, McpRounds, RoundStream, StreamEnd, TextPipeline, ToolRoute, admit_memory,
+    classify_finished, encode_prompt, read_body, ready_entry,
 };
 use crate::error::ApiError;
 use crate::registry::ModelEntry;
@@ -105,31 +105,91 @@ async fn handle(
     let deadlines = Deadlines::start(&state.timeouts, arrival);
     let entry = ready_entry(&state, &request.model)?;
     admit_memory(&state, &entry)?;
-    let validated = request.validate()?;
+    let mut validated = request.validate()?;
+
+    // MCP tools in scope (SPEC §8.4): same gates and merge as the chat
+    // endpoint — crate::chat::handle. A non-empty set switches onto the
+    // multi-round execution path below.
+    let format = entry
+        .template
+        .as_ref()
+        .and_then(|template| template.tool_call_format());
+    let emits_think = entry
+        .template
+        .as_ref()
+        .is_some_and(|template| template.emits_think_tags());
+    let mut mcp_tools = if validated.tools_disabled || format.is_none() {
+        crate::mcp::McpToolSet::empty()
+    } else {
+        state.mcp.snapshot()
+    };
+    if !mcp_tools.is_empty() {
+        mcp_tools.merge_into(&mut validated.tools, &entry.id);
+    }
+    if let (false, Some(format)) = (mcp_tools.is_empty(), format) {
+        let mut rounds = McpRounds {
+            state: Arc::clone(&state),
+            entry: Arc::clone(&entry),
+            messages: std::mem::take(&mut validated.messages),
+            tools: std::mem::take(&mut validated.tools),
+            format,
+            sampling: validated.sampling,
+            client_max_tokens: Some(validated.max_tokens),
+            stop_strings: validated.stop_sequences.clone(),
+            priority: validated.priority as i32,
+            rate,
+            base_request_id: request_id.0.clone(),
+            thinking_disabled: validated.thinking_disabled,
+            mcp: mcp_tools,
+            round: 0,
+            prompt_tokens_total: 0,
+            completion_tokens_total: 0,
+        };
+        let mut ctx = CompletionCtx {
+            state: Arc::clone(&state),
+            model: entry.id.clone(),
+            completion_id: format!("msg_{}", request_id.0.replace('-', "")),
+            created: crate::chat::unix_now(),
+            request_id: request_id.0.clone(),
+            channel: entry.channel.clone(),
+            requests_total: state.metrics.messages_total.clone(),
+            tpm: None,
+        };
+        // Round 1 submits here so its failures surface as proper HTTP
+        // errors, exactly like the single-round path.
+        let first = rounds.submit_round(&mut ctx).await?;
+        let stop_sequences = validated.stop_sequences.clone();
+        return if validated.stream {
+            Ok(stream_mcp_messages(
+                ctx,
+                rounds,
+                first,
+                emits_think,
+                stop_sequences,
+                deadlines,
+            ))
+        } else {
+            collect_mcp_messages(ctx, rounds, first, emits_think, stop_sequences, deadlines)
+                .await
+                .map(IntoResponse::into_response)
+        };
+    }
 
     let tool_parser = if validated.tools.is_empty() {
         None
     } else {
-        let format = entry
-            .template
-            .as_ref()
-            .and_then(|template| template.tool_call_format())
-            .ok_or_else(|| {
-                ApiError::invalid_request(format!(
-                    "model '{}' has no known tool-call format; 'tools' is not supported for it",
-                    entry.id
-                ))
-            })?;
+        let format = format.ok_or_else(|| {
+            ApiError::invalid_request(format!(
+                "model '{}' has no known tool-call format; 'tools' is not supported for it",
+                entry.id
+            ))
+        })?;
         Some(ToolCallParser::new(format, &validated.tools))
     };
     // Thinking-block extraction only for models that emit the tags; a
     // non-thinking model's output never routes through the parser, so user
     // text mentioning `<think>` cannot be misclassified.
-    let think = entry
-        .template
-        .as_ref()
-        .is_some_and(|template| template.emits_think_tags())
-        .then(ThinkParser::new);
+    let think = emits_think.then(ThinkParser::new);
 
     let prompt = render_prompt(&entry, &validated)?;
     let mut client = WorkerClient::new(entry.channel.clone());
@@ -369,6 +429,365 @@ fn usage_of(finished: &Finished) -> Usage {
         input_tokens: finished.prompt_tokens,
         output_tokens: finished.completion_tokens,
     }
+}
+
+// ---------------------------------------------------------------------------
+// MCP execution loop (SPEC §8.4) — Anthropic framing over crate::chat's
+// round machinery. Thinking/text blocks accumulate across rounds; an
+// executed round's tool_use blocks are internal plumbing the client never
+// sees, a terminal round's surface as ordinary blocks.
+// ---------------------------------------------------------------------------
+
+/// Routes one round's segments: thinking/text flow through (to the
+/// assembler or streamer) and into the assistant-history text; tool
+/// segments are withheld until the round settles. History gets text
+/// segments only — replayed thinking is dropped exactly as the request
+/// validator drops client-replayed thinking blocks (crate::anthropic
+/// module docs), so the loop feeds back what a faithful client would.
+fn split_segments(
+    segments: Vec<Segment>,
+    text_content: &mut String,
+    calls: &mut Vec<(String, String)>,
+    tool_segments: &mut Vec<Segment>,
+    mut live: impl FnMut(Segment),
+) {
+    for segment in segments {
+        match segment {
+            Segment::Thinking(_) => live(segment),
+            Segment::Text(text) => {
+                text_content.push_str(&text);
+                live(Segment::Text(text));
+            }
+            Segment::ToolStart { name } => {
+                calls.push((name.clone(), String::new()));
+                tool_segments.push(Segment::ToolStart { name });
+            }
+            Segment::ToolArgs { delta } => {
+                if let Some((_, arguments)) = calls.last_mut() {
+                    arguments.push_str(&delta);
+                }
+                tool_segments.push(Segment::ToolArgs { delta });
+            }
+            Segment::ToolEnd => tool_segments.push(Segment::ToolEnd),
+        }
+    }
+}
+
+async fn collect_mcp_messages(
+    mut ctx: CompletionCtx,
+    mut rounds: McpRounds,
+    first: RoundStream,
+    emits_think: bool,
+    stop_sequences: Vec<String>,
+    mut deadlines: Deadlines,
+) -> Result<axum::Json<MessagesResponse>, ApiError> {
+    let mut assembler = BlockAssembler::default();
+    let mut next_round = Some(first);
+    loop {
+        let RoundStream {
+            mut events,
+            mut pipeline,
+            parser,
+            ..
+        } = match next_round.take() {
+            Some(round) => round,
+            None => rounds.submit_round(&mut ctx).await?,
+        };
+        let mut route = SegmentRoute {
+            tools: ToolRoute::new(Some(parser)),
+            think: emits_think.then(ThinkParser::new),
+        };
+        let mut text_content = String::new();
+        let mut calls: Vec<(String, String)> = Vec::new();
+        let mut tool_segments: Vec<Segment> = Vec::new();
+
+        let (end, matched) = loop {
+            match next_event(&mut events, &mut deadlines).await {
+                WorkerEvent::Event(event) => match event.event {
+                    Some(token_event::Event::Tokens(chunk)) => {
+                        let was_matched = pipeline.stop_matched();
+                        let text = pipeline.push(chunk)?;
+                        split_segments(
+                            route.push(text),
+                            &mut text_content,
+                            &mut calls,
+                            &mut tool_segments,
+                            |segment| assembler.push(segment),
+                        );
+                        if !was_matched && pipeline.stop_matched() {
+                            ctx.cancel_worker().await;
+                        }
+                    }
+                    Some(token_event::Event::Finished(mut finished)) => {
+                        let tail = pipeline.finish()?;
+                        split_segments(
+                            route.finish(tail),
+                            &mut text_content,
+                            &mut calls,
+                            &mut tool_segments,
+                            |segment| assembler.push(segment),
+                        );
+                        pipeline.apply_usage(&mut finished);
+                        let matched = matched_stop_of(&pipeline, &finished);
+                        break (
+                            classify_finished(finished, pipeline.stop_matched()),
+                            matched,
+                        );
+                    }
+                    _ => {}
+                },
+                WorkerEvent::Closed => {
+                    break (
+                        StreamEnd::Failed(ApiError::worker_crashed(
+                            "the worker stream ended without a result (worker crashed mid-request)",
+                        )),
+                        None,
+                    );
+                }
+                WorkerEvent::Rpc(status) => {
+                    break (
+                        StreamEnd::Failed(ApiError::from_worker_status(&status)),
+                        None,
+                    );
+                }
+                WorkerEvent::TimedOut(scope) => {
+                    break (StreamEnd::Failed(ctx.abort_for_timeout(scope).await), None);
+                }
+            }
+        };
+
+        match end {
+            StreamEnd::Failed(err) => return Err(err),
+            StreamEnd::Done {
+                finished,
+                finish_reason,
+            } => {
+                rounds.prompt_tokens_total += u64::from(finished.prompt_tokens);
+                rounds.completion_tokens_total += u64::from(finished.completion_tokens);
+                if rounds.should_execute(
+                    finish_reason,
+                    pipeline.stop_matched(),
+                    &calls,
+                    route.calls_completed(),
+                ) {
+                    ctx.settle_round(&finished);
+                    if let Err(scope) = rounds.execute_round(text_content, calls, &deadlines).await
+                    {
+                        return Err(ctx.abort_for_timeout(scope).await);
+                    }
+                    continue;
+                }
+
+                for segment in tool_segments {
+                    assembler.push(segment);
+                }
+                ctx.record_ok(&finished);
+                let (stop_reason, stop_sequence) = anthropic_stop_reason(
+                    finish_reason,
+                    route.calls_completed(),
+                    matched,
+                    &stop_sequences,
+                );
+                let prompt = u32::try_from(rounds.prompt_tokens_total).unwrap_or(u32::MAX);
+                let completion = u32::try_from(rounds.completion_tokens_total).unwrap_or(u32::MAX);
+                return Ok(axum::Json(MessagesResponse {
+                    id: ctx.completion_id.clone(),
+                    response_type: "message",
+                    role: "assistant",
+                    model: ctx.model.clone(),
+                    content: assembler.into_content(&ctx.model),
+                    stop_reason: Some(stop_reason),
+                    stop_sequence,
+                    usage: Usage {
+                        input_tokens: prompt,
+                        output_tokens: completion,
+                    },
+                }));
+            }
+        }
+    }
+}
+
+/// Streaming messages under the MCP loop: one named-event SSE stream spans
+/// every round. `message_start` carries the first round's prompt tokens
+/// (later rounds don't exist yet when it goes out); the terminal
+/// `message_delta` usage reports the summed output tokens.
+fn stream_mcp_messages(
+    mut ctx: CompletionCtx,
+    mut rounds: McpRounds,
+    first: RoundStream,
+    emits_think: bool,
+    stop_sequences: Vec<String>,
+    mut deadlines: Deadlines,
+) -> Response {
+    let stream = async_stream::stream! {
+        let skeleton = MessagesResponse {
+            id: ctx.completion_id.clone(),
+            response_type: "message",
+            role: "assistant",
+            model: ctx.model.clone(),
+            content: Vec::new(),
+            stop_reason: None,
+            stop_sequence: None,
+            usage: Usage { input_tokens: first.prompt_tokens, output_tokens: 0 },
+        };
+        yield Ok::<SseEvent, Infallible>(sse_event("message_start", &MessageStartEvent {
+            event_type: "message_start",
+            message: &skeleton,
+        }));
+
+        let mut streamer = BlockStreamer::new();
+        let mut next_round = Some(first);
+        'rounds: loop {
+            let RoundStream { mut events, mut pipeline, parser, .. } = match next_round.take() {
+                Some(round) => round,
+                None => match rounds.submit_round(&mut ctx).await {
+                    Ok(round) => round,
+                    Err(err) => {
+                        ctx.record_err(&err);
+                        yield Ok(sse_event("error", &err.anthropic_body()));
+                        return;
+                    }
+                },
+            };
+            let mut route = SegmentRoute {
+                tools: ToolRoute::new(Some(parser)),
+                think: emits_think.then(ThinkParser::new),
+            };
+            let mut text_content = String::new();
+            let mut calls: Vec<(String, String)> = Vec::new();
+            let mut tool_segments: Vec<Segment> = Vec::new();
+
+            let (end, matched) = loop {
+                match next_event(&mut events, &mut deadlines).await {
+                    WorkerEvent::Event(event) => match event.event {
+                        Some(token_event::Event::Tokens(chunk)) => {
+                            let was_matched = pipeline.stop_matched();
+                            let text = match pipeline.push(chunk) {
+                                Ok(text) => text,
+                                Err(err) => {
+                                    ctx.record_err(&err);
+                                    yield Ok(sse_event("error", &err.anthropic_body()));
+                                    return;
+                                }
+                            };
+                            if !was_matched && pipeline.stop_matched() {
+                                ctx.cancel_worker().await;
+                            }
+                            let mut frames = Vec::new();
+                            split_segments(
+                                route.push(text),
+                                &mut text_content,
+                                &mut calls,
+                                &mut tool_segments,
+                                |segment| streamer.on_segment(segment, &mut frames),
+                            );
+                            for frame in frames {
+                                yield Ok(frame);
+                            }
+                            continue;
+                        }
+                        Some(token_event::Event::Finished(mut finished)) => {
+                            match pipeline.finish() {
+                                Ok(tail) => {
+                                    let mut frames = Vec::new();
+                                    split_segments(
+                                        route.finish(tail),
+                                        &mut text_content,
+                                        &mut calls,
+                                        &mut tool_segments,
+                                        |segment| streamer.on_segment(segment, &mut frames),
+                                    );
+                                    for frame in frames {
+                                        yield Ok(frame);
+                                    }
+                                }
+                                Err(err) => {
+                                    ctx.record_err(&err);
+                                    yield Ok(sse_event("error", &err.anthropic_body()));
+                                    return;
+                                }
+                            }
+                            pipeline.apply_usage(&mut finished);
+                            let matched = matched_stop_of(&pipeline, &finished);
+                            break (classify_finished(finished, pipeline.stop_matched()), matched);
+                        }
+                        _ => continue,
+                    },
+                    WorkerEvent::Closed => break (StreamEnd::Failed(ApiError::worker_crashed(
+                        "the worker stream ended without a result (worker crashed mid-request)",
+                    )), None),
+                    WorkerEvent::Rpc(status) =>
+                        break (StreamEnd::Failed(ApiError::from_worker_status(&status)), None),
+                    WorkerEvent::TimedOut(scope) =>
+                        break (StreamEnd::Failed(ctx.abort_for_timeout(scope).await), None),
+                }
+            };
+
+            match end {
+                StreamEnd::Failed(err) => {
+                    tracing::warn!(target: "kiln::messages", model = %ctx.model, code = err.code,
+                        "streaming messages request failed mid-stream: {}", err.message);
+                    ctx.record_err(&err);
+                    yield Ok(sse_event("error", &err.anthropic_body()));
+                    return;
+                }
+                StreamEnd::Done { finished, finish_reason } => {
+                    rounds.prompt_tokens_total += u64::from(finished.prompt_tokens);
+                    rounds.completion_tokens_total += u64::from(finished.completion_tokens);
+                    if rounds.should_execute(
+                        finish_reason,
+                        pipeline.stop_matched(),
+                        &calls,
+                        route.calls_completed(),
+                    ) {
+                        ctx.settle_round(&finished);
+                        if let Err(scope) = rounds.execute_round(text_content, calls, &deadlines).await {
+                            let err = ctx.abort_for_timeout(scope).await;
+                            ctx.record_err(&err);
+                            yield Ok(sse_event("error", &err.anthropic_body()));
+                            return;
+                        }
+                        continue 'rounds;
+                    }
+
+                    // Terminal round: flush withheld tool blocks, then
+                    // finish exactly like the single-round stream.
+                    let mut frames = Vec::new();
+                    for segment in tool_segments {
+                        streamer.on_segment(segment, &mut frames);
+                    }
+                    streamer.close(&mut frames);
+                    for frame in frames {
+                        yield Ok(frame);
+                    }
+                    let (stop_reason, stop_sequence) = anthropic_stop_reason(
+                        finish_reason,
+                        route.calls_completed(),
+                        matched,
+                        &stop_sequences,
+                    );
+                    yield Ok(sse_event("message_delta", &MessageDeltaEvent {
+                        event_type: "message_delta",
+                        delta: MessageDelta { stop_reason, stop_sequence },
+                        usage: MessageDeltaUsage {
+                            output_tokens: u32::try_from(rounds.completion_tokens_total)
+                                .unwrap_or(u32::MAX),
+                        },
+                    }));
+                    yield Ok(sse_event("message_stop", &MessageStopEvent {
+                        event_type: "message_stop",
+                    }));
+                    ctx.record_ok(&finished);
+                    return;
+                }
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

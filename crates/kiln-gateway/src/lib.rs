@@ -15,6 +15,7 @@ pub mod config_write;
 pub mod cors;
 pub mod error;
 pub mod lifecycle;
+pub mod mcp;
 pub mod messages;
 pub mod metrics;
 pub mod openai;

@@ -78,6 +78,15 @@ pub struct Metrics {
     /// Kernel memory-pressure level (`kern.memorystatus_vm_pressure_level`):
     /// 1 normal, 2 warning, 4 critical; 0 = unavailable.
     pub system_pressure_level: IntGauge,
+    /// 1 while the MCP server is connected, else 0 (SPEC §8.4).
+    pub mcp_up: IntGaugeVec,
+    /// MCP connect attempts by server and outcome (`ok | error`) — the
+    /// reconnect-with-backoff loop's visible heartbeat.
+    pub mcp_connect_attempts_total: IntCounterVec,
+    /// Gateway-executed MCP tool calls by server, tool, and outcome
+    /// (`ok | tool_error | error | timeout | unavailable`). Cardinality is
+    /// bounded by the servers' declared tool sets.
+    pub mcp_tool_calls_total: IntCounterVec,
     /// Worker `Stats` mirrors, per model.
     pub worker_stats: WorkerStatGauges,
     /// Heartbeat `MemoryReport` mirrors, per model (SPEC §2.3).
@@ -311,6 +320,22 @@ impl Metrics {
             "kiln_system_pressure_level",
             "Kernel memory-pressure level: 1 normal, 2 warning, 4 critical, 0 unavailable",
         )?;
+        let mcp_up = gauge(
+            "kiln_mcp_up",
+            "1 while the MCP server is connected, else 0",
+            &["server"],
+        )?;
+        let mcp_connect_attempts_total = counter(
+            "kiln_mcp_connect_attempts_total",
+            "MCP connect attempts by server and outcome (ok | error)",
+            &["server", "outcome"],
+        )?;
+        let mcp_tool_calls_total = counter(
+            "kiln_mcp_tool_calls_total",
+            "Gateway-executed MCP tool calls by server, tool, and outcome \
+             (ok | tool_error | error | timeout | unavailable)",
+            &["server", "tool", "outcome"],
+        )?;
         // Heartbeat MemoryReport mirrors (SPEC §2.3), per model.
         let mem = |name: &str, help: &str| gauge(name, help, &["model"]);
         let worker_memory = MemoryGauges {
@@ -440,6 +465,9 @@ impl Metrics {
             system_available_bytes,
             system_swap_used_bytes,
             system_pressure_level,
+            mcp_up,
+            mcp_connect_attempts_total,
+            mcp_tool_calls_total,
             worker_stats,
             worker_memory,
         })
