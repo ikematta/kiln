@@ -8325,3 +8325,22 @@
     AND --no-default-features; commit contains no Rust diff.
   ```
 - Next: PM ruling on this hardening + merge of PR #41; pushing re-rolls CI.
+
+## [2026-07-25] Gateway follow-up / SPEC §8.3 — PR #42 MERGED (PM ruling) — DONE
+- What: PM ruled to merge the tpm-reconciliation e2e hardening on green CI
+  (run 30179643994, all four jobs: lint 49s, compile-linux 56s,
+  test-macos-release 3m59s, test-macos 1h7m44s — the hardened
+  test_tpm_reservation_is_reconciled_to_actual_usage PASSED live on the
+  runner under the suite-wide pytest step). Merge commit e2e6178 (merge
+  commit, not squash — PROGRESS commit references stay valid on main).
+  This closes the open PM item from the 2026-07-24 flake entry: the
+  device-dependent early-stop assertion is gone; the test now derives its
+  probe bounds from reported usage and is immune to hardware-class logit
+  variance and to default-temperature sampling variance.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 42 -> 4/4 pass (run 30179643994)
+  $ gh pr merge 42 --merge -> merged; origin/main head e2e6178
+  ```
+- Next: nothing scheduled.
