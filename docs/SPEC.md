@@ -247,6 +247,10 @@ trait Model {
 ```
 v1 architectures, in build order: **Llama** (covers Llama 2/3/3.x, Mistral, and most llamafied models), **Qwen2/2.5**, **Qwen3** (incl. GQA + qk-norm variants), **Gemma 2**, **Gemma 3 (text)**. Config parsing must follow mlx-lm's `config.json` conventions exactly (that's the ecosystem contract), including `rope_scaling` variants (linear, llama3, yarn).
 
+**OLMoE** (mixture-of-experts; added 2026-07-25, MoE arc session 1): expert routing/gating and the sparse feed-forward live in Kiln-owned `moe.rs`, parameterized by config (`num_experts`, `num_experts_per_tok`, `norm_topk_prob`) — the first architecture exercising the `gather_qmm`/`gather_mm` kernel family. MoE trunks take monolithic (reference-shaped) prefill and cannot speculate at this pin.
+
+> **BACKLOG (MoE hardware scope — ADR 0007):** MoE kernel-dispatch-class safety is verified ONLY on M4-class hardware via the pinned ~4 GB OLMoE proxy. The deployment target — large MoE architectures on M3 Ultra / 128 GB — is a DIFFERENT GPU dispatch class at a scale no pinned test touches, and hosted CI (7 GB runners) cannot exercise it at all. Large-scale M3 Ultra deployment requires a separate verification pass on real target hardware (golden-style parity + calibration probe + dispatch re-read, per ADR 0007) before the ADR 0005 trust level applies there; tracked for community verification once open-sourced, not assumed.
+
 ### 7.3 Quantized weights
 Support mlx-lm quantization format: affine group quantization (`quantization: {group_size, bits}` in config, weights stored as packed `uint32` + `scales` + `biases`). Matmuls via `mlx_quantized_matmul`. Support 4-bit and 8-bit, group sizes 32/64/128. FP16/BF16 unquantized also supported. Anything else → route model to Python worker.
 

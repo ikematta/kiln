@@ -35,6 +35,7 @@ impl Qwen2Model {
             head_dim: config.head_dim() as i32,
             traditional_rope: config.rope_traditional,
             qk_norm_eps: None,
+            qk_norm_full_width: false,
             scale_override: None,
             attn_logit_softcapping: None,
         };

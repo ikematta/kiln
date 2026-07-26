@@ -36,6 +36,13 @@ PINS=(
   # {group_size: 64, bits: 8} — no per-module overrides (config.rs
   # fail-loud check). BF16 is covered by smollm2-135m-bf16 above.
   "qwen3-0.6b-8bit     mlx-community/Qwen3-0.6B-8bit             11de96878523501bcaa86104e3c186de07ff9068"
+  # MoE session 1 (PROGRESS 2026-07-25): the MoE proxy model — smallest
+  # well-supported mlx-community MoE checkpoint (6.9B total / 1.3B active,
+  # ~3.9 GB at 4-bit; uniform affine quantization, no per-module overrides).
+  # Proves routing/gating/expert-dispatch correctness on M4-class hardware
+  # only; it does NOT stand in for large-MoE deployment scale (see the
+  # SPEC §7.2 MoE backlog note).
+  "olmoe-1b-7b-0125-4bit  mlx-community/OLMoE-1B-7B-0125-Instruct-4bit  e23844197887b031e7ddddbb0b8959c5a6853a7b"
 )
 
 DEST="${KILN_TEST_MODELS:-$HOME/.kiln/test-models}"
