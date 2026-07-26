@@ -19,6 +19,7 @@ verified, not assumed").
 from __future__ import annotations
 
 import concurrent.futures
+import math
 import pathlib
 import subprocess
 import time
@@ -27,13 +28,15 @@ import httpx
 import pytest
 from conftest import MODEL_ID, build_binaries, model_dir, running_stack
 
+TPM_RECONCILE_LIMIT = 600
+
 # name -> (raw key, limits toml lines)
 LIMITED_KEYS = {
     "rpm": ("rl-rpm-key", "rpm = 2"),
     "burst": ("rl-burst-key", "rpm = 5"),
     "anthropic": ("rl-anthropic-key", "rpm = 1"),
     "tpm-cap": ("rl-tpm-cap-key", "tpm = 300"),
-    "tpm-reconcile": ("rl-tpm-reconcile-key", "tpm = 600"),
+    "tpm-reconcile": ("rl-tpm-reconcile-key", f"tpm = {TPM_RECONCILE_LIMIT}"),
     "tpm-race": ("rl-tpm-race-key", "tpm = 400"),
 }
 
@@ -166,26 +169,75 @@ def test_tpm_request_that_can_never_fit_is_rejected_up_front(rl_stack):
 
 def test_tpm_reservation_is_reconciled_to_actual_usage(rl_stack):
     """Reserve-then-reconcile: request A reserves prompt + 450 of the 600
-    budget but a stop string ends it after a handful of tokens. Only its
-    ACTUAL usage may stay charged — otherwise request B (another ~470
-    reservation) could not fit in the same minute."""
-    first = chat(
-        rl_stack,
-        "tpm-reconcile",
-        max_tokens=450,
-        prompt="Count from 1 to 100, separated by commas:",
-        stop=[" "],
-    )
+    budget; when it settles, exactly the unused remainder must come back.
+
+    Every bound below is derived from the usage A actually REPORTS, never
+    from what the model chooses to say. An earlier version asserted that a
+    " " stop string fires within 20 tokens of llama counting to 100 —
+    device-class-dependent greedy output that flaked on a CI runner whose
+    logits diverge from the golden machines (PR #41 run 30123388579; the
+    ADR-0004 cross-device situation, see PROGRESS.md 2026-07-24). Here A
+    terminates no matter what it emits (EOS or its own max_tokens cap),
+    and two probes bracket the settled budget from both sides:
+
+    - over (denied): asks for more than a correct refund leaves, even
+      crediting the bucket's continuous refill its worst-case accrual.
+      Admission would mean settle() refunded MORE than the unused
+      remainder (e.g. the whole reservation, ignoring actual usage).
+    - second (admitted): asks for exactly the post-refund budget, no
+      refill credit needed. A 429 means the unused remainder was never
+      returned.
+
+    Both probes assert ledger arithmetic that holds for ANY completion
+    length A reports, including the degenerate cap-hit case (refund
+    legitimately ~0, probes still pass). Their bug-catching power scales
+    with the refund actually left on the table — every observed runner
+    class ends a counting prompt a few hundred tokens short of the cap —
+    but their PASS/FAIL is content-independent. Exact refund arithmetic
+    is unit-tested in ratelimit.rs (tpm_reserve_settle_refunds_only_unused)."""
+    prompt = "Count from 1 to 100, separated by commas:"
+    refill_per_sec = TPM_RECONCILE_LIMIT / 60
+    started = time.monotonic()
+
+    first = chat(rl_stack, "tpm-reconcile", max_tokens=450, prompt=prompt)
     assert first.status_code == 200, first.text
     usage = first.json()["usage"]
-    # The stop string must have fired early for the refund to be visible.
-    assert usage["completion_tokens"] <= 20, usage
-    assert usage["total_tokens"] <= 100, usage
+    prompt_tokens = usage["prompt_tokens"]
+    actual = usage["total_tokens"]
+    # Server-enforced invariants, independent of what the model emitted.
+    assert usage["completion_tokens"] <= 450, usage
+    assert actual == prompt_tokens + usage["completion_tokens"], usage
+    # Tokenization is deterministic: this only moves if the prompt string
+    # or chat template changes, and the probe arithmetic needs the room.
+    assert prompt_tokens <= 74, f"prompt too large for the probe bounds: {usage}"
 
-    second = chat(rl_stack, "tpm-reconcile", max_tokens=450)
+    # Denied probe first — a denied reservation consumes nothing (proved
+    # by test_tpm_request_that_can_never_fit_is_rejected_up_front), so it
+    # cannot disturb the admitted probe. 15s covers this probe's own
+    # flight time when bounding the refill accrued since A reserved.
+    refill_bound = math.ceil((time.monotonic() - started + 15.0) * refill_per_sec)
+    over = chat(
+        rl_stack,
+        "tpm-reconcile",
+        max_tokens=TPM_RECONCILE_LIMIT - actual + refill_bound - prompt_tokens,
+        prompt=prompt,
+    )
+    assert over.status_code == 429, (
+        f"budget above actual-usage + worst-case refill was admitted: settle() "
+        f"refunded more than A's unused reservation (A reserved "
+        f"{prompt_tokens} + 450, reported {actual}): {over.text}"
+    )
+    assert_openai_429(over, "tokens")
+
+    second = chat(
+        rl_stack,
+        "tpm-reconcile",
+        max_tokens=TPM_RECONCILE_LIMIT - actual - prompt_tokens,
+        prompt=prompt,
+    )
     assert second.status_code == 200, (
-        f"reservation was not refunded down to actual usage "
-        f"(A used {usage['total_tokens']} of its ~490 reservation): {second.text}"
+        f"reservation was not refunded down to actual usage (A reserved "
+        f"{prompt_tokens} + 450, reported {actual}): {second.text}"
     )
 
 

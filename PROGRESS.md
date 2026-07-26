@@ -8253,3 +8253,75 @@
 - Next: nothing scheduled. Open PM item from the 2026-07-24 flake entry:
   ruling on hardening test_rate_limit's device-dependent early-stop
   assertion (spurious failure risk on golden-divergent runner classes).
+
+## [2026-07-25] Gateway follow-up / SPEC §8.3 — harden tpm reconciliation e2e (PM-directed) — DONE
+- What:
+  - `test_rate_limit.py::test_tpm_reservation_is_reconciled_to_actual_usage`
+    no longer asserts device-class-dependent model output (the `" "` stop
+    string firing within 20 tokens of llama counting to 100 — the PR #41
+    run 30123388579 flake, diagnosed 2026-07-24). Every bound now derives
+    from the usage request A actually REPORTS.
+  - New shape: A reserves prompt + 450 of the 600 tpm budget with no stop
+    string, so it terminates for ANY output (EOS or its own max_tokens
+    cap). Two probes are then sized at runtime from A's reported usage,
+    reusing A's prompt (deterministic tokenization ⇒ identical
+    prompt_tokens): a DENIED over-probe asking for more than a correct
+    refund leaves even crediting worst-case bucket refill (catches
+    refund-more-than-unused, e.g. refunding the full reservation — the old
+    test could NOT catch this class), and an ADMITTED probe asking for
+    exactly the post-refund budget with zero refill credit (catches
+    no-refund). Coverage is strictly stronger, per the task's bar.
+- Decisions:
+  - The PM directive preferred "force a short first completion via small
+    max_tokens", conditional on settle() being cause-uniform. Confirmed
+    cause-uniform: `TpmReservation::settle` computes reserved − actual and
+    never sees a finish reason; the sole success-path caller
+    `CompletionCtx::record_ok` (chat.rs:759) settles prompt + completion
+    from `Finished` identically for stop-string/EOS/length terminations
+    (errors, timeouts, disconnects forfeit unsettled by design). BUT the
+    small-max_tokens fix is structurally vacuous for an ARITHMETIC reason,
+    not a branching one: the reservation IS prompt + max_tokens
+    (ratelimit.rs:289), so a cap-terminated completion has
+    actual == reserved and refund ≡ 0 — the follow-up admission then
+    passes even with settle() deleted. Zero refund coverage is exactly the
+    forbidden weaker bar, so the PM's stated fallback (actual-usage
+    derivation) was implemented instead.
+  - The probes assert ledger arithmetic that holds for ANY reported
+    completion length, including the degenerate cap-hit (refund
+    legitimately ~0; probes pass vacuously-but-correctly). Their
+    bug-catching power scales with the refund actually left on the table
+    (200–450 tokens on every observed runner class). Exact
+    to-the-token refund arithmetic stays in the ratelimit.rs unit tests
+    (`tpm_reserve_settle_refunds_only_unused`), where the bucket's
+    10 tok/s refill noise does not exist.
+  - Additional finding while verifying: these requests never pinned
+    `temperature`, and the OpenAI-surface default is 1.0 (openai.rs:386) —
+    the old assertion rode on SAMPLED output, not even on stable greedy
+    output (observed same-machine spread: completion_tokens 208–314 for
+    the identical prompt across runs). The hardened test is immune to both
+    sampling variance and the ADR-0004 hardware-class logit variance.
+- Deviations: a test's assertions changed — authorized by the PM task
+  driving this session; presented here for the PM ruling per CLAUDE.md.
+- Acceptance:
+  ```
+  $ uv run --project tests/e2e pytest tests/e2e/test_rate_limit.py -v
+    6 passed in 296.64s (incl. hardened
+    test_tpm_reservation_is_reconciled_to_actual_usage)
+  Content-independence demo (uncommitted scaffold, same probe logic,
+  three prompts driving A's completion to the shape extremes):
+    eos-fast   usage={prompt 40, completion 2,   total 42}  PASSED
+    mid-length usage={prompt 47, completion 208, total 255} PASSED
+    cap-hit    usage={prompt 47, completion 450, total 497} PASSED
+    (scaffold deleted after the run)
+  Mutation checks (ratelimit.rs settle() broken both ways, rebuilt, run):
+    refund = 0        -> admitted-probe FAILED: "reservation was not
+                         refunded down to actual usage" (429 observed)
+    refund = reserved -> over-probe FAILED: "settle() refunded more than
+                         A's unused reservation" (200 observed)
+    limiter restored via git checkout (byte-identical to HEAD); clean
+    rerun: 1 passed in 23.28s
+  CI shapes: ruff check + ruff format --check clean (CI invocation);
+    cargo fmt --check clean; cargo clippy -D warnings clean on default
+    AND --no-default-features; commit contains no Rust diff.
+  ```
+- Next: PM ruling on this hardening + merge of PR #41; pushing re-rolls CI.
