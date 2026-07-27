@@ -12,6 +12,7 @@ use kiln_mlx::{Array, Dtype, MlxError, Stream, ops};
 
 use crate::config::{ConfigError, Quantization, RopeScaling};
 use crate::kv_cache::KvCache;
+use crate::moe::{MoeBlock, MoeOptions};
 use crate::weights::{WeightStore, WeightsError};
 
 #[derive(Debug, thiserror::Error)]
@@ -374,6 +375,13 @@ pub(crate) struct AttentionShape {
     /// `Some(eps)` loads `q_norm`/`k_norm` weights (qwen3/gemma3 qk-norm;
     /// the weight parameterization follows the trunk's [`NormStyle`]).
     pub(crate) qk_norm_eps: Option<f32>,
+    /// Where the qk-norm sits (only meaningful with `qk_norm_eps`):
+    /// `false` = per-head, between the `[B, L, H, D]` reshape and the
+    /// transpose, reducing over `D` (qwen3/gemma3); `true` = full-width, on
+    /// the raw `[B, L, H*D]` projection output before the reshape, reducing
+    /// over `H*D` (olmoe: `q_norm(q_proj(x))` in the reference). The two
+    /// are different math, not different layouts.
+    pub(crate) qk_norm_full_width: bool,
     /// SDPA scale, already computed with the architecture's own f64
     /// formula (gemma `query_pre_attn_scalar`); `None` = `head_dim**-0.5`.
     pub(crate) scale_override: Option<f64>,
@@ -402,6 +410,7 @@ pub(crate) struct Attention {
     v_proj: Linear,
     o_proj: Linear,
     qk_norm: Option<QkNorm>,
+    qk_norm_full_width: bool,
     rope: Rope,
 }
 
@@ -442,8 +451,39 @@ impl Attention {
             v_proj: Linear::load(store, &format!("{prefix}.v_proj"), quantization)?,
             o_proj: Linear::load(store, &format!("{prefix}.o_proj"), quantization)?,
             qk_norm,
+            qk_norm_full_width: shape.qk_norm_full_width,
             rope,
         })
+    }
+
+    /// Full-width qk-norm (olmoe placement): RMSNorm over the raw
+    /// `[.., H*D]` projection outputs, before any reshape. The identity for
+    /// per-head-norm and norm-less architectures. Row-wise over the last
+    /// axis, so applying it to a concatenated multi-sequence step batch is
+    /// row-for-row the single-request op (same argument as the trunk's
+    /// `input_layernorm` over concatenated rows).
+    fn norm_full_width(
+        &self,
+        queries: Array,
+        keys: Array,
+        s: &Stream,
+    ) -> Result<(Array, Array), MlxError> {
+        match (&self.qk_norm, self.qk_norm_full_width) {
+            (Some(n), true) => Ok((
+                fast::rms_norm(&queries, &n.q_weight, n.eps, s)?,
+                fast::rms_norm(&keys, &n.k_weight, n.eps, s)?,
+            )),
+            _ => Ok((queries, keys)),
+        }
+    }
+
+    /// The per-head qk-norm weights for the reshape-site norm (`None` when
+    /// the norm is full-width or absent).
+    fn per_head_norm_weights(&self) -> (Option<&Array>, Option<&Array>) {
+        match &self.qk_norm {
+            Some(n) if !self.qk_norm_full_width => (Some(&n.q_weight), Some(&n.k_weight)),
+            _ => (None, None),
+        }
     }
 
     /// The reference's manual attention for softcapped architectures
@@ -558,6 +598,10 @@ impl Attention {
         let queries = self.q_proj.forward(x, s)?;
         let keys = self.k_proj.forward(x, s)?;
         let values = self.v_proj.forward(x, s)?;
+        // olmoe-style full-width qk-norm sits HERE, on the raw projection
+        // outputs (identity elsewhere); the per-head variant stays at the
+        // reshape site below.
+        let (queries, keys) = self.norm_full_width(queries, keys, s)?;
         let (queries, keys, values) = if pad > 0 {
             (
                 ops::slice(
@@ -640,16 +684,16 @@ impl Attention {
     }
 
     fn norm_q(&self, q: &Array, s: &Stream) -> Result<Array, MlxError> {
-        match &self.qk_norm {
-            Some(n) => fast::rms_norm(q, &n.q_weight, n.eps, s),
-            None => Ok(q.clone()),
+        match (self.per_head_norm_weights().0, &self.qk_norm) {
+            (Some(w), Some(n)) => fast::rms_norm(q, w, n.eps, s),
+            _ => Ok(q.clone()),
         }
     }
 
     fn norm_k(&self, k: &Array, s: &Stream) -> Result<Array, MlxError> {
-        match &self.qk_norm {
-            Some(n) => fast::rms_norm(k, &n.k_weight, n.eps, s),
-            None => Ok(k.clone()),
+        match (self.per_head_norm_weights().1, &self.qk_norm) {
+            (Some(w), Some(n)) => fast::rms_norm(k, w, n.eps, s),
+            _ => Ok(k.clone()),
         }
     }
 
@@ -680,6 +724,12 @@ impl Attention {
         let queries = self.q_proj.forward(x, s)?;
         let keys = self.k_proj.forward(x, s)?;
         let values = self.v_proj.forward(x, s)?;
+        // olmoe-style full-width qk-norm on the raw projection outputs
+        // (identity elsewhere): row-wise over the last axis, so norming the
+        // concatenated step batch is row-for-row the single-request op —
+        // the same argument the trunk's input_layernorm already relies on.
+        let (queries, keys) = self.norm_full_width(queries, keys, s)?;
+        let (q_head_norm, k_head_norm) = self.per_head_norm_weights();
 
         // Phase 1: per-sequence (qk-norm +) RoPE + pool writes. Segments
         // address REAL rows only, so the pad rows at the tail of `x` are
@@ -689,10 +739,10 @@ impl Attention {
         let mut start = 0;
         for seq in seqs {
             let l = seq.len;
-            // qk-norm slots between the reshape and the transpose, exactly
-            // as in [`Self::forward`]; rms_norm reduces over the last axis
-            // only, so norming the sliced segment matches norming the full
-            // batch row-for-row.
+            // Per-head qk-norm slots between the reshape and the transpose,
+            // exactly as in [`Self::forward`]; rms_norm reduces over the
+            // last axis only, so norming the sliced segment matches norming
+            // the full batch row-for-row.
             let segment =
                 |a: &Array, heads: i32, norm: Option<&Array>| -> Result<Array, MlxError> {
                     let seg = if single {
@@ -707,16 +757,8 @@ impl Attention {
                     };
                     ops::transpose(&seg, &[0, 2, 1, 3], s)
                 };
-            let q = segment(
-                &queries,
-                self.n_heads,
-                self.qk_norm.as_ref().map(|n| &n.q_weight),
-            )?;
-            let k = segment(
-                &keys,
-                self.n_kv_heads,
-                self.qk_norm.as_ref().map(|n| &n.k_weight),
-            )?;
+            let q = segment(&queries, self.n_heads, q_head_norm)?;
+            let k = segment(&keys, self.n_kv_heads, k_head_norm)?;
             let v = segment(&values, self.n_kv_heads, None)?;
             let q = self
                 .rope
@@ -803,6 +845,25 @@ impl Attention {
     }
 }
 
+/// A block's feed-forward sublayer: the dense gated [`Mlp`] everywhere
+/// except MoE trunks, whose sparse block routes each token through its
+/// top-k experts (`moe.rs`). Same `[.., L, D] -> [.., L, D]` contract —
+/// position-independent, so one implementation serves both decode paths.
+#[derive(Debug)]
+pub(crate) enum FeedForward {
+    Dense(Mlp),
+    Moe(MoeBlock),
+}
+
+impl FeedForward {
+    fn forward(&self, x: &Array, s: &Stream) -> Result<Array, MlxError> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(x, s),
+            Self::Moe(moe) => moe.forward(x, s),
+        }
+    }
+}
+
 /// Residual connection. With `clip_f16` (gemma3 `clip_residual`) an f16
 /// residual is computed in f32 and clipped to the f16 range before
 /// narrowing; any other dtype (and the non-clipping architectures) is a
@@ -837,7 +898,7 @@ pub(crate) struct Block {
     post_feedforward_layernorm: Option<Array>,
     clip_residual_f16: bool,
     self_attn: Attention,
-    mlp: Mlp,
+    mlp: FeedForward,
     rms_eps: f32,
 }
 
@@ -884,12 +945,21 @@ impl Block {
                 opts.norm_style,
                 s,
             )?,
-            mlp: Mlp::load(
-                store,
-                &format!("{prefix}.mlp"),
-                quantization,
-                opts.activation,
-            )?,
+            mlp: match &opts.moe {
+                Some(moe_opts) => FeedForward::Moe(MoeBlock::load(
+                    store,
+                    &format!("{prefix}.mlp"),
+                    quantization,
+                    moe_opts,
+                    s,
+                )?),
+                None => FeedForward::Dense(Mlp::load(
+                    store,
+                    &format!("{prefix}.mlp"),
+                    quantization,
+                    opts.activation,
+                )?),
+            },
             rms_eps,
         })
     }
@@ -967,6 +1037,9 @@ pub(crate) struct TrunkOptions {
     pub(crate) embed_scale: Option<Array>,
     /// gemma2 final logit softcapping (`tanh(logits/cap)*cap`).
     pub(crate) final_logit_softcapping: Option<f32>,
+    /// `Some` replaces every block's dense MLP with the sparse-MoE block
+    /// (`moe.rs`), parameterized by the checkpoint's expert geometry.
+    pub(crate) moe: Option<MoeOptions>,
 }
 
 impl Default for TrunkOptions {
@@ -978,6 +1051,7 @@ impl Default for TrunkOptions {
             clip_residual_f16: false,
             embed_scale: None,
             final_logit_softcapping: None,
+            moe: None,
         }
     }
 }
@@ -1123,15 +1197,16 @@ impl CausalLm {
         base.eval()?;
 
         let attn = &block.self_attn;
-        let mut linears: Vec<&Linear> = vec![
-            &attn.q_proj,
-            &attn.k_proj,
-            &attn.v_proj,
-            &attn.o_proj,
-            &block.mlp.gate_proj,
-            &block.mlp.up_proj,
-            &block.mlp.down_proj,
-        ];
+        let mut linears: Vec<&Linear> =
+            vec![&attn.q_proj, &attn.k_proj, &attn.v_proj, &attn.o_proj];
+        match &block.mlp {
+            FeedForward::Dense(mlp) => {
+                linears.extend([&mlp.gate_proj, &mlp.up_proj, &mlp.down_proj]);
+            }
+            // MoE: the router is a plain projection, probed with the rest;
+            // the expert path is probed whole below.
+            FeedForward::Moe(moe) => linears.push(&moe.gate),
+        }
         if let Some(head) = &self.lm_head {
             linears.push(head);
         }
@@ -1151,6 +1226,22 @@ impl CausalLm {
             let hidden = base.dim(2);
             let threshold =
                 probe_row_stability(hidden, &base, s, |x| self.embed_tokens.as_linear(x, s))?;
+            min_threshold = min_threshold.min(threshold);
+        }
+        if let FeedForward::Moe(moe) = &block.mlp {
+            // The expert path is its own kernel-dispatch surface, distinct
+            // from plain projections on two axes at once: gather_qmm's
+            // row-count dispatch AND the SwitchGLU sort threshold
+            // (`indices.size >= 64` flips the op stream itself once
+            // M * top_k crosses it — see moe.rs). Probing the whole block
+            // (router → top-k → expert dispatch → weighted combine)
+            // measures both, so the resulting width keeps batched
+            // deterministic rows bit-identical to M=1 through the full MoE
+            // layer, not just through its matmuls. Identical probe rows
+            // route identically, maximizing per-expert group sizes — the
+            // adversarial shape for any group-size-dependent kernel switch.
+            let hidden = base.dim(2);
+            let threshold = probe_row_stability(hidden, &base, s, |x| moe.forward(x, s))?;
             min_threshold = min_threshold.min(threshold);
         }
         Ok(min_threshold.saturating_sub(1).clamp(1, 32))

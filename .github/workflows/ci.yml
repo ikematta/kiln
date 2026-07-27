@@ -147,6 +147,18 @@ jobs:
         run: |
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
           export KILN_FIXTURE_PARITY=skip
+          # Runner-capacity carve-out (PM-directed, PROGRESS 2026-07-26):
+          # spec_decode's SELF-DRAFT arm loads a model twice; on this
+          # ~7 GB runner a doubled load above 3.5 GiB (= half of RAM
+          # resident in weights alone) is measured-pathological (olmoe,
+          # 2 x 3.6 GB: 62-min swap crawl, run 30191249436) while the
+          # largest pre-MoE double-load (gemma-2-2b, 3.2 GB) fits
+          # cleanly and stays under this limit. Skips ONLY the
+          # self-draft arm for oversized models; the adversarial arm and
+          # plain-path invariance run for every model, and dev machines
+          # (var unset) always run the full self-draft bar. Reasoning:
+          # spec_decode.rs `selfdraft_double_load_limit`.
+          export KILN_SPEC_SELFDRAFT_DOUBLE_LOAD_LIMIT=3758096384
           cargo test -p kiln-tokenize --test tokenizer --test detok --test toolcall_fixtures
           cargo test -p kiln-engine --test grammar
           cargo test -p kiln-models --test batching --test calibration \

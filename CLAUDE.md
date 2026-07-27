@@ -121,6 +121,8 @@ revisions (revisions live in the script — treat as frozen):
 - `mlx-community/Qwen3-0.6B-4bit`            (also the draft model in spec-decode tests)
 - `mlx-community/gemma-3-1b-it-4bit`
 - one BF16 tiny model (see script) for the unquantized path
+- `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` (MoE proxy, ~3.9 GB — proves
+  routing/gating on M4-class hardware ONLY; see ADR 0007 for the M3 Ultra gap)
 
 Tests reference them via the `KILN_TEST_MODELS` env var; never hardcode home paths.
 
@@ -129,7 +131,7 @@ Tests reference them via the `KILN_TEST_MODELS` env var; never hardcode home pat
 ```
 proto/kiln/v1/worker.proto   the contract (frozen semantics after Phase 2)
 crates/kiln-mlx              unsafe FFI + safe wrappers (Array, Stream, errors)  [only unsafe crate]
-crates/kiln-models           model impls + config.json parsing (llama, qwen*, gemma*)
+crates/kiln-models           model impls + config.json parsing (llama, qwen*, gemma*, olmoe/MoE)
 crates/kiln-engine           batching loop, paged KV, radix prefix cache, sampler, spec decode, SSD tier
 crates/kiln-worker           binary: gRPC server = kiln-engine + kiln-models
 crates/kiln-gateway          binary: axum, API adapters, router, supervisor, metrics

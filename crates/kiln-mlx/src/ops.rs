@@ -99,6 +99,11 @@ binary_op!(
     logical_and, mlx_logical_and
 );
 binary_op!(
+    /// Elementwise floor(a / b) (Python `//`; integer division for integer
+    /// dtypes — the MoE gather-sort's `order // top_k`).
+    floor_divide, mlx_floor_divide
+);
+binary_op!(
     /// Dense matrix multiplication.
     matmul, mlx_matmul
 );
@@ -164,6 +169,15 @@ pub fn concatenate(arrays: &[&Array], axis: i32, s: &Stream) -> Result<Array> {
     let vec = VectorArray::from_arrays(arrays)?;
     let mut out = Array::new_handle();
     check(unsafe { sys::mlx_concatenate_axis(out.raw_out(), vec.raw(), axis, s.raw()) })?;
+    Ok(out)
+}
+
+/// Stack `arrays` along a new `axis` (expert-weight stacking, mlx-lm MoE
+/// `sanitize`).
+pub fn stack(arrays: &[&Array], axis: i32, s: &Stream) -> Result<Array> {
+    let vec = VectorArray::from_arrays(arrays)?;
+    let mut out = Array::new_handle();
+    check(unsafe { sys::mlx_stack_axis(out.raw_out(), vec.raw(), axis, s.raw()) })?;
     Ok(out)
 }
 
@@ -314,6 +328,13 @@ pub fn topk(a: &Array, k: i32, axis: i32, s: &Stream) -> Result<Array> {
     Ok(out)
 }
 
+/// Sum along `axis`.
+pub fn sum(a: &Array, axis: i32, keepdims: bool, s: &Stream) -> Result<Array> {
+    let mut out = Array::new_handle();
+    check(unsafe { sys::mlx_sum_axis(out.raw_out(), a.raw(), axis, keepdims, s.raw()) })?;
+    Ok(out)
+}
+
 /// Cumulative sum along `axis`.
 pub fn cumsum(a: &Array, axis: i32, reverse: bool, inclusive: bool, s: &Stream) -> Result<Array> {
     let mut out = Array::new_handle();
@@ -360,6 +381,72 @@ pub fn quantized_matmul(
             opt_int(Some(group_size)),
             opt_int(Some(bits)),
             c"affine".as_ptr(),
+            s.raw(),
+        )
+    })?;
+    Ok(out)
+}
+
+/// Affine-quantized gather-matmul over per-expert weight stacks (mlx-lm
+/// `QuantizedSwitchLinear`, the MoE expert dispatch): for each row of `x`,
+/// `x @ dequant(w[rhs_indices], scales[rhs_indices], biases[rhs_indices])^T?`.
+/// `lhs_indices` is always null at Kiln's call sites (every token row pairs
+/// with its own expert indices by broadcasting); `sorted_indices` mirrors the
+/// reference's sort hint and changes kernel scheduling, so callers must pass
+/// exactly what the reference passes for the same shape.
+#[allow(clippy::too_many_arguments)] // mirrors the mlx-c parameter list
+pub fn gather_qmm(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    biases: &Array,
+    rhs_indices: &Array,
+    transpose: bool,
+    group_size: i32,
+    bits: i32,
+    sorted_indices: bool,
+    s: &Stream,
+) -> Result<Array> {
+    let mut out = Array::new_handle();
+    check(unsafe {
+        sys::mlx_gather_qmm(
+            out.raw_out(),
+            x.raw(),
+            w.raw(),
+            scales.raw(),
+            biases.raw(),
+            Array::null_raw(),
+            rhs_indices.raw(),
+            transpose,
+            opt_int(Some(group_size)),
+            opt_int(Some(bits)),
+            c"affine".as_ptr(),
+            sorted_indices,
+            s.raw(),
+        )
+    })?;
+    Ok(out)
+}
+
+/// Dense gather-matmul over per-expert weight stacks (mlx-lm
+/// `SwitchLinear`): `x @ b[rhs_indices]`. The caller pre-transposes `b`
+/// exactly as the reference does (`weight.swapaxes(-1, -2)`).
+pub fn gather_mm(
+    a: &Array,
+    b: &Array,
+    rhs_indices: &Array,
+    sorted_indices: bool,
+    s: &Stream,
+) -> Result<Array> {
+    let mut out = Array::new_handle();
+    check(unsafe {
+        sys::mlx_gather_mm(
+            out.raw_out(),
+            a.raw(),
+            b.raw(),
+            Array::null_raw(),
+            rhs_indices.raw(),
+            sorted_indices,
             s.raw(),
         )
     })?;

@@ -36,6 +36,7 @@ impl Qwen3Model {
             // mlx_lm.models.qwen3 hardcodes traditional=False.
             traditional_rope: false,
             qk_norm_eps: Some(config.rms_norm_eps),
+            qk_norm_full_width: false,
             scale_override: None,
             attn_logit_softcapping: None,
         };

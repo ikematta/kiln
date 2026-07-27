@@ -36,7 +36,8 @@ pub struct Quantization {
 /// [`ArchConfig`] dispatch below — extend both together. (`gemma3_text` is
 /// the text-only Gemma3 checkpoint type; multimodal `"gemma3"` is not
 /// supported and routes to the Python worker.)
-pub const SUPPORTED_ARCHITECTURES: &[&str] = &["llama", "qwen2", "qwen3", "gemma2", "gemma3_text"];
+pub const SUPPORTED_ARCHITECTURES: &[&str] =
+    &["llama", "qwen2", "qwen3", "gemma2", "gemma3_text", "olmoe"];
 
 /// Resolved `rope_scaling` (the variants mlx-lm's `initialize_rope` supports
 /// for the SPEC §7.2 architectures: default, linear, llama3, yarn).
@@ -568,6 +569,94 @@ impl Gemma3Config {
     }
 }
 
+/// Parsed OLMoE-family `config.json` — fields and defaults mirror
+/// `mlx_lm.models.olmoe.ModelArgs` exactly. The MoE geometry (`num_experts`,
+/// `num_experts_per_tok`, `norm_topk_prob`) parameterizes the expert
+/// routing/gating in `moe.rs`; nothing about it is hardcoded to a specific
+/// checkpoint size. `intermediate_size` is the PER-EXPERT hidden width.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OlmoeConfig {
+    pub model_type: String,
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub intermediate_size: usize,
+    pub num_attention_heads: usize,
+    pub rms_norm_eps: f32,
+    pub vocab_size: usize,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    #[serde(default)]
+    pub norm_topk_prob: bool,
+    #[serde(default)]
+    pub head_dim: Option<usize>,
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    pub num_key_value_heads: Option<usize>,
+    #[serde(default)]
+    pub attention_bias: bool,
+    #[serde(default)]
+    pub mlp_bias: bool,
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f32,
+    #[serde(default)]
+    pub rope_traditional: bool,
+    #[serde(default)]
+    pub rope_scaling: Option<serde_json::Value>,
+    #[serde(default = "default_true")]
+    pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub quantization: Option<Quantization>,
+    #[serde(default)]
+    pub eos_token_id: Option<serde_json::Value>,
+}
+
+impl OlmoeConfig {
+    /// Loads and validates `<dir>/config.json`.
+    pub fn from_model_dir(dir: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        Self::from_json_str(&read_config_json(dir.as_ref())?)
+    }
+
+    /// Parses and validates a `config.json` document (load-time fail-loud;
+    /// see [`LlamaConfig::from_json_str`]).
+    pub fn from_json_str(text: &str) -> Result<Self, ConfigError> {
+        let raw: serde_json::Value = serde_json::from_str(text)?;
+        let config: Self = serde_json::from_value(raw.clone())?;
+        if config.model_type != "olmoe" {
+            return Err(ConfigError::UnsupportedArchitecture(
+                config.model_type.clone(),
+            ));
+        }
+        if config.num_experts == 0 || config.num_experts_per_tok == 0 {
+            return Err(ConfigError::UnsupportedArchitecture(format!(
+                "olmoe with num_experts={} num_experts_per_tok={}",
+                config.num_experts, config.num_experts_per_tok
+            )));
+        }
+        config.rope_scaling()?;
+        validate_quantization(&raw)?;
+        validate_quant_params(config.quantization)?;
+        Ok(config)
+    }
+
+    pub fn num_kv_heads(&self) -> usize {
+        self.num_key_value_heads.unwrap_or(self.num_attention_heads)
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    pub fn eos_token_ids(&self) -> Vec<u32> {
+        eos_ids_from(self.eos_token_id.as_ref())
+    }
+
+    pub fn rope_scaling(&self) -> Result<RopeScaling, ConfigError> {
+        resolve_rope_scaling(self.rope_scaling.as_ref())
+    }
+}
+
 /// A validated `config.json` for any architecture the Rust worker implements,
 /// dispatched on `model_type` ([`SUPPORTED_ARCHITECTURES`]).
 ///
@@ -582,6 +671,7 @@ pub enum ArchConfig {
     Qwen3(Qwen3Config),
     Gemma2(Gemma2Config),
     Gemma3(Gemma3Config),
+    Olmoe(OlmoeConfig),
 }
 
 impl ArchConfig {
@@ -606,6 +696,7 @@ impl ArchConfig {
             "qwen3" => Ok(Self::Qwen3(Qwen3Config::from_json_str(text)?)),
             "gemma2" => Ok(Self::Gemma2(Gemma2Config::from_json_str(text)?)),
             "gemma3_text" => Ok(Self::Gemma3(Gemma3Config::from_json_str(text)?)),
+            "olmoe" => Ok(Self::Olmoe(OlmoeConfig::from_json_str(text)?)),
             _ => Err(ConfigError::UnsupportedArchitecture(model_type)),
         }
     }
@@ -617,6 +708,7 @@ impl ArchConfig {
             Self::Qwen3(c) => &c.model_type,
             Self::Gemma2(c) => &c.model_type,
             Self::Gemma3(c) => &c.model_type,
+            Self::Olmoe(c) => &c.model_type,
         }
     }
 
@@ -627,6 +719,7 @@ impl ArchConfig {
             Self::Qwen3(c) => c.eos_token_ids(),
             Self::Gemma2(c) => c.eos_token_ids(),
             Self::Gemma3(c) => c.eos_token_ids(),
+            Self::Olmoe(c) => c.eos_token_ids(),
         }
     }
 }
@@ -943,6 +1036,76 @@ mod tests {
         json["rope_scaling"] = serde_json::json!({"rope_type": "longrope", "factor": 4.0});
         let err = ArchConfig::from_json_str(&json.to_string()).expect_err("longrope rejected");
         assert!(matches!(err, ConfigError::UnsupportedRope(_)));
+    }
+
+    fn olmoe_json() -> serde_json::Value {
+        // The pinned olmoe-1b-7b-0125-4bit test model's config, trimmed to
+        // the fields the parser reads.
+        serde_json::json!({
+            "model_type": "olmoe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 16,
+            "intermediate_size": 1024,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "num_experts": 64,
+            "num_experts_per_tok": 8,
+            "norm_topk_prob": false,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 50304,
+            "max_position_embeddings": 4096,
+            "rope_theta": 10000.0,
+            "rope_scaling": null,
+            "tie_word_embeddings": false,
+            "eos_token_id": 50279,
+            "quantization": {"group_size": 64, "bits": 4}
+        })
+    }
+
+    #[test]
+    fn olmoe_parses_and_dispatches() {
+        let arch = ArchConfig::from_json_str(&olmoe_json().to_string()).expect("olmoe loads");
+        let ArchConfig::Olmoe(c) = &arch else {
+            panic!("wrong arch: {arch:?}");
+        };
+        assert_eq!(arch.model_type(), "olmoe");
+        assert_eq!(arch.eos_token_ids(), vec![50279]);
+        assert_eq!(c.num_experts, 64);
+        assert_eq!(c.num_experts_per_tok, 8);
+        assert!(!c.norm_topk_prob);
+        // Derived per mlx_lm.models.olmoe.ModelArgs: MHA (kv defaults to
+        // heads when absent), head_dim = hidden // heads when absent.
+        assert_eq!(c.num_kv_heads(), 16);
+        assert_eq!(c.head_dim(), 128);
+        assert!(!c.tie_word_embeddings);
+
+        // Defaults when optional fields are absent (ModelArgs defaults).
+        let mut json = olmoe_json();
+        let obj = json.as_object_mut().unwrap();
+        for key in [
+            "num_key_value_heads",
+            "norm_topk_prob",
+            "rope_theta",
+            "tie_word_embeddings",
+            "max_position_embeddings",
+        ] {
+            obj.remove(key);
+        }
+        let c: OlmoeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(c.num_kv_heads(), 16);
+        assert!(!c.norm_topk_prob);
+        assert_eq!(c.rope_theta, 10_000.0);
+        assert!(c.tie_word_embeddings);
+        assert!(!c.attention_bias);
+        assert!(!c.mlp_bias);
+        assert_eq!(c.rope_scaling().unwrap(), RopeScaling::Default);
+
+        // Degenerate expert geometry is a named load error, not a
+        // mid-forward shape failure.
+        let mut json = olmoe_json();
+        json["num_experts_per_tok"] = serde_json::json!(0);
+        let err = OlmoeConfig::from_json_str(&json.to_string()).expect_err("k=0 rejected");
+        assert!(matches!(err, ConfigError::UnsupportedArchitecture(_)));
     }
 
     #[test]

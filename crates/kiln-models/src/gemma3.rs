@@ -50,6 +50,7 @@ impl Gemma3Model {
             // mlx_lm.models.gemma3_text hardcodes traditional=False.
             traditional_rope: false,
             qk_norm_eps: Some(config.rms_norm_eps),
+            qk_norm_full_width: false,
             // Reference: `args.query_pre_attn_scalar**-0.5` (f64, narrowed
             // at the FFI boundary).
             scale_override: Some(config.query_pre_attn_scalar.powf(-0.5)),
@@ -81,6 +82,7 @@ impl Gemma3Model {
                 clip_residual_f16: true,
                 embed_scale: Some(embed_scale),
                 final_logit_softcapping: None,
+                moe: None,
             },
             |layer| {
                 // `is_sliding = (layer_idx + 1) % sliding_window_pattern != 0`

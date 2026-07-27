@@ -13,6 +13,7 @@ use crate::gemma2::Gemma2Model;
 use crate::gemma3::Gemma3Model;
 use crate::llama::LlamaModel;
 use crate::nn::ModelError;
+use crate::olmoe::OlmoeModel;
 use crate::qwen2::Qwen2Model;
 use crate::qwen3::Qwen3Model;
 
@@ -25,6 +26,7 @@ pub enum AnyModel {
     Qwen3(Qwen3Model),
     Gemma2(Gemma2Model),
     Gemma3(Gemma3Model),
+    Olmoe(OlmoeModel),
 }
 
 impl AnyModel {
@@ -39,6 +41,7 @@ impl AnyModel {
             ArchConfig::Qwen3(_) => Ok(Self::Qwen3(Qwen3Model::load(dir, s)?)),
             ArchConfig::Gemma2(_) => Ok(Self::Gemma2(Gemma2Model::load(dir, s)?)),
             ArchConfig::Gemma3(_) => Ok(Self::Gemma3(Gemma3Model::load(dir, s)?)),
+            ArchConfig::Olmoe(_) => Ok(Self::Olmoe(OlmoeModel::load(dir, s)?)),
         }
     }
 
@@ -49,6 +52,7 @@ impl AnyModel {
             Self::Qwen3(m) => &m.config().model_type,
             Self::Gemma2(m) => &m.config().model_type,
             Self::Gemma3(m) => &m.config().model_type,
+            Self::Olmoe(m) => &m.config().model_type,
         }
     }
 
@@ -60,6 +64,7 @@ impl AnyModel {
             Self::Qwen3(m) => m.config().eos_token_ids(),
             Self::Gemma2(m) => m.config().eos_token_ids(),
             Self::Gemma3(m) => m.config().eos_token_ids(),
+            Self::Olmoe(m) => m.config().eos_token_ids(),
         }
     }
 
@@ -71,6 +76,7 @@ impl AnyModel {
             Self::Qwen3(m) => m.kv_dims(),
             Self::Gemma2(m) => m.kv_dims(),
             Self::Gemma3(m) => m.kv_dims(),
+            Self::Olmoe(m) => m.kv_dims(),
         }
     }
 
@@ -87,6 +93,13 @@ impl AnyModel {
     ///   reference-shaped replica matches the fixture (PROGRESS
     ///   2026-07-10, smollm2-135m-bf16/raw-tiny-remainder). The fine
     ///   grid was only ever validated on quantized checkpoints.
+    /// - MoE trunks (olmoe): the bar-(3) pad was validated on dense-MLP
+    ///   quantized trunks only. Pad rows on a MoE piece would route
+    ///   through the gate and join REAL rows' expert groups, changing the
+    ///   gather_qmm shapes (and possibly the SwitchGLU sort branch) of the
+    ///   rows being kept — outside the pad rule's empirical base, so MoE
+    ///   takes reference-shaped prefill like dense trunks do (the ADR 0002
+    ///   addendum precedent applied to a new op family; see olmoe.rs).
     pub fn monolithic_prefill_required(&self) -> bool {
         let dense = match self {
             Self::Llama(m) => m.config().quantization.is_none(),
@@ -94,9 +107,11 @@ impl AnyModel {
             Self::Qwen3(m) => m.config().quantization.is_none(),
             Self::Gemma2(m) => m.config().quantization.is_none(),
             Self::Gemma3(m) => m.config().quantization.is_none(),
+            Self::Olmoe(m) => m.config().quantization.is_none(),
         };
         match self {
             Self::Gemma2(m) => dense || m.monolithic_prefill_required(),
+            Self::Olmoe(_) => true,
             _ => dense,
         }
     }
@@ -154,6 +169,20 @@ impl AnyModel {
     pub fn speculative_gamma_bound(&self) -> Option<usize> {
         // (n_heads, n_kv_heads, head_dim, quantized, fused-SDPA path)
         let (heads, kv_heads, head_dim, quantized, fused) = match self {
+            // MoE trunks are outside the certified envelope at this pin,
+            // regardless of their attention geometry (olmoe's fused SDPA,
+            // head_dim 128, gqa_factor 1 would pass the formula below): a
+            // gamma+1-row verify also multiplies the EXPERT dispatch row
+            // count, and the gather_qmm/SwitchGLU kernel family has no
+            // kernel-class certificate — ADR 0005's proof covers fused
+            // SDPA and plain trunk matmuls only. Per ADR 0005 decision
+            // (2), a new family needs a documented geometry review plus a
+            // green spec_decode gate on the generating device before
+            // `Some` here is permission; until that review exists
+            // (tracked in the SPEC §7.2 MoE backlog note / ADR 0007), a
+            // configured drafter on a MoE target is a loud load failure
+            // by design.
+            Self::Olmoe(_) => return None,
             Self::Llama(m) => {
                 let c = m.config();
                 (
@@ -235,6 +264,7 @@ impl AnyModel {
             Self::Qwen3(m) => m.calibrate_deterministic_width(s),
             Self::Gemma2(m) => m.calibrate_deterministic_width(s),
             Self::Gemma3(m) => m.calibrate_deterministic_width(s),
+            Self::Olmoe(m) => m.calibrate_deterministic_width(s),
         }
     }
 }
@@ -252,6 +282,7 @@ impl StepModel for AnyModel {
             Self::Qwen3(m) => m.forward_step(batch, kv, s),
             Self::Gemma2(m) => m.forward_step(batch, kv, s),
             Self::Gemma3(m) => m.forward_step(batch, kv, s),
+            Self::Olmoe(m) => m.forward_step(batch, kv, s),
         }
     }
 }

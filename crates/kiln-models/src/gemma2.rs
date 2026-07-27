@@ -53,6 +53,7 @@ impl Gemma2Model {
             head_dim: config.head_dim as i32,
             traditional_rope: config.rope_traditional,
             qk_norm_eps: None,
+            qk_norm_full_width: false,
             // Reference: `1.0 / (args.query_pre_attn_scalar**0.5)` (f64,
             // narrowed at the FFI boundary).
             scale_override: Some(1.0 / config.query_pre_attn_scalar.sqrt()),
@@ -78,6 +79,7 @@ impl Gemma2Model {
                 clip_residual_f16: false,
                 embed_scale: Some(embed_scale),
                 final_logit_softcapping: Some(config.final_logit_softcapping),
+                moe: None,
             },
             |_| {
                 Rope::new(
