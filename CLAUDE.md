@@ -77,6 +77,10 @@ python -m grpc_tools.protoc -Iproto --python_out=python/kiln_worker_py/src/kiln_
 cargo test --workspace                           # unit + integration (Metal tests auto-skip if no GPU)
 cargo test -p kiln-engine -- --ignored           # property tests (slow)
 cargo test -p kiln-models --test golden          # golden-token parity harness
+KILN_GOLDEN_XL=1 cargo test -p kiln-models --test golden   # + the XL tier (tests/golden-xl:
+  # checkpoints hosted CI cannot load — currently the 8-bit MoE cell). DEV MACHINES MUST RUN
+  # THIS: CI never does, so an unrun XL tier rots silently. Needs the opt-in pin fetched
+  # (see "Test models"); with the gate set, a missing model is a loud failure, not a skip.
 pytest python/kiln_worker_py/tests               # python worker unit tests
 uv run --project tests/e2e pytest tests/e2e     # black-box HTTP tests (full stack; `uv sync --project tests/e2e` once)
 
@@ -120,6 +124,10 @@ Purpose: prove Rust model implementations reproduce mlx-lm exactly.
 - Run: `cargo test -p kiln-models --test golden`. Pass = exact token-id match for
   every fixture. The relaxed bar in SPEC §11.2 applies only after a human-approved
   ADR names the specific model and reason.
+- `tests/golden-xl/` is the same harness and the same exact-match bar for models
+  hosted CI cannot load; it runs only under `KILN_GOLDEN_XL=1`, which dev machines
+  set. The gate is the only skip — once set, a missing model fails loudly. Fixtures
+  for a model whose checkpoint CI can hold belong in `tests/golden/`, not here.
 - When adding a new architecture: fixtures first (from mlx-lm reference), then the
   implementation, then iterate until green. Never the other way around.
 
@@ -136,10 +144,12 @@ revisions (revisions live in the script — treat as frozen):
   routing/gating on M4-class hardware ONLY; see ADR 0007 for the M3 Ultra gap)
 - `mlx-community/OLMoE-1B-7B-0125-Instruct-8bit` (8-bit cell of the MoE
   quantization matrix, ~7.4 GB, 2 shards — same base model as the 4-bit
-  proxy, so the pair isolates `gather_qmm` at `bits = 8`. Dev-machine only:
-  hosted CI runners (~7 GB RAM) cannot load it at all, and how it reaches CI
-  is an open PM decision — see the DECISION NEEDED block in PROGRESS.md
-  [2026-07-27].)
+  proxy, so the pair isolates `gather_qmm` at `bits = 8`). **Opt-in pin:**
+  a bare fetch skips it; get it with
+  `./scripts/fetch-test-model.sh --only olmoe-1b-7b-0125-8bit`. Its fixtures
+  live in `tests/golden-xl/`, not `tests/golden/`, because hosted CI runners
+  (~7 GB RAM) cannot load the checkpoint at all (PROGRESS 2026-07-27,
+  option C).
 
 Tests reference them via the `KILN_TEST_MODELS` env var; never hardcode home paths.
 
@@ -159,6 +169,7 @@ crates/kiln-cli              binary `kiln`: serve/models/bench wrappers over the
 python/kiln_worker_py        mlx-lm fallback worker (same proto; no monkey-patching)
 Formula/kiln.rb              Homebrew formula       packaging/  launchd plist template
 tests/golden                 parity fixtures        tests/e2e   black-box HTTP suite
+tests/golden-xl              parity fixtures for models CI cannot load (KILN_GOLDEN_XL=1)
 docs/SPEC.md                 the spec               docs/decisions/  ADRs (read-only)
 ```
 

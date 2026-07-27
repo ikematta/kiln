@@ -8867,3 +8867,123 @@
   Whichever way this goes: the fixtures were generated into
   `tests/golden/olmoe-1b-7b-0125-8bit/` as the task directed, so (C) means
   moving that directory while (A)/(B) leave it where it is.
+
+## [2026-07-27] MoE arc / Session 2 follow-up — XL fixture tier (option C, PM-directed) — DONE
+- What: PM approved option (C) from the DECISION NEEDED block above —
+  dev-only fixture tree plus opt-in pin — and directed it as a small
+  dedicated change ahead of session 3.
+  - `tests/golden/olmoe-1b-7b-0125-8bit/` -> `tests/golden-xl/olmoe-1b-7b-0125-8bit/`
+    (git mv; all 6 fixtures byte-identical, not regenerated — git records
+    them as pure renames).
+  - `golden.rs`: the tree walk is now `run_fixture_tree(fixture_root,
+    models_root, fetch_hint)` — ONE implementation and ONE bar whichever
+    tree it is pointed at. `tests/golden/` is walked unconditionally exactly
+    as before, so its fixtures-imply-model assertion keeps full force over
+    an unchanged set; `tests/golden-xl/` is walked afterwards under
+    `KILN_GOLDEN_XL`. `fetch_hint` changes only the remedy printed with an
+    absence failure, since XL pins must be named explicitly to be fetched.
+  - The gate is the ONLY skip. Gated + model absent -> hard failure with the
+    same fixtures-imply-model text. Gated + `KILN_TEST_MODELS` unset ->
+    panic instead of the usual skip, because the operator asked for the
+    tier. `KILN_GOLDEN_XL=0` or empty is an explicit off.
+  - `scripts/fetch-test-model.sh`: a named `OPT_IN` list. A bare run (what
+    CI invokes) fetches the default set and skips opt-in pins; `--only
+    <name>` fetches them; `--list` now reports which set each pin is in.
+    Deliberately a named opt-out list, NOT option (A)'s general tier system
+    — that remains available if more oversized pins arrive.
+  - `CLAUDE.md`: the gated command is in the acceptance list marked DEV
+    MACHINES MUST RUN THIS (rot is option C's stated risk and CI can never
+    catch it), the golden-harness section states the XL tier's bar and which
+    fixtures belong where, the pinned-model entry documents the opt-in
+    fetch, and the repository map gains `tests/golden-xl`.
+- Findings — the acceptance run caught a bug I introduced, before it landed:
+  - My first cut added a SECOND `#[test]` for the XL tree. libtest runs test
+    functions in PARALLEL, so two threads drove MLX at once and the process
+    aborted: `-[_MTLCommandBuffer addCompletedHandler:]:1011: failed
+    assertion 'Completed handler provided after commit call'` (SIGABRT,
+    after 6 passing fixtures). That is exactly the CLAUDE.md FFI rule — all
+    MLX work on one thread, `Stream` is `!Send` — and it would also have
+    raced the two `live_objects()` leak baselines against each other. Fixed
+    by folding both trees into the one existing test function, called
+    sequentially; the reason is recorded in a comment at the test so nobody
+    re-splits it. Rejected the alternative (`--test-threads=1`): a flag
+    every caller must remember is a worse contract than a structure that
+    cannot be run wrong.
+- Net effect on CI: a bare fetch is back to the pre-session-2 default set,
+  so no recurring +7.35 GB; `tests/golden/` is back to its 8 directories, so
+  `golden.rs`, `spec_decode.rs` and `spec_probe.rs` enumerate exactly what
+  they did before session 2. The model cache key (`hashFiles` over the
+  script) does change because the script changed, so CI refetches the
+  default set ONCE — unavoidable for any script edit, and one-time rather
+  than per-run. Item (iv) of the decision block is disposed of as expected:
+  spec_decode no longer sees the 8-bit dir, so the dev machine never meets
+  the 14.71 GB double-load unless something opts in explicitly (measured
+  below: 401.43s -> 193.90s, back under session 1's 214.46s).
+- Decisions:
+  - Implemented the opt-in pin as well as the fixture move. The approved
+    recommendation was explicitly "(C) plus the minimum piece of (A) needed
+    to keep the pin out of CI's bare fetch"; the move alone would have left
+    CI still downloading 7.35 GB it cannot use — problem (i) unsolved.
+- Deviations: none. ADR 0007 scope unchanged; no fixture regenerated, no
+  existing assertion relaxed.
+- Acceptance (all against the final committed source):
+  ```
+  $ KILN_GOLDEN_XL=1 cargo test -p kiln-models --test golden
+  test result: ok. 1 passed; 0 failed; ... finished in 981.87s
+  208 exact-match rounds = 184 (tests/golden, 8 dirs) + 24 (tests/golden-xl,
+  the 8-bit MoE cell: 6 fixtures x {sequential, width-16} x {gather, paged
+  kernel}). Both trees' live_objects() leak baselines held.
+
+  $ cargo test -p kiln-models --test golden          # gate off = the CI shape
+  skipping tests/golden-xl: KILN_GOLDEN_XL not set (dev-machine tier; hosted
+    CI runners cannot load these checkpoints)
+  test result: ok. 1 passed; 0 failed; ... finished in 727.65s
+  184 exact-match rounds over the 8 tests/golden dirs.
+
+  FAIL-LOUD, gated (the property option C depends on):
+  $ KILN_GOLDEN_XL=1 KILN_TEST_MODELS=<farm with the 8 default models, no 8-bit>
+    cargo test -p kiln-models --test golden
+  panicked at crates/kiln-models/tests/golden.rs:412:
+  fixtures exist for olmoe-1b-7b-0125-8bit but the model is missing under
+  KILN_TEST_MODELS — run ./scripts/fetch-test-model.sh --only <name> (XL pins
+  are opt-in and are NOT fetched by a bare run)
+  test result: FAILED. 0 passed; 1 failed; ... finished in 719.55s
+  (reached only AFTER the main tree passed — the XL walk is genuinely
+  binding, not short-circuited)
+
+  $ KILN_GOLDEN_XL=1 (KILN_TEST_MODELS unset) cargo test -p kiln-models --test golden
+  panicked: KILN_GOLDEN_XL is set but KILN_TEST_MODELS is not — the XL tier
+  needs both
+  test result: FAILED. 0 passed; 1 failed
+
+  $ cargo test -p kiln-models --test spec_decode
+  8 model dirs enumerated (pre-session-2 set; no 8-bit double-load)
+  test result: ok. 1 passed; 0 failed; ... finished in 193.90s
+
+  $ ./scripts/fetch-test-model.sh --list
+  llama-3.2-1b-4bit      ... [default]      qwen3-0.6b-4bit    ... [default]
+  gemma-3-1b-it-4bit     ... [default]      smollm2-135m-bf16  ... [default]
+  qwen2.5-0.5b-4bit      ... [default]      gemma-2-2b-it-4bit ... [default]
+  qwen3-0.6b-8bit        ... [default]      olmoe-1b-7b-0125-4bit ... [default]
+  olmoe-1b-7b-0125-8bit  ... [opt-in (--only olmoe-1b-7b-0125-8bit)]
+
+  $ cargo fmt --check                                                        -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings                    -> Finished
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> Finished
+  $ cargo build --workspace --no-default-features                            -> Finished
+  $ ruff check / ruff format --check (worker venv)  -> All checks passed! / 40 formatted
+  (clippy's first pass flagged `ptr_arg` on `run_fixture_tree`'s `&PathBuf`
+  params; changed to `&Path` and both golden runs above were re-run against
+  the corrected source.)
+
+  The llama-only model-gated suites (batching, calibration, draft, leak,
+  leak_batched, preemption, prefill_pad, prefix_cache, prefix_multiturn) are
+  untouched by this change — no golden-tree walk, fixed MODEL_NAME constants
+  — and were green at the previous commit; not re-run.
+  ```
+- Next: session 3 of the MoE arc — a second MoE architecture (`qwen2_moe` /
+  `qwen3_moe`). Carry into its task list explicitly: golden.rs's MoE posture
+  assertion keys on the literal `"olmoe"`, so a new family must be added
+  there or its monolithic-prefill / envelope-None posture goes unasserted;
+  and new-family fixtures belong in `tests/golden/` unless the checkpoint is
+  too large for a ~7 GB hosted runner, in which case `tests/golden-xl/`.

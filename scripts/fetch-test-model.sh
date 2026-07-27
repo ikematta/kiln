@@ -11,9 +11,12 @@
 # gated/private repos (unneeded for the public pins below; never printed).
 #
 # Usage:
-#   ./scripts/fetch-test-model.sh              # fetch all pinned models
+#   ./scripts/fetch-test-model.sh              # fetch the DEFAULT set
 #   ./scripts/fetch-test-model.sh --only llama-3.2-1b-4bit [--only ...]
-#   ./scripts/fetch-test-model.sh --list
+#   ./scripts/fetch-test-model.sh --list       # pins + which set each is in
+#
+# A bare run fetches every pin EXCEPT those in OPT_IN below (checkpoints
+# hosted CI cannot load); name those with --only. `--list` shows which.
 
 set -euo pipefail
 
@@ -58,8 +61,36 @@ PINS=(
   "olmoe-1b-7b-0125-8bit  mlx-community/OLMoE-1B-7B-0125-Instruct-8bit  7055a795fc029a51108f881d4a118c6f17deb59f"
 )
 
+# Pins a BARE run does not fetch — checkpoints hosted CI cannot use at all
+# (~7 GB macos-14 runners), so downloading them there would only burn cache
+# and minutes. Fetch one explicitly by name:
+#   ./scripts/fetch-test-model.sh --only olmoe-1b-7b-0125-8bit
+# This is deliberately a named opt-out list, not a general tier system:
+# every other pin stays in the default set, and adding a pin here is a
+# visible, one-line decision (PROGRESS 2026-07-27, PM-directed option C).
+OPT_IN=(
+  "olmoe-1b-7b-0125-8bit"
+)
+
 DEST="${KILN_TEST_MODELS:-$HOME/.kiln/test-models}"
 ONLY=()
+
+opt_in_only() {
+  local name="$1" o
+  for o in "${OPT_IN[@]}"; do [[ "$o" == "$name" ]] && return 0; done
+  return 1
+}
+
+wanted() {
+  local name="$1" o
+  # A bare run fetches the default set: everything except the opt-in pins.
+  if [[ ${#ONLY[@]} -eq 0 ]]; then
+    opt_in_only "$name" && return 1
+    return 0
+  fi
+  for o in "${ONLY[@]}"; do [[ "$o" == "$name" ]] && return 0; done
+  return 1
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -68,7 +99,12 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --list)
-      for pin in "${PINS[@]}"; do echo "$pin" | awk '{printf "%-20s %-45s %s\n", $1, $2, $3}'; done
+      for pin in "${PINS[@]}"; do
+        read -r name repo rev <<<"$pin"
+        tier="default"
+        opt_in_only "$name" && tier="opt-in (--only $name)"
+        printf "%-24s %-45s %s  [%s]\n" "$name" "$repo" "$rev" "$tier"
+      done
       exit 0
       ;;
     *)
@@ -77,13 +113,6 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-
-wanted() {
-  [[ ${#ONLY[@]} -eq 0 ]] && return 0
-  local name="$1" o
-  for o in "${ONLY[@]}"; do [[ "$o" == "$name" ]] && return 0; done
-  return 1
-}
 
 mkdir -p "$DEST"
 
