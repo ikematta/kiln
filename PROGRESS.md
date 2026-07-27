@@ -8494,3 +8494,43 @@
   pre-MoE baseline (vs 2h13m in run 30191249436) with all four jobs
   green and olmoe still exercised in every non-self-draft spec_decode
   case; record the measured run time here once observed.
+
+## [2026-07-27] MoE arc / Session 1 — PR #43 MERGED (PM ruling); carve-out timing recorded — DONE
+- What: PM ruled to merge on green CI. Run 30241628948 (the carve-out
+  commit 456043c), all four jobs green: lint 58s, compile-linux 1m15s,
+  test-macos-release 4m10s, **test-macos 1h19m7s** — vs 2h13m16s on run
+  30191249436 (pre-carve-out) and the ~1h8m pre-MoE baseline (run
+  30179643994: 1h7m44s). Decomposition of the recovery: the blocking
+  model-gated step fell 69m14s -> 19m24s, of which spec_decode itself
+  fell 3744.79s -> 726.86s (62.4 -> 12.1 min; the self-draft double-load
+  swap crawl is gone). Verified from the run log by binary + arithmetic:
+  `Running tests/spec_decode.rs` 06:17:26 + 726.86s = the 06:29:33 pass.
+  The remaining ~11m over the pre-MoE baseline is legitimate new olmoe
+  coverage (single-load adversarial arm + plain-path invariance in
+  spec_decode, olmoe in the enumerating suites) — exactly what the
+  carve-out was scoped to keep. Merge commit 236edd2 (merge commit, not
+  squash — PROGRESS commit references stay valid on main).
+- Also observed, for the ADR 0004 record: the advisory golden lane
+  failed on gemma-3-1b-it-4bit/chat-basic (gather path) again — the
+  SAME known divergence as runs 30191249436 and the 2026-07-24 entry
+  (divergent runner class; this run's runner drew that class too). No
+  pattern change; the lane stayed green by design (continue-on-error).
+  Standing consequence worth knowing: the advisory suite aborts at its
+  first divergence, and gemma-3 sorts before olmoe, so divergent-class
+  runners produce NO cross-device advisory datapoint for the olmoe
+  fixtures. Not a correctness gap (ADR 0004 scope: the golden bar binds
+  on the generating device, where olmoe is 184/184 exact) — noted so
+  nobody reads "no olmoe advisory data" as "olmoe advisory-clean".
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 43 -> 4/4 pass (run 30241628948; test-macos 1h19m7s)
+  $ gh pr merge 43 --merge -> merged; origin/main head 236edd2
+  Dev-machine bar unchanged (re-verified pre-push, PROGRESS 2026-07-27
+  entry above): spec_decode with env UNSET runs the full self-draft arm
+  incl. olmoe's double-load, 1 passed, 214.46s.
+  ```
+- Next: nothing scheduled for session 1 — the arc continues with
+  session 2 (quantization variants / second MoE architecture /
+  worker="auto" MoE routing, per the arc plan). Open PM item: ADR 0007
+  ratification (status "recorded", ratification pending).
