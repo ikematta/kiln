@@ -8534,3 +8534,31 @@
   session 2 (quantization variants / second MoE architecture /
   worker="auto" MoE routing, per the arc plan). Open PM item: ADR 0007
   ratification (status "recorded", ratification pending).
+
+## [2026-07-27] Maintenance — automated build-cache pruning (out-of-band) — DONE
+- What: target/debug hit 63G; set up weekly automatic pruning so the build
+  cache stops needing manual attention. New `scripts/sweep-build-cache.sh`
+  (cargo sweep --time 14, skips if cargo/rustc running, logs size-capped to
+  ~/.kiln/logs/cargo-sweep.log) + launchd LaunchAgent
+  `com.kiln.build-cache-sweep` (~/Library/LaunchAgents, Mondays 09:30, local
+  machine only — not committed). CLAUDE.md gained a "Build cache pruning"
+  section so future sessions know this exists.
+- Decisions: cargo-sweep over scheduled `cargo clean` — removes only artifacts
+  untouched 14 days, so recent incremental state stays warm and the job is
+  safe to fire-and-forget. launchd over cron per macOS convention. Script
+  committed to the repo (other contributors will hit the same growth); plist
+  stays per-machine with setup steps in the script header.
+- Deviations: none (machine maintenance, no SPEC scope).
+- Acceptance:
+  ```
+  $ launchctl list | grep build-cache-sweep -> "- 0 com.kiln.build-cache-sweep"
+  $ launchctl start com.kiln.build-cache-sweep
+  ~/.kiln/logs/cargo-sweep.log:
+    ==== 2026-07-27 08:25:02 -0600 cargo-sweep (14d) ====
+    [INFO] Cleaned 18.10 GiB from "/Users/isaacmatta/KILN/target"
+    target/: 69378 MB -> 57149 MB (freed 12228 MB)
+  du -sh target: 68G before -> 56G after (debug 63G -> 54G)
+  ```
+- Next: unchanged — MoE arc session 2 (quantization variants / second MoE
+  architecture / worker="auto" MoE routing); open PM item: ADR 0007
+  ratification.

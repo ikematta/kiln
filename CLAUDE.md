@@ -90,6 +90,17 @@ cargo run -p kiln-gateway -- --config kiln.toml
 cargo run -p kiln-worker -- --model ~/.kiln/test-models/llama-3.2-1b-4bit --socket /tmp/kiln-test.sock
 ```
 
+## Build cache pruning (local dev machines)
+
+`target/` growth is handled automatically on set-up machines: a weekly launchd
+LaunchAgent (`com.kiln.build-cache-sweep`, Mondays 09:30) runs
+`scripts/sweep-build-cache.sh`, which uses `cargo sweep --time 14` to delete
+only artifacts untouched for 14 days — never a full `cargo clean` — and skips
+itself entirely if a cargo/rustc process is running. Log (size-capped):
+`~/.kiln/logs/cargo-sweep.log`. New machine: `cargo install cargo-sweep`, then
+follow the plist setup in the script's header comment. No manual cache
+management needed; don't add `cargo clean` steps to fix disk pressure.
+
 ## mlx-c pin
 
 Vendored at `crates/kiln-mlx/vendor/mlx-c` (git submodule). The pinned commit is
