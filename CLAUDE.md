@@ -134,6 +134,12 @@ revisions (revisions live in the script — treat as frozen):
 - one BF16 tiny model (see script) for the unquantized path
 - `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` (MoE proxy, ~3.9 GB — proves
   routing/gating on M4-class hardware ONLY; see ADR 0007 for the M3 Ultra gap)
+- `mlx-community/OLMoE-1B-7B-0125-Instruct-8bit` (8-bit cell of the MoE
+  quantization matrix, ~7.4 GB, 2 shards — same base model as the 4-bit
+  proxy, so the pair isolates `gather_qmm` at `bits = 8`. Dev-machine only:
+  hosted CI runners (~7 GB RAM) cannot load it at all, and how it reaches CI
+  is an open PM decision — see the DECISION NEEDED block in PROGRESS.md
+  [2026-07-27].)
 
 Tests reference them via the `KILN_TEST_MODELS` env var; never hardcode home paths.
 

@@ -223,10 +223,33 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
         .calibrate_deterministic_width(&stream)
         .expect("calibrates");
     eprintln!(
-        "== {model_name}: model_type={}, {} fixture(s), deterministic width {det_width}",
+        "== {model_name}: model_type={}, {} fixture(s), deterministic width {det_width}, \
+         monolithic prefill {}, ADR 0005 envelope {:?}",
         model.model_type(),
-        fixture_paths.len()
+        fixture_paths.len(),
+        model.monolithic_prefill_required(),
+        model.speculative_gamma_bound(),
     );
+    // ADR 0007 decision (4): the MoE engine posture is keyed on the
+    // ARCHITECTURE, so every MoE checkpoint inherits it whatever its
+    // quantization — reference-shaped prefill (the pad rule's empirical
+    // base excludes expert routing) and no speculation (the
+    // gather_qmm/SwitchGLU family has no kernel-class certificate).
+    // Asserted per fixture model rather than assumed from the enum
+    // dispatch, so a quantization variant that somehow slipped the
+    // posture would fail here instead of silently fine-chunking a MoE
+    // prefill or attaching a drafter to an uncertified trunk.
+    if model.model_type() == "olmoe" {
+        assert!(
+            model.monolithic_prefill_required(),
+            "{model_name}: MoE trunks take reference-shaped prefill (model.rs)"
+        );
+        assert_eq!(
+            model.speculative_gamma_bound(),
+            None,
+            "{model_name}: MoE targets are outside the ADR 0005 envelope"
+        );
+    }
     let fixtures: Vec<(String, Fixture, Vec<u32>)> = fixture_paths
         .iter()
         .map(|path| {
