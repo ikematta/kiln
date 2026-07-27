@@ -98,3 +98,16 @@ target class.
   run decision (3)'s pass and record it; (b) any mlx-c/core-MLX bump
   (ADR 0001's standing quarterly process) — the M4-side measurements
   this ADR scopes go stale with the pin like every other ADR's.
+
+## Addendum (2026-07-26, PM-directed): CI self-draft carve-out
+
+CI additionally skips spec_decode's SELF-DRAFT arm (only) for models
+whose doubled weight bytes exceed 3.5 GiB
+(`KILN_SPEC_SELFDRAFT_DOUBLE_LOAD_LIMIT` in ci.yml — threshold reasoning
+in spec_decode.rs), because the hosted ~7 GB runner survived olmoe's
+7.3 GB double-load only via a 62-minute swap crawl (run 30191249436).
+This is a runner-capacity accommodation, NOT a coverage claim: the
+adversarial arm and plain-path invariance still run for every model on
+CI, and the dev machine — where the var is never set — remains the
+full, unskipped self-draft bar. Do not read CI's skip as "self-draft is
+untested".

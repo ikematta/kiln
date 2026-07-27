@@ -8453,3 +8453,44 @@
   ~4.3 GB peak), or (B) accept an olmoe-less spec_decode enumeration on
   CI (KILN-side env gate), keeping full coverage dev-machine-only.
   Neither weakens a dev-machine bar; PM ruling wanted before either.
+
+## [2026-07-27] MoE arc / Session 1 follow-up — CI self-draft carve-out (Option A, PM-directed) — DONE
+- What:
+  - spec_decode's SELF-DRAFT arm is skipped, on CI only, for models whose
+    doubled weight bytes exceed `KILN_SPEC_SELFDRAFT_DOUBLE_LOAD_LIMIT`
+    (set to 3758096384 = 3.5 GiB in ci.yml's model-gated step; nowhere
+    else). Threshold reasoning documented at
+    spec_decode.rs::selfdraft_double_load_limit: the ~7 GB hosted runner
+    keeps weights-resident load ≤ half of RAM; both sides measured —
+    gemma-2-2b's 3.2 GB double-load (largest pre-MoE case) fits cleanly
+    and stays under the line, olmoe's 7.3 GB double-load produced the
+    62-minute swap crawl (run 30191249436). Malformed limit values panic
+    loudly rather than silently disabling the carve-out.
+  - Unchanged and unskipped everywhere, including CI and including
+    olmoe: the adversarial-drafter arm and the plain-path invariance
+    comparison (for envelope-None models the adversarial arm still
+    asserts zero speculation with a real drafter attached).
+  - Dev machines never set the var: the full self-draft bar is
+    unchanged there. ADR 0007 addendum (PM-directed) records the
+    carve-out so a future session cannot mistake CI's skip for
+    "self-draft is untested".
+- Decisions: env var carries the byte threshold itself (self-documenting
+  at the CI call site, tunable without code changes) rather than a
+  boolean CI flag.
+- Deviations: none — the arm-skip is exactly the PM's Option A scope.
+- Acceptance:
+  ```
+  MODE 1, dev machine (env unset): spec_decode 1 passed, 214.46s —
+    olmoe self-draft arm RAN (double-load) and verified plain-path.
+  MODE 2, CI simulation (LIMIT=3758096384 + KILN_FIXTURE_PARITY=skip):
+    spec_decode 1 passed, 196.34s — exactly ONE skip line:
+    "olmoe-1b-7b-0125-4bit self-draft: SKIPPED — double-load 7786746458
+    bytes (2 x 3893373229) exceeds ... 3758096384"; olmoe adversarial arm
+    + plain-path invariance ran; every other model's self-draft ran
+    (gemma-2-2b double-load 3.2 GB stays under the limit by design).
+  cargo fmt --check clean; cargo clippy -p kiln-models --tests -D warnings clean.
+  ```
+- Next: push re-rolls CI — confirm test-macos returns near the ~1h8m
+  pre-MoE baseline (vs 2h13m in run 30191249436) with all four jobs
+  green and olmoe still exercised in every non-self-draft spec_decode
+  case; record the measured run time here once observed.

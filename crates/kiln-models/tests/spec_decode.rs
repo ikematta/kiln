@@ -96,6 +96,51 @@ fn model_root() -> Option<PathBuf> {
     std::env::var_os("KILN_TEST_MODELS").map(PathBuf::from)
 }
 
+/// CI runner-capacity carve-out for the SELF-DRAFT arm only (PM-directed,
+/// PROGRESS 2026-07-26; ADR 0007 addendum): when this env var is set, the
+/// self-draft arm — which loads the model TWICE (target + drafter copy) —
+/// is skipped for any model whose doubled weight bytes exceed the limit.
+///
+/// Threshold reasoning (the value lives in .github/workflows/ci.yml, set
+/// to 3758096384 = 3.5 GiB): hosted macos-14 runners have ~7 GB RAM, so
+/// the limit keeps the weights-RESIDENT portion of a self-draft round at
+/// or under half the machine, leaving the other half for the two engines'
+/// KV pools, activations, the test harness, and the OS. Both sides of the
+/// line are measured, not guessed: gemma-2-2b (2 x 1.6 GB = 3.2 GB, the
+/// largest double-load CI ran before MoE) fits cleanly and stays UNDER
+/// the limit — existing coverage is unchanged — while olmoe
+/// (2 x 3.6 GB = 7.3 GB, > 100% of RAM before pools) produced a 62-minute
+/// swap crawl in run 30191249436. The threshold separates the
+/// proven-clean region from the measured-pathological one.
+///
+/// Scope guarantees: the adversarial arm and the plain-path invariance
+/// comparison run UNSKIPPED for every model (for envelope-None models the
+/// adversarial arm still asserts zero speculation with a real drafter
+/// attached); a dev machine never sets the var, so the self-draft arm
+/// stays the full bar there — CI's skip is a runner-capacity
+/// accommodation, never a claim that self-draft is untested.
+fn selfdraft_double_load_limit() -> Option<u64> {
+    let raw = std::env::var("KILN_SPEC_SELFDRAFT_DOUBLE_LOAD_LIMIT").ok()?;
+    // A malformed value must fail loudly, not silently disable the
+    // carve-out and resurface the swap crawl on CI.
+    Some(raw.parse().unwrap_or_else(|_| {
+        panic!("KILN_SPEC_SELFDRAFT_DOUBLE_LOAD_LIMIT is not a byte count: {raw:?}")
+    }))
+}
+
+/// Total bytes of a model directory's safetensors payload — the resident
+/// weight footprint one engine copy pins.
+fn model_weight_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
 /// A drafter that proposes syntactically valid but (for any real prompt)
 /// wrong token ids — the total-rejection adversary. Every verify round
 /// commits exactly the target's own token and rolls the rest back.
@@ -399,6 +444,22 @@ fn run_model_with_speculation(
                 as Box<dyn Fn() -> Box<dyn Drafter>>,
         ),
     ] {
+        if drafter_kind == "self-draft"
+            && let Some(limit) = selfdraft_double_load_limit()
+        {
+            let weights = model_weight_bytes(model_dir);
+            let double = weights.saturating_mul(2);
+            if double > limit {
+                eprintln!(
+                    "{model_name} self-draft: SKIPPED — double-load {double} bytes \
+                     (2 x {weights}) exceeds KILN_SPEC_SELFDRAFT_DOUBLE_LOAD_LIMIT \
+                     {limit} (CI runner-capacity carve-out, PROGRESS 2026-07-26 / \
+                     ADR 0007 addendum; the adversarial arm below still runs, and \
+                     the dev-machine run is the full self-draft bar)"
+                );
+                continue;
+            }
+        }
         let mut config = engine_config(&model, det_width);
         if drafter_kind == "adversarial" {
             // The adversarial arm exists to hammer the correction +
