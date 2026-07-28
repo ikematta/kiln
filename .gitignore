@@ -10,3 +10,7 @@ __pycache__/
 
 # bench.sh output (CLAUDE.md: results are per-machine measurements, not sources)
 bench/results/
+
+# Gateway logs preserved by a failing soak (test_soak.py preserve_gateway_log);
+# CI uploads them as an artifact, they are never sources.
+soak-logs/

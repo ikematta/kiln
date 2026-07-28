@@ -108,15 +108,35 @@ Correctness gates, held THROUGHOUT:
     else is a hard failure. Grammar outputs 100% schema-valid.
   - Interactive requests complete < 90 s even mid-flood (priority
     admission), every gemma burst recovers to a 200 within its 180 s window.
+
+Failure path — gateway-log forensics. Every gate above reads /metrics,
+which reports THAT something happened, never why: `crash-restarts
+observed: N` is a counter, and the discriminating evidence (the
+supervisor's recycle-cause line) lives in the gateway log inside the
+stack's runtime dir, which running_stack deletes at teardown. Run
+30377498688 (PR #45) hit exactly that wall — one py-smollm restart, zero
+on the four rust models, no crashed/unhealthy state ever sampled by the
+10 s poller, no hard errors, cause undeterminable. So any escape from the
+run — a violated gate, but equally a warmup that never got admitted or an
+uncaught harness error — now prints a biased tail of that log (recycle
+causes first, with each worker's own stdout/stderr around them, then the
+load/unload timeline, then a raw tail) and copies the whole file to
+soak-logs/ for CI to upload. The restart gate additionally carries its
+per-model cause line INSIDE the assertion message, since that is what a
+CI reader sees first. See the forensics section below for what the
+worker-output forwarding can and cannot show.
 """
 
 from __future__ import annotations
 
+import calendar
 import contextlib
 import json
 import os
+import pathlib
 import random
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -125,7 +145,7 @@ from dataclasses import dataclass, field
 
 import httpx
 import pytest
-from conftest import API_KEY, pinned_model_dir, running_stack
+from conftest import API_KEY, REPO, pinned_model_dir, running_stack, tail
 
 SOAK_MINUTES = float(os.environ.get("KILN_SOAK_MINUTES", "0") or "0")
 
@@ -322,6 +342,339 @@ def slope_kb_per_min(points: list[tuple[float, float]]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Gateway-log forensics (failure path only)
+# ---------------------------------------------------------------------------
+# Read-only over the gateway's own JSON-lines log (main.rs init_tracing:
+# fmt().json(), so `fields.message` holds the literal format string). This
+# changes no supervisor behavior and no gate threshold — it only makes a
+# fired gate diagnosable from a CI log.
+
+# The lines the supervisor emits immediately before returning
+# RunExit::Crashed — i.e. the reason `kiln_worker_restarts_total` moved.
+# Matched as prefixes and kept verbatim from
+# crates/kiln-gateway/src/supervisor.rs; each carries its own discriminating
+# fields, which fmt_log_line prints alongside.
+RECYCLE_CAUSES = (
+    # `status` is the reaped ExitStatus — the process died on its own, and
+    # this field says how. For a RUST worker it is the worker's own status,
+    # so an OS kill reads as a signal. For the PYTHON worker the direct
+    # child is the `uv run` wrapper (config.rs defaults::python_worker_argv)
+    # and the status is the WRAPPER's: SIGKILLing the python process was
+    # measured (local, 2026-07-28) as
+    # `Some(ExitStatus(unix_wait_status(35072)))` — 35072 = 137 << 8, i.e.
+    # uv exiting 137 (128 + SIGKILL) rather than a raw signal status. Read
+    # 128+n as "the python process took signal n"; the python process's own
+    # account, if it had time to give one, is in the stderr lines below.
+    "worker process exited",
+    # HEALTH_MISSED_DEADLINE (3 s) with HEALTH_RPC_TIMEOUT (2 s): the
+    # `silent_ms` field says how long Health had been failing.
+    "worker missed health deadline; recycling",
+    "worker self-reported UNHEALTHY; recycling",  # `detail` is the worker's
+    "worker reported UNHEALTHY during load (model load failed?); recycling",
+    "worker never reached READY; recycling",
+    "worker exited while loading",
+    "failed to spawn worker process",
+)
+# Everything else needed to read a recycle in context: what the supervisor
+# did next, and the DELIBERATE load/unload traffic (TTL expiry, eviction,
+# the gemma bursts) that a restart has to be told apart from.
+LIFECYCLE_MESSAGES = RECYCLE_CAUSES + (
+    "worker crashed; restarting after backoff",
+    "worker exceeded restart budget; marking failed (manual reset required)",
+    "worker spawned",
+    "worker ready",
+    "unloading worker",
+    "idle past ttl_seconds; auto-unloading",
+    "worker survived SIGTERM grace; sending SIGKILL",
+    "worker unloaded; memory released",
+)
+# Worker stdout/stderr, re-logged by supervisor.rs forward_output under
+# target `kiln::worker` with a `source` field. Completeness, measured
+# against a real SIGKILLed python worker (local, 2026-07-28): the python
+# worker routes every log record AND any traceback to stderr (__main__.py
+# basicConfig(stream=sys.stderr), line-buffered), so a python-side death is
+# visible line by line — but a SIGKILL leaves NO worker line at all, and
+# the only evidence is the `status` field plus that silence. Hence the
+# explicit "no worker output" note below: silence is itself the finding.
+#
+# The window is asymmetric on purpose. Backwards it must reach past the
+# dying worker's last words; forwards it must NOT reach into the next
+# generation — the restart backoff is 500 ms, and a symmetric window was
+# measured attributing the RESTARTED worker's first stderr (its Stats
+# UNIMPLEMENTED traceback) to the death that preceded it. The forward side
+# is therefore also cut at the next `worker spawned` for that model, which
+# is the exact generation boundary. forward_output drains each pipe on its
+# own tokio task, so a genuinely last line can still land just after the
+# supervisor's exit line — that is what the (short) forward side is for.
+WORKER_OUTPUT_BEFORE_S = 20.0
+WORKER_OUTPUT_AFTER_S = 5.0
+WORKER_OUTPUT_MAX = 10
+LIFECYCLE_TAIL = 80
+ERROR_TAIL = 30
+RAW_TAIL = 30
+MESSAGE_CLIP = 300
+
+
+@dataclass
+class LogLine:
+    lineno: int
+    when: float | None  # epoch seconds; None if the timestamp was unparseable
+    level: str
+    target: str
+    message: str
+    fields: dict
+
+
+_LOG_TS = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?")
+
+
+def _log_epoch(value: object) -> float | None:
+    """Epoch seconds from a tracing-subscriber JSON timestamp (UTC RFC3339;
+    observed at microsecond precision, documented as nanosecond — either way
+    more digits than datetime.fromisoformat accepts, so the fraction is
+    taken as a float and any width works)."""
+    match = _LOG_TS.match(str(value or ""))
+    if not match:
+        return None
+    parts = [int(p) for p in match.groups()[:6]]
+    return calendar.timegm((*parts, 0, 1, -1)) + float(match.group(7) or 0.0)
+
+
+def read_gateway_log(path: pathlib.Path) -> list[LogLine]:
+    """Parses the gateway's JSON-lines log. Never raises: a missing,
+    truncated, or garbled log must degrade this report, never replace a real
+    gate failure with a harness error."""
+    records: list[LogLine] = []
+    try:
+        raw = path.read_text(errors="replace")
+    except OSError:
+        return records
+    for lineno, line in enumerate(raw.splitlines(), start=1):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # non-JSON (a pre-init panic, a torn last line)
+        if not isinstance(entry, dict):
+            continue
+        raw_fields = entry.get("fields")
+        fields = dict(raw_fields) if isinstance(raw_fields, dict) else {}
+        records.append(
+            LogLine(
+                lineno=lineno,
+                when=_log_epoch(entry.get("timestamp")),
+                level=str(entry.get("level", "")),
+                target=str(entry.get("target", "")),
+                message=str(fields.pop("message", "")),
+                fields=fields,
+            )
+        )
+    return records
+
+
+def matches(message: str, prefixes: tuple[str, ...]) -> bool:
+    return any(message.startswith(prefix) for prefix in prefixes)
+
+
+def fmt_log_line(rec: LogLine, origin: float | None) -> str:
+    """One log line as `t+SSSs LEVEL model/source  message [fields]`, with
+    times rebased onto the soak's own t+ clock so the log lines up with the
+    status lines and checkpoints printed above it."""
+    if rec.when is not None and origin:
+        stamp = f"t{rec.when - origin:+8.1f}s"
+    else:
+        stamp = f"line{rec.lineno:>6}"
+    source = rec.fields.get("source")
+    who = str(rec.fields.get("model", "-"))
+    if source:
+        who = f"{who}/{source}"
+    extras = " ".join(
+        f"{k}={v}" for k, v in rec.fields.items() if k not in ("model", "source")
+    )
+    text = f"  {stamp} {rec.level:<5} {who:>22}  {rec.message[:MESSAGE_CLIP]}"
+    return f"{text}  [{extras}]" if extras else text
+
+
+def worker_output_near(
+    records: list[LogLine], model: str, when: float | None, origin: float | None
+) -> list[str]:
+    """The dying worker's own forwarded stdout/stderr around a recycle event
+    — a python traceback, an mlx error, or (tellingly) nothing at all for a
+    SIGKILL. Bounded by the next `worker spawned` for this model so the
+    replacement's output is never attributed to its predecessor's death."""
+    if when is None:
+        return []
+    mine = [
+        rec
+        for rec in records
+        if rec.when is not None and str(rec.fields.get("model", "")) == model
+    ]
+    next_spawn = min(
+        (
+            rec.when
+            for rec in mine
+            if rec.when > when and rec.message.startswith("worker spawned")
+        ),
+        default=None,
+    )
+    forward_end = when + WORKER_OUTPUT_AFTER_S
+    if next_spawn is not None:
+        forward_end = min(forward_end, next_spawn)
+    output = [rec for rec in mine if rec.target == "kiln::worker"]
+    # Closest-first truncation on each side: the lines adjacent to the death
+    # are the evidence; older ones are startup noise.
+    before = [
+        rec for rec in output if when - WORKER_OUTPUT_BEFORE_S <= rec.when <= when
+    ]
+    after = [rec for rec in output if when < rec.when <= forward_end]
+    lines: list[str] = []
+    if len(before) > WORKER_OUTPUT_MAX:
+        lines.append(f"    ... {len(before) - WORKER_OUTPUT_MAX} earlier lines ...")
+        before = before[-WORKER_OUTPUT_MAX:]
+    lines += [fmt_log_line(rec, origin) for rec in before]
+    lines += [fmt_log_line(rec, origin) for rec in after[:WORKER_OUTPUT_MAX]]
+    if not lines:
+        return [
+            f"    (no worker output in -{WORKER_OUTPUT_BEFORE_S:.0f}s..+"
+            f"{WORKER_OUTPUT_AFTER_S:.0f}s — a silent death: SIGKILL, or a "
+            "stall with nothing left to say)"
+        ]
+    return [
+        f"    worker output (-{WORKER_OUTPUT_BEFORE_S:.0f}s..+"
+        f"{WORKER_OUTPUT_AFTER_S:.0f}s, cut at the next spawn):",
+        *lines,
+    ]
+
+
+def restart_attribution(
+    records: list[LogLine], origin: float | None
+) -> dict[str, list[str]]:
+    """model -> the supervisor cause line for each recycle, each followed by
+    that worker's output around it. Keyed by model so a restart counter can
+    be attributed to the process that actually died."""
+    causes: dict[str, list[str]] = {}
+    try:
+        for rec in records:
+            if not matches(rec.message, RECYCLE_CAUSES):
+                continue
+            model = str(rec.fields.get("model", "?"))
+            block = causes.setdefault(model, [])
+            block.append(fmt_log_line(rec, origin))
+            block.extend(worker_output_near(records, model, rec.when, origin))
+    except Exception as exc:  # noqa: BLE001 - forensics must never mask a gate
+        return {"?": [f"  attribution failed: {type(exc).__name__}: {exc}"]}
+    return causes
+
+
+def gateway_log_report(
+    records: list[LogLine], origin: float | None, log_path: pathlib.Path
+) -> str:
+    try:
+        return _gateway_log_report(records, origin, log_path)
+    except Exception as exc:  # noqa: BLE001 - forensics must never mask a gate
+        return (
+            f"\n-- gateway log forensics failed ({type(exc).__name__}: {exc}); "
+            f"raw tail of {log_path} --\n" + tail(log_path, RAW_TAIL)
+        )
+
+
+def _gateway_log_report(
+    records: list[LogLine], origin: float | None, log_path: pathlib.Path
+) -> str:
+    if not records:
+        return (
+            f"\n-- gateway log ({log_path}) --\n"
+            f"no parseable JSON lines; raw tail:\n{tail(log_path, RAW_TAIL)}"
+        )
+    out = [f"\n-- gateway log forensics ({log_path}, {len(records)} lines parsed) --"]
+
+    causes = restart_attribution(records, origin)
+    out.append("recycle causes (the supervisor line that precedes each restart):")
+    if causes:
+        for model, lines in sorted(causes.items()):
+            out.append(f"  [{model}]")
+            out.extend(lines)
+    else:
+        out.append(
+            "  none — no worker was recycled by the supervisor during this run "
+            "(so a restart-counter gate, if it fired, moved before the log "
+            "opened; any other gate failed for reasons the timeline below "
+            "may show)"
+        )
+
+    lifecycle = [rec for rec in records if matches(rec.message, LIFECYCLE_MESSAGES)]
+    shown = lifecycle[-LIFECYCLE_TAIL:]
+    out.append(f"load/unload/recycle timeline (last {len(shown)} of {len(lifecycle)}):")
+    out.extend(fmt_log_line(rec, origin) for rec in shown)
+
+    problems = [
+        rec
+        for rec in records
+        if rec.level in ("WARN", "ERROR")
+        and not matches(rec.message, LIFECYCLE_MESSAGES)
+    ]
+    if problems:
+        shown = problems[-ERROR_TAIL:]
+        out.append(f"other WARN/ERROR lines (last {len(shown)} of {len(problems)}):")
+        out.extend(fmt_log_line(rec, origin) for rec in shown)
+
+    out.append(f"raw tail (last {RAW_TAIL} lines, unfiltered):")
+    out.append(tail(log_path, RAW_TAIL))
+    return "\n".join(out)
+
+
+@dataclass
+class Forensics:
+    """Handle for the failure dump: `origin` is filled in once the run's t+
+    clock exists, so log timestamps can be rebased onto it."""
+
+    origin: float | None = None
+
+
+@contextlib.contextmanager
+def gateway_log_on_failure(stack):
+    """Dumps and preserves the gateway log on ANY escape from the soak body,
+    then re-raises. Nested inside running_stack, which deletes the runtime
+    dir — and the log with it — on the way out, so this is the last moment
+    the evidence exists. Covers the gate assertion (`crash-restarts
+    observed: N` and friends) and equally the paths that never reach the
+    gates: a 240 s warmup that never got admitted, an uncaught harness
+    error."""
+    handle = Forensics()
+    try:
+        yield handle
+    except BaseException:
+        print(
+            gateway_log_report(
+                read_gateway_log(stack.log_path), handle.origin, stack.log_path
+            ),
+            flush=True,
+        )
+        saved = preserve_gateway_log(stack.log_path)
+        if saved is not None:
+            print(f"\nfull gateway log preserved at {saved}", flush=True)
+        raise
+
+
+def preserve_gateway_log(log_path: pathlib.Path) -> pathlib.Path | None:
+    """Copies the gateway log out of the runtime dir, which running_stack
+    deletes at teardown, so CI can upload the whole thing as an artifact
+    when the printed tail is not enough. Destination: KILN_SOAK_LOG_DIR, or
+    soak-logs/ in the checkout (gitignored, uploaded by ci.yml)."""
+    try:
+        dest_dir = pathlib.Path(
+            os.environ.get("KILN_SOAK_LOG_DIR") or (REPO / "soak-logs")
+        )
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        dest = dest_dir / f"gateway-{stamp}.log"
+        shutil.copyfile(log_path, dest)
+        return dest
+    except OSError as exc:
+        print(f"could not preserve gateway log: {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Load-generator framework
 # ---------------------------------------------------------------------------
 
@@ -341,6 +694,10 @@ class Ctx:
     severed: list[tuple[str, float, str]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     started: float = 0.0
+    # Epoch counterpart of `started`, set at the same instant: the gateway
+    # logs UTC timestamps, and the forensics report rebases them onto this
+    # t+ clock so the log lines up with the status lines and checkpoints.
+    wall_started: float = 0.0
 
     def elapsed(self) -> float:
         return time.monotonic() - self.started
@@ -958,7 +1315,10 @@ def test_full_stack_soak():
     ]
     extra = f"[memory]\nbudget_bytes = {BUDGET_BYTES}\nmin_available_bytes = 0\n"
 
-    with running_stack(models, extra_toml=extra) as stack:
+    with (
+        running_stack(models, extra_toml=extra) as stack,
+        gateway_log_on_failure(stack) as forensics,
+    ):
         stack.wait_ready()
         gateway_pid = stack.gateway.pid
         ctx = Ctx(
@@ -969,6 +1329,8 @@ def test_full_stack_soak():
         )
         ctx.gate.set()
         ctx.started = time.monotonic()
+        ctx.wall_started = time.time()
+        forensics.origin = ctx.wall_started
 
         warm = Runner(ctx, "warmup", lambda r: None, (1, 1))
 
@@ -1385,6 +1747,14 @@ def test_full_stack_soak():
         # ------------------------------------------------------------------
         # Gates
         # ------------------------------------------------------------------
+        # Gateway log, read ONCE here and reused by the restart attribution
+        # below and the failure dump before the verdict. It must be read
+        # inside this `with`: running_stack deletes the runtime dir at
+        # teardown, taking the log with it.
+        log_records = read_gateway_log(stack.log_path)
+        log_origin = ctx.wall_started
+        restart_causes = restart_attribution(log_records, log_origin)
+
         # Severed-stream 502s: each must be the bounded-drain tail of a
         # deliberate unload of that model — the per-model unload counter
         # must move within ±60 s of the error. Uncorrelated ones are hard
@@ -1579,12 +1949,39 @@ def test_full_stack_soak():
                 f"warm pinned {LLAMA} was admission-rejected "
                 f"{llama_rejects:.0f}x (growth should be 0)"
             )
-        total_restarts = sum(
-            msum(final_metrics, "kiln_worker_restarts_total", model=m)
+        restarts_by_model = {
+            m: msum(final_metrics, "kiln_worker_restarts_total", model=m)
             for m in (LLAMA, SPEC, TTL, GEMMA, PYSMOL)
-        )
+        }
+        total_restarts = sum(restarts_by_model.values())
         if total_restarts:
-            failures.append(f"crash-restarts observed: {total_restarts:.0f}")
+            # The counter alone is not root-causable (run 30377498688):
+            # carry the supervisor's own cause line for each model that
+            # restarted, plus that worker's output around it, INTO the
+            # failure message — the assert text is what CI shows.
+            attributed = ", ".join(
+                f"{model}={count:.0f}"
+                for model, count in restarts_by_model.items()
+                if count
+            )
+            detail = []
+            for model, count in restarts_by_model.items():
+                if not count:
+                    continue
+                lines = restart_causes.get(model)
+                if lines:
+                    detail.append(f"  [{model}] cause(s) from the gateway log:")
+                    detail.extend(lines)
+                else:
+                    detail.append(
+                        f"  [{model}] NO supervisor recycle line in the gateway "
+                        "log — the restart predates the log or the cause line "
+                        "was lost; see the forensics dump below"
+                    )
+            failures.append(
+                f"crash-restarts observed: {total_restarts:.0f} ({attributed})\n"
+                + "\n".join(detail)
+            )
         if mval(final_metrics, "kiln_worker_up", model=LLAMA) != 1:
             failures.append(f"{LLAMA} not up at the end")
         for model, state in final_ready.items():
@@ -1692,4 +2089,8 @@ def test_full_stack_soak():
             print(f"FAIL: {len(failures)} gate(s) violated")
         else:
             print("PASS: all gates held")
+        # A violated gate raises here, and gateway_log_on_failure turns that
+        # into the log dump + the preserved copy on the way out. The
+        # per-model restart attribution above is already IN this message,
+        # since the assert text is what a CI reader sees first.
         assert not failures, "\n".join(failures)

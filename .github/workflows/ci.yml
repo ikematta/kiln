@@ -250,3 +250,17 @@ jobs:
         run: |
           export KILN_TEST_MODELS="$HOME/.kiln/test-models"
           ./scripts/soak.sh --minutes 30
+      # A failing soak prints a biased tail of the gateway log (the
+      # supervisor's recycle-cause lines) into the step output and copies the
+      # whole file to soak-logs/. Uploading it makes the rest of the run —
+      # every load, unload and worker stderr line — available when the tail
+      # is not enough; run 30377498688 failed on `crash-restarts observed: 1`
+      # with the log unreachable and the cause undeterminable.
+      - name: Upload soak gateway log (failures only)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-gateway-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: soak-logs/
+          if-no-files-found: ignore
+          retention-days: 14
