@@ -9164,3 +9164,91 @@
   .requests_waiting` (engine queue only) vs `HealthStatus.requests_waiting`
   (engine queue + not-yet-drained submissions) share a name and differ by
   design; say the word and Stats becomes the same sum.
+
+## [2026-07-28] Observability / queue-depth metrics — PR #45 MERGED; soak crash-restart gate fired ONCE (first ever), did not reproduce — DONE
+- What: PM ruled to merge on green CI. PR #45 merged with `--merge` (not
+  squash, same as #43/#44 — the PROGRESS commit references stay valid on
+  main); merge commit 4c5d28f, feature commit f701d69.
+- CI, run 30377498688 (head f701d69): **attempt 1 FAILED**, re-run of the
+  failed job **PASSED**. Final: lint 41s, compile-linux 45s,
+  test-macos-release 5m30s, test-macos 1h17m16s (vs the 1h19m12s baseline;
+  the model cache hit — fetch-test-model.sh untouched here, so none of the
+  8m41s cold-refetch penalty from run 30326248951).
+- **THE FINDING — record it even though it went green.** Attempt 1 failed
+  the blocking 30-min soak on ONE gate: `crash-restarts observed: 1`. Per
+  the PM ruling this is logged at the same standard the ADR 0004 advisory
+  lane gets: **this gate has never fired before** (PROGRESS 2026-07-15,
+  -07-19, -07-22 all record "zero crash-restarts"), and it is currently
+  UNEXPLAINED rather than closed.
+  - The restart was on **py-smollm, the PYTHON worker**; all four rust
+    models reported `restarts=0`. py-smollm had been evicted 24x — normal
+    churn for this soak (cf. the 2026-07-15 entry's "py-smollm 24").
+  - Every other gate held: leak gates, RSS slopes, mlx live-object
+    counter, both determinism canaries (llama + spec text correct),
+    prefix reuse 100811 tokens, spec acceptance 2707/2707 = 1.00,
+    reservation-ledger uncovered growth 0.0 MB, zero hard errors. The
+    `crashed_states` gate never fired either — the 10 s poller never
+    sampled a Crashed/Unhealthy state, i.e. the worker went away between
+    samples rather than reporting itself sick.
+  - **Which recycle path fired is NOT determinable from CI.** The three
+    candidates in supervisor.rs — `child.wait()` ("worker process
+    exited"), the 3 s `HEALTH_MISSED_DEADLINE` ("worker missed health
+    deadline"), and a self-reported UNHEALTHY — are distinguished only by
+    a gateway log line, and the gateway log lives in the stack's runtime
+    dir, is never printed on failure, and is not uploaded. Filed as
+    separate work (do NOT fold into a feature PR): print/upload the
+    gateway log tail when a soak gate fails. Until then this gate is
+    blocking but un-root-causable.
+  - Context that makes an environmental cause plausible but NOT proven:
+    the run was memory-pressured (raw used above budget in 10/159
+    samples, worst t+86s 4.47 GB on a ~7 GB runner), and the python
+    worker is the fattest non-rust process (~470 MB RSS).
+- Why this was judged unrelated to the change (the merge rationale, so a
+  future reader can re-check the reasoning rather than the verdict):
+  - The diff's ONLY contact with the python worker is the regenerated
+    `worker_pb2.py` descriptor. `servicer.py`/`engine.py`/`server.py` are
+    untouched, and the python worker does not implement Stats at all, so
+    the two new fields are never constructed there. A malformed descriptor
+    would fail every start, not 1 of ~25.
+  - The gateway's Stats poll to a python worker (UNIMPLEMENTED once per
+    worker generation, then `stats_supported = false`) is pre-existing and
+    unchanged in count or cost by this diff.
+  - The rust/python asymmetry in the failing run points away from a change
+    that only adds two atomic loads to the RUST worker's Stats handler.
+  - The re-run establishes NON-REPRODUCTION, not innocence: one pass, on a
+    fresh runner, of a gate that had never fired in any prior run. Weight
+    the causal argument above, not the green tick. **If this gate fires
+    again on any PR, treat it as a real signal and do not re-run past it.**
+- Also observed, ADR 0004 record: the advisory golden lane failed on
+  gemma-3-1b-it-4bit/chat-basic in BOTH attempts — the same known
+  cross-device divergence as runs 30191249436 / 30241628948 / 30326248951,
+  same fixture, same first-divergence shape. No pattern change, which is
+  the property that matters here: this change adds no engine or model code,
+  and the lane behaved exactly as it does without it. continue-on-error by
+  design; did not gate.
+- The new queue-depth case ran and passed on the real runner in the
+  model-gated BLOCKING step (`test worker_rpc_semantics ... ok`, 17:58),
+  i.e. the admission-pacing shape it asserts holds on the CI runner's
+  shared paravirtual GPU as well as on a dev M4.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 45 -> 4/4 pass (run 30377498688 after re-run of test-macos)
+     lint 41s | compile-linux 45s | test-macos-release 5m30s | test-macos 1h17m16s
+  $ gh pr merge 45 --merge -> MERGED 2026-07-28T18:55:54Z, merge commit 4c5d28f
+  $ git log --oneline -1 origin/main -> 4c5d28f Merge pull request #45
+
+  attempt 1 (failed):
+    FAILED tests/e2e/test_soak.py::test_full_stack_soak
+    AssertionError: crash-restarts observed: 1
+    py-smollm: unloads={'evicted': 24.0, ...} restarts=1
+    (llama-int / spec-qwen25 / ttl-qwen25 / burst-gemma all restarts=0)
+  re-run (passed):
+    PASS: all gates held
+    py-smollm: unloads={'evicted': 25.0, ...} restarts=0   <- heavier churn
+  ```
+- Next: session 3 of the MoE arc — a second MoE architecture (`qwen2_moe` /
+  `qwen3_moe`), with the three carry-ins from the PR #44 entry (golden.rs's
+  `"olmoe"`-keyed posture assertion; fixture tier choice; dev machines must
+  run the `KILN_GOLDEN_XL=1` golden tier). Separately queued, not part of
+  that session: capture the gateway log on soak-gate failure.
