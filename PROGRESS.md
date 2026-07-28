@@ -9392,3 +9392,67 @@
   fetch-test-model.sh; (c) dev machines must run `KILN_GOLDEN_XL=1 cargo
   test -p kiln-models --test golden` — CI never does, so an unrun XL tier
   rots silently.
+
+## [2026-07-28] Soak diagnosability — PR #46 MERGED; CI timing recorded — DONE
+- What: merged on green per the "merge on green" instruction. Run
+  30393683825 (head f6bc192), all four jobs green on **attempt 1, no
+  re-run**: lint 1m02s, compile-linux 40s, test-macos-release 4m52s,
+  **test-macos 1h17m19s**. Merged with `--merge` (not squash, same as
+  #43/#44/#45 — the PROGRESS commit references stay valid on main); merge
+  commit 3ac299d, over commits 2adcd12 (harness+CI) and 57245c4 (PROGRESS)
+  plus the f6bc192 main-merge described below.
+- Branch was cut before PR #45 landed, so main had moved. The ONLY conflict
+  was PROGRESS.md, and only because both sides appended an entry at the end
+  of the file; both were kept, chronologically (PR #45 merged 18:55Z, this
+  work verified 19:18Z). No code conflict — #45 touched metrics.rs,
+  service.rs, rpc.rs, worker.proto and the regenerated worker_pb2.py, this
+  branch only ci.yml, .gitignore and tests/e2e/.
+- What this run says about the change itself:
+  - **No CI cost on the happy path.** test-macos 1h17m19s against the
+    1h17m16s baseline of run 30377498688 — a 3 s delta, i.e. noise. Expected
+    by construction: the forensics only execute on a failing run, and the
+    eight `test_soak_forensics` cases are stack-free (they ran inside the
+    E2E sweep, which came in at 786.67s / 131 passed + 4 skipped, and all
+    eight are visible as PASSED in the log).
+  - The soak itself passed clean: `PASS: all gates held`, 1858s of a
+    requested 1800s, `restarts=0` on all five models. Worth recording
+    against the un-root-caused firing in run 30377498688: **py-smollm was
+    evicted 27x here** — HEAVIER churn than the 24x of the run that fired —
+    and still did not restart. That is one more non-reproduction, and it
+    still is not innocence; the standing instruction from the PR #45 entry
+    stands unchanged, and is now cheap to honour.
+  - The failure path did NOT execute on CI in this run, because nothing
+    failed. Stated plainly rather than implied: its evidence remains the
+    local reproduction in the entry above (a real 3-min soak with the python
+    worker SIGKILLed at t+65s, the gate firing with the cause attached) plus
+    the eight guard tests that DID run here. The first CI exercise of the
+    dump will be the next genuinely failing soak — which is the point.
+- Also observed, ADR 0004 record: the advisory golden lane failed on
+  `gemma-3-1b-it-4bit/chat-basic` (attention path: gather) — the SAME known
+  cross-device divergence as runs 30191249436 / 30241628948 / 30326248951 /
+  30377498688, same fixture, same first-divergence shape. No pattern change,
+  which is the property that matters: this change adds no engine or model
+  code. continue-on-error by design; did not gate.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 46 -> 4/4 pass (run 30393683825, attempt 1, no re-run)
+     lint 1m2s | compile-linux 40s | test-macos-release 4m52s | test-macos 1h17m19s
+  $ gh pr merge 46 --merge -> MERGED 2026-07-28T23:11:53Z, merge commit 3ac299d
+  $ git log --oneline -1 origin/main -> 3ac299d Merge pull request #46
+
+  from the test-macos log:
+    tests/e2e/test_soak_forensics.py .. 8 PASSED (inside the E2E sweep,
+      131 passed, 4 skipped in 786.67s)
+    duration: 1858s (requested 1800s)
+    py-smollm: unloads={'evicted': 27.0, ...} restarts=0
+    (llama-int / spec-qwen25 / ttl-qwen25 / burst-gemma all restarts=0)
+    -- verdict --
+    PASS: all gates held
+    1 passed in 1895.17s (0:31:35)
+  ```
+- Next: session 3 of the MoE arc — a second MoE architecture (`qwen2_moe` /
+  `qwen3_moe`), with the three carry-ins from the PR #44 entry (golden.rs's
+  `"olmoe"`-keyed posture assertion; fixture tier choice; dev machines must
+  run the `KILN_GOLDEN_XL=1` golden tier). The soak-log capture that was
+  queued alongside it is now closed by this PR.
