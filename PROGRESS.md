@@ -9041,3 +9041,128 @@
   plus an `OPT_IN` entry in fetch-test-model.sh; (c) dev machines must run
   `KILN_GOLDEN_XL=1 cargo test -p kiln-models --test golden` — CI never
   does, so an unrun XL tier rots silently.
+
+## [2026-07-28] Soak diagnosability — gateway-log forensics on the failure path — DONE
+- What (test harness + CI only; no Rust touched, no supervisor semantics or
+  gate threshold changed):
+  - `tests/e2e/test_soak.py`: new "Gateway-log forensics" section. Parses
+    the gateway's JSON-lines log (main.rs `init_tracing` = `fmt().json()`)
+    and, on ANY escape from the soak body, prints a tail biased to the
+    supervisor's own lines: the recycle causes FIRST (each with the dying
+    worker's forwarded stdout/stderr around it), then the
+    load/unload/recycle timeline, then non-lifecycle WARN/ERROR, then a raw
+    unfiltered tail. Log timestamps are rebased onto the run's `t+` clock so
+    they line up with the `[soak t+...]` status lines and the checkpoint
+    table.
+  - Per-model restart attribution folded INTO the assertion text of the
+    `crash-restarts observed: N` gate, because the assert message is what a
+    CI reader sees first. It now reads e.g. `crash-restarts observed: 1
+    (py-smollm=1)` followed by that model's cause line and fields.
+  - `gateway_log_on_failure`, a context manager nested INSIDE
+    `running_stack`: the runtime dir (and the log) is deleted at
+    `running_stack` teardown, so this is the last moment the evidence
+    exists. Nesting it there also covers the paths that never reach the
+    gates — a warmup that never got admitted (run 29398308457's shape), an
+    uncaught harness error.
+  - Full log copied to `soak-logs/` (gitignored; `KILN_SOAK_LOG_DIR`
+    overrides) and uploaded by a new `if: failure()` artifact step in
+    ci.yml, for when the printed tail is not enough. 3-min run = 107 KB.
+  - `tests/e2e/test_soak_forensics.py`: NEW, stack-free, runs in the normal
+    e2e sweep (the soak itself only runs under KILN_SOAK_MINUTES, so
+    nothing would otherwise notice the forensics rotting). Pins the cause
+    literals to supervisor.rs, asserts every `return RunExit::Crashed` has
+    a recognised log line above it, and covers the parser, the window and
+    the missing/garbled-log degradation.
+- Decisions:
+  - Cause strings are matched as PREFIXES copied verbatim from
+    supervisor.rs rather than by target/level: level alone does not separate
+    a recycle from a load rejection, and the fields that discriminate
+    (`status`, `silent_ms`, `detail`, `attempt`) hang off those specific
+    lines. The coupling is real, so `test_soak_forensics` guards it — a
+    reword in supervisor.rs would otherwise turn a real crash into "no
+    cause line", which is indistinguishable from a genuinely missing one.
+  - The worker-output window is ASYMMETRIC (-20 s..+5 s) and additionally
+    cut at the next `worker spawned` for that model. First cut was
+    symmetric ±20 s and a live SIGKILL test showed it attributing the
+    RESTARTED worker's first stderr (its Stats UNIMPLEMENTED traceback,
+    500 ms later per `backoff(1)`) to the death that preceded it. The
+    forward side is kept only because `forward_output` drains each pipe on
+    its own tokio task, so a genuinely last line can land just after the
+    supervisor's exit line.
+  - Dump on any escape, not just a gate: one code path instead of two, and
+    a warmup failure is exactly as opaque as a restart counter.
+- On the question asked — is forwarded worker output enough to identify a
+  python-worker death? Measured, not assumed (local, 2026-07-28, real
+  stack + real SIGKILL):
+  - YES for anything the python side can narrate. `__main__.py` sends every
+    log record and any traceback to `sys.stderr` (line-buffered), so
+    `forward_output` lands them in the gateway log line by line; a killed
+    worker's grpc traceback was captured in full.
+  - NO for a hard kill, and that is not fixable from the harness: a SIGKILL
+    leaves NO worker line at all. The forensics therefore print an explicit
+    "no worker output ... a silent death" note — silence IS the finding,
+    and an empty gap would have read as a bug in the report.
+  - The residual sharp edge, now documented in the code: for the PYTHON
+    worker the supervisor's direct child is the `uv run` WRAPPER (config.rs
+    `defaults::python_worker_argv`), so `status` on "worker process exited"
+    is the wrapper's. SIGKILLing the python process was measured as
+    `Some(ExitStatus(unix_wait_status(35072)))` — 35072 = 137 << 8, i.e. uv
+    exiting 128+SIGKILL, not a raw signal status. Read 128+n as "the python
+    process took signal n". Left as-is: changing the argv is a supervisor
+    change and out of this task's scope.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ ruff check python/ tests/e2e scripts && ruff format --check python/ tests/e2e scripts
+  All checks passed!    41 files already formatted
+
+  $ uv run --project tests/e2e pytest tests/e2e/test_soak_forensics.py -q
+  8 passed in 0.02s
+  $ uv run --project tests/e2e pytest tests/e2e --collect-only -q
+  133 tests collected in 0.97s
+
+  # Happy path unchanged (2-min soak, nothing killed):
+  $ ./scripts/soak.sh --minutes 2
+  -- verdict --
+  PASS: all gates held
+
+  # The run-30377498688 scenario reproduced: 3-min soak, python worker
+  # SIGKILLed at t+65s. Before this change the whole diagnosis was the
+  # counter; the assert text now carries the cause:
+  $ ./scripts/soak.sh --minutes 3     # + kill -9 of the py worker mid-run
+  E   AssertionError: crash-restarts observed: 1 (py-smollm=1)
+  E     [py-smollm] cause(s) from the gateway log:
+  E     t   +67.8s ERROR   py-smollm  worker process exited
+  E       [status=Some(ExitStatus(unix_wait_status(35072)))]
+  E       (no worker output in -20s..+5s — a silent death: SIGKILL, or a
+  E        stall with nothing left to say)
+
+  -- gateway log forensics (/tmp/kiln-e2e-0ae86ror/gateway.log, 431 lines parsed) --
+  recycle causes (the supervisor line that precedes each restart):
+    [py-smollm]
+    t   +67.8s ERROR    py-smollm  worker process exited  [status=...(35072)]
+      (no worker output in -20s..+5s — a silent death: ...)
+  load/unload/recycle timeline (last 48 of 48):
+    ...
+    t   +67.8s ERROR    py-smollm  worker process exited  [status=...(35072)]
+    t   +67.8s WARN     py-smollm  worker crashed; restarting after backoff  [attempt=1 delay_ms=500]
+    t   +68.3s INFO   spec-qwen25  unloading worker  [reason=evicted]
+    t   +69.9s INFO     py-smollm  unloading worker  [reason=evicted]
+    t   +88.3s INFO   burst-gemma  idle past ttl_seconds; auto-unloading  [ttl_s=90 idle_ms=90004]
+  full gateway log preserved at .../soak-logs/gateway-20260728T191813Z.log
+  1 failed in 213.26s (0:03:33)
+  ```
+  The timeline excerpt is the point of the whole change: py-smollm was ALSO
+  deliberately evicted twice within seconds of the crash, and only the
+  supervisor's own lines separate the one recycle from the deliberate
+  unloads around it.
+- Next: session 3 of the MoE arc — a second MoE architecture (`qwen2_moe` /
+  `qwen3_moe`), unchanged from the PR #44 entry. Carry into its task list:
+  (a) golden.rs's MoE posture assertion keys on the literal `"olmoe"`, so a
+  new family must be added there or its monolithic-prefill / envelope-None
+  posture goes unasserted; (b) new-family fixtures belong in
+  `tests/golden/` unless the checkpoint exceeds a ~7 GB hosted runner, in
+  which case `tests/golden-xl/` plus an `OPT_IN` entry in
+  fetch-test-model.sh; (c) dev machines must run `KILN_GOLDEN_XL=1 cargo
+  test -p kiln-models --test golden` — CI never does, so an unrun XL tier
+  rots silently.
