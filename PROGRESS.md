@@ -8987,3 +8987,57 @@
   there or its monolithic-prefill / envelope-None posture goes unasserted;
   and new-family fixtures belong in `tests/golden/` unless the checkpoint is
   too large for a ~7 GB hosted runner, in which case `tests/golden-xl/`.
+
+## [2026-07-28] MoE arc / Session 2 — PR #44 MERGED (PM ruling); CI timing recorded — DONE
+- What: PM ruled to merge on green CI. Run 30326248951 (head a4ed601), all
+  four jobs green: lint 52s, compile-linux 52s, test-macos-release 5m01s,
+  **test-macos 1h25m13s** (run total 1h25m18s). Merge commit 7c004ba
+  (--merge, not squash — the PROGRESS commit references above stay valid on
+  main, same as PR #43).
+  - The PR also carried `0187060 Maintenance: weekly cargo-sweep of target/
+    via launchd [skip ci]`, a pre-existing local commit that had never been
+    pushed and rode along because the branch was cut from local main. Not
+    session-2 work; flagged before merge and accepted as-is.
+- What this run actually verified — the option C mechanism, on CI:
+  - `olmoe-1b-7b-0125-8bit` appears **zero times** in the whole test-macos
+    log, and so does `tests/golden-xl`. CI fetched exactly the 8 default-set
+    models and never touched the 7.35 GB checkpoint it cannot load. The
+    opt-in pin and the XL tree do what they were built to do.
+  - Timing vs the run-30241628948 baseline (1h19m12s): model-gated blocking
+    step 19m24s -> **18m21s** (no regression), golden advisory 6m47s, soak
+    31m22s, E2E 14m19s. The delta to 1h25m is essentially the **8m41s
+    one-time cold refetch** — the model cache key hashes
+    fetch-test-model.sh, which this PR changed. Next run on main hits the
+    cache and should return to the ~1h19m baseline.
+- Also observed, for the ADR 0004 record: the advisory golden lane failed on
+  gemma-3-1b-it-4bit/chat-basic (gather path) — the SAME known cross-device
+  divergence as runs 30191249436 and 30241628948, on a runner that drew the
+  divergent class. No pattern change; continue-on-error by design, did not
+  gate the job. Consequence specific to this change, worth knowing: gemma-3
+  sorts before the XL branch and the advisory suite aborts at its first
+  divergence, so **CI has not yet executed the XL skip line itself** in a
+  run. Harmless — the property that matters (CI never demands the 8-bit
+  model) is confirmed directly by the zero mentions and by every blocking
+  step passing — but the skip path will first be exercised on a run whose
+  advisory lane draws a non-divergent runner. Do not read its absence from
+  this log as the skip being broken.
+  - Same for the session-1 self-draft carve-out line: the blocking step runs
+    without `--nocapture`, so a passing test's stderr is captured and the
+    "SKIPPED" line is not in the log. Its dev-machine verification stands
+    from PROGRESS 2026-07-27; absence here is capture, not behavior.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 44 -> 4/4 pass (run 30326248951; test-macos 1h25m13s)
+  $ gh pr merge 44 --merge -> MERGED 2026-07-28T05:04:12Z, merge commit 7c004ba
+  $ git log --oneline -1 origin/main -> 7c004ba Merge pull request #44
+  ```
+- Next: session 3 of the MoE arc — a second MoE architecture (`qwen2_moe` /
+  `qwen3_moe`). Carry into its task list explicitly: (a) golden.rs's MoE
+  posture assertion keys on the literal `"olmoe"`, so a new family must be
+  added there or its monolithic-prefill / envelope-None posture goes
+  unasserted; (b) new-family fixtures belong in `tests/golden/` unless the
+  checkpoint exceeds a ~7 GB hosted runner, in which case `tests/golden-xl/`
+  plus an `OPT_IN` entry in fetch-test-model.sh; (c) dev machines must run
+  `KILN_GOLDEN_XL=1 cargo test -p kiln-models --test golden` — CI never
+  does, so an unrun XL tier rots silently.
