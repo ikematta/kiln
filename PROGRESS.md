@@ -9041,3 +9041,126 @@
   plus an `OPT_IN` entry in fetch-test-model.sh; (c) dev machines must run
   `KILN_GOLDEN_XL=1 cargo test -p kiln-models --test golden` — CI never
   does, so an unrun XL tier rots silently.
+
+## [2026-07-28] Observability follow-up / SPEC §5 + §8.1 — queue depth on /metrics — DONE
+- What:
+  - `proto/kiln/v1/worker.proto`: `WorkerStats.requests_waiting = 19` and
+    `requests_running = 20`, both `uint64` gauges. Purely ADDITIVE on the
+    frozen proto — new field numbers after the previous max (18), nothing
+    renumbered/retyped/repurposed, no number reused (there are no reserved
+    numbers in this message). Per CLAUDE.md the additive shape needs no ADR.
+  - Codegen regenerated both sides: `cargo build -p kiln-proto` (prost via
+    build.rs) and the `grpc_tools.protoc` step; only `worker_pb2.py` moves.
+  - `kiln-worker/src/service.rs` Stats: populated from the engine mirrors
+    `Shared::engine_waiting` / `Shared::running`, which `publish_stats`
+    stores from `engine.num_waiting()` / `engine.num_running()` after every
+    step.
+  - `kiln-gateway/src/metrics.rs`: `kiln_worker_requests_waiting` /
+    `kiln_worker_requests_running` in `WorkerStatGauges`, following the
+    `kv_blocks_free` pattern (field, `set(...)` in `record`, `stat(...)`
+    registration with a `model` label).
+  - Tests: `worker_stats_reexport_with_model_label` extended with both new
+    series AND a second `record` that brings them back down (these are the
+    first non-monotone members of that gauge set — a lifetime-total wiring
+    would pass the first half alone); new engine-level case
+    `queue_depth_stats_track_the_engine` in `kiln-worker/tests/rpc.rs`.
+- Decisions (within spec latitude):
+  - **`requests_waiting` is engine-only, deliberately ≠
+    `HealthStatus.requests_waiting`.** Health sums `Shared::waiting`
+    (accepted by gRPC, not yet drained into the engine) with the engine
+    queue; Stats reports the engine queue alone, per the change request's
+    "from engine.num_waiting()". The two therefore differ, by at most the
+    one engine iteration it takes to drain an arriving burst, with Health ≥
+    Stats. Documented in the proto field comments and at the Stats call
+    site rather than silently reconciled — the engine-only number is the
+    admission-backpressure signal. **Flagging for the PM**: if the identical
+    field name across two messages is judged a consumer trap, aligning Stats
+    to the Health sum is a one-line change; I did not make that call.
+  - `uint64` (not Health's `uint32`): matches every other `WorkerStats`
+    field and the gauge helper's `u64` argument.
+  - The new test lives in `kiln-worker/tests/rpc.rs` (already CI-gated by
+    the model-gated blocking step) because that is the only place where the
+    real engine and the exposed proto values meet. It asserts against real
+    pressure, not defaults: a 5-deep burst of distinct >prefill_chunk
+    prompts, `waiting + running == 5` (per-request accounting, right unit),
+    both ≥ 1, peak waiting ≥ 2, Health sees the same non-empty queue, then
+    cancel → both gauges return to 0 and `requests_total == 5`. The queue is
+    structural, not a race: kiln-engine's `admit` stops admitting while any
+    admitted request is still prefilling, so the observed shape is a stable
+    waiting=4/running=1 (four consecutive runs, identical).
+  - Staleness documented in the proto per the change request: same
+    heartbeat/poll cadence as every other WorkerStats mirror (engine
+    republishes at each step end; gateway polls Stats on the 1 s
+    `HEALTH_POLL_INTERVAL`), caveat written in the `mlx_live_objects`
+    style. Also documented: the python worker does not implement Stats at
+    all (UNIMPLEMENTED; the supervisor then stops polling it), so these
+    read 0 there like every other WorkerStats field — its queue depth is on
+    HealthStatus. Not a bug; parity separately scoped.
+- Deviations: none. No engine, model, or scheduling code touched — greedy
+  determinism and the golden bar are untouched by construction.
+- Acceptance:
+  ```
+  $ cargo fmt --all --check                                              -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings                -> Finished
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> Finished
+  $ cargo build --workspace --no-default-features                        -> Finished (compile-linux shape)
+  $ cargo test --workspace            -> 56 suites, 0 failed (env-less: model-gated skip)
+  $ cargo test --workspace --release  -> 56 suites, 0 failed (test-macos-release shape)
+  $ ruff check python/ tests/e2e scripts        -> All checks passed!
+  $ ruff format --check python/ tests/e2e scripts -> 40 files already formatted
+  $ pytest python/kiln_worker_py/tests -q       -> 35 passed
+  $ uv run --project tests/e2e pytest tests/e2e/test_metrics.py -q -> 4 passed
+
+  KILN_TEST_MODELS set (the model-gated blocking step's worker slice):
+  $ cargo test -p kiln-worker --test rpc -- --nocapture
+  stats + prefix cache over RPC ok: WorkerStats { requests_total: 2, ...,
+    requests_waiting: 0, requests_running: 0 }
+  queue depth under a 5-deep burst: waiting=4 running=1 (peak waiting 4)
+  queue depth drained to zero after cancel: WorkerStats { requests_total: 5,
+    requests_cancelled: 5, ..., requests_waiting: 0, requests_running: 0 }
+  test result: ok. 1 passed; 0 failed; ... finished in 19.41s
+  (run 4x total, byte-identical queue-depth line each time)
+
+  REAL END-TO-END, at the actual scrape endpoint (not the RPC field): a
+  gateway + rust worker started through the e2e scaffolding, driven by
+  test_priority.py's 12-stream BATCH flood (12 x ~1150-token prompts,
+  ~20k slots demanded vs a 16384-slot pool; all one priority class, so
+  the surplus genuinely queues instead of preempting), sampling
+  GET /metrics at 10 Hz throughout:
+
+    idle scrape:
+      kiln_worker_requests_waiting{model="llama"} 0
+      kiln_worker_requests_running{model="llama"} 0
+    peak scrape (burst arrival, admission pacing):
+      kiln_worker_requests_waiting{model="llama"} 11
+      kiln_worker_requests_running{model="llama"} 1
+      kiln_worker_requests_total{model="llama"} 12
+    KV-saturated scrape (pool full, surplus genuinely queued):
+      kiln_worker_kv_blocks_allocated{model="llama"} 497
+      kiln_worker_kv_blocks_free{model="llama"} 15
+      kiln_worker_requests_running{model="llama"} 10
+      kiln_worker_requests_waiting{model="llama"} 2
+    drained scrape (all 12 finished, reason "length"):
+      kiln_worker_requests_waiting{model="llama"} 0
+      kiln_worker_requests_running{model="llama"} 0
+      kiln_worker_requests_preempted_total{model="llama"} 2
+
+  Not verified (stated, not implied): the /admin/models Health cross-check
+  in that probe returned `admin_disabled` — the e2e stack sets no
+  admin_token_hash. The Stats-vs-Health agreement is covered instead by
+  the new rpc.rs case, which asserts both report the same non-empty queue.
+  Untouched and not re-run: the model-gated model/engine suites (batching,
+  calibration, draft, leak*, preemption, prefill_pad, prefix_cache,
+  prefix_multiturn, spec_decode) and the golden trees — this change adds
+  no engine or model code. The 30-min soak was not run locally; it gates
+  on CI as usual.
+  ```
+- Next: session 3 of the MoE arc — a second MoE architecture (`qwen2_moe` /
+  `qwen3_moe`), with the three carry-ins recorded in the 2026-07-28 PR #44
+  entry (golden.rs's `"olmoe"`-keyed posture assertion; fixture tier choice;
+  dev machines must run the `KILN_GOLDEN_XL=1` golden tier).
+- DECISION NEEDED: none blocking. One judgment call is recorded above for
+  the PM's review queue rather than as a blocker — `WorkerStats
+  .requests_waiting` (engine queue only) vs `HealthStatus.requests_waiting`
+  (engine queue + not-yet-drained submissions) share a name and differ by
+  design; say the word and Stats becomes the same sum.

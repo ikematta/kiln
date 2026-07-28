@@ -542,6 +542,186 @@ async fn prefix_cache_stats_and_ssd_restart() {
     let _ = std::fs::remove_dir_all(&ssd_dir);
 }
 
+/// Queue depth over the frozen proto (`WorkerStats.requests_waiting` /
+/// `requests_running`, added 2026-07-28): the numbers a `/metrics` scrape
+/// ultimately shows must track the engine's own WAITING/RUNNING counts
+/// under real pressure — existing and reading 0 is not the bar.
+///
+/// The pressure is structural, not a race: kiln-engine's `admit` stops
+/// admitting while any admitted request is still prefilling, so a burst
+/// of distinct long prompts enters the engine together and leaves exactly
+/// one request RUNNING with the rest queued in WAITING, draining one per
+/// completed prefill.
+async fn queue_depth_stats_track_the_engine() {
+    use kiln_proto::v1::StatsRequest;
+
+    if !kiln_mlx::memory::metal_is_available() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let Some(model) = model_dir() else {
+        eprintln!("skipping: KILN_TEST_MODELS not set or {MODEL_NAME} missing");
+        return;
+    };
+
+    /// Requests in the burst. 5 × 80 blocks of prompt stays inside the
+    /// default 512-block pool, so the queue here is admission pacing —
+    /// no preemption, no OOM rejection to muddy the counts.
+    const BURST: usize = 5;
+    /// Prompt length: over `prefill_chunk`, so each admission occupies
+    /// the engine for more than one step and the queued state is wide
+    /// enough to sample on a fast dev machine as well as a slow runner.
+    const PROMPT_LEN: usize = kiln_engine::DEFAULT_PREFILL_CHUNK + 512;
+
+    /// Distinct prompt per burst member: a shared prefix would be served
+    /// from the radix cache, skipping the prefill this scenario needs.
+    fn burst_submission(k: usize) -> SubmitRequest {
+        let mut ids = vec![1000 + k as u32];
+        ids.extend((0..PROMPT_LEN - 1).map(|i| (i % 8) as u32 + 1));
+        SubmitRequest {
+            request_id: format!("queue-{k}"),
+            input: Some(submit_request::Input::TokenIds(TokenIds { ids })),
+            sampling: Some(SamplingParams::default()),
+            // Long and EOS-proof: every member stays in flight until the
+            // explicit cancel below, so the burst cannot quietly retire
+            // mid-measurement.
+            stopping: Some(StoppingParams {
+                max_tokens: 4096,
+                ignore_eos: true,
+                ..StoppingParams::default()
+            }),
+            grammar: None,
+            priority: Priority::Interactive as i32,
+            prefix_hint: 0,
+            echo_prompt: false,
+        }
+    }
+
+    let worker = Worker::spawn(&model, "queue");
+    let mut client = worker.client_when_ready().await;
+
+    // Idle baseline: an engine with nothing in it reports nothing.
+    let idle = client
+        .stats(StatsRequest {})
+        .await
+        .expect("stats ok")
+        .into_inner();
+    assert_eq!(
+        (idle.requests_waiting, idle.requests_running),
+        (0, 0),
+        "idle worker must report an empty queue: {idle:?}"
+    );
+
+    let mut streams = Vec::with_capacity(BURST);
+    for k in 0..BURST {
+        streams.push(
+            client
+                .submit(burst_submission(k))
+                .await
+                .expect("submit ok")
+                .into_inner(),
+        );
+    }
+
+    // Poll until the two gauges account for the whole burst. Reaching
+    // `waiting + running == BURST` is the strong statement: they are
+    // per-request counts of live work, in requests, not defaults and not
+    // some other unit that happens to be nonzero.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut peak_waiting = 0;
+    let mut accounted = None;
+    while accounted.is_none() {
+        let stats = client
+            .stats(StatsRequest {})
+            .await
+            .expect("stats ok")
+            .into_inner();
+        peak_waiting = peak_waiting.max(stats.requests_waiting);
+        assert!(
+            stats.requests_waiting + stats.requests_running <= BURST as u64,
+            "queue depth exceeds the {BURST} submitted requests: {stats:?}"
+        );
+        if stats.requests_waiting + stats.requests_running == BURST as u64 {
+            accounted = Some(stats);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "queue depth never accounted for the burst (last: {stats:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let accounted = accounted.expect("loop exits only with a sample");
+    assert!(
+        accounted.requests_running >= 1,
+        "burst with nothing running: {accounted:?}"
+    );
+    assert!(
+        accounted.requests_waiting >= 1,
+        "burst with nothing queued — admission pacing did not hold: {accounted:?}"
+    );
+    // Admission releases one request per completed prefill, so the queue
+    // must have held several members at once, not just the tail one.
+    assert!(
+        peak_waiting >= 2,
+        "queue never held more than {peak_waiting} request(s) of the {BURST}-deep burst"
+    );
+    // Health mirrors the same engine state (its `requests_waiting` also
+    // counts submissions not yet drained into the engine, hence >=).
+    let health = client
+        .health(HealthRequest {})
+        .await
+        .expect("health ok")
+        .into_inner();
+    assert!(
+        health.requests_running > 0 && health.requests_waiting > 0,
+        "Stats reported a queue that Health does not see: {health:?} vs {accounted:?}"
+    );
+    eprintln!(
+        "queue depth under a {BURST}-deep burst: waiting={} running={} (peak waiting {peak_waiting})",
+        accounted.requests_waiting, accounted.requests_running
+    );
+
+    // Retire the burst: both gauges must fall back to zero. A lifetime
+    // total (or a counter wired to the wrong source) would not.
+    for k in 0..BURST {
+        client
+            .cancel(CancelRequest {
+                request_id: format!("queue-{k}"),
+            })
+            .await
+            .expect("cancel ok");
+    }
+    for (k, stream) in streams.iter_mut().enumerate() {
+        let (finished, _) = read_to_finished(stream).await;
+        assert_eq!(
+            finished.finish_reason(),
+            FinishReason::Cancelled,
+            "burst member {k} did not end cancelled"
+        );
+    }
+    let drained = loop {
+        let stats = client
+            .stats(StatsRequest {})
+            .await
+            .expect("stats ok")
+            .into_inner();
+        if (stats.requests_waiting, stats.requests_running) == (0, 0) {
+            break stats;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "queue depth never drained after cancelling the burst: {stats:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        drained.requests_total, BURST as u64,
+        "the burst is all the worker ever saw: {drained:?}"
+    );
+    eprintln!("queue depth drained to zero after cancel: {drained:?}");
+}
+
 /// One `#[test]` because cases in a binary run concurrently and both of
 /// the above spawn kiln-worker child processes that drive the GPU — the
 /// process-level counterpart of the single-engine-thread discipline every
@@ -554,4 +734,5 @@ async fn prefix_cache_stats_and_ssd_restart() {
 async fn worker_rpc_semantics() {
     cancel_and_drain_rpc_semantics().await;
     prefix_cache_stats_and_ssd_restart().await;
+    queue_depth_stats_track_the_engine().await;
 }
