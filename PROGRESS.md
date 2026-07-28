@@ -9042,7 +9042,233 @@
   `KILN_GOLDEN_XL=1 cargo test -p kiln-models --test golden` — CI never
   does, so an unrun XL tier rots silently.
 
+## [2026-07-28] Observability follow-up / SPEC §5 + §8.1 — queue depth on /metrics — DONE
+- What:
+  - `proto/kiln/v1/worker.proto`: `WorkerStats.requests_waiting = 19` and
+    `requests_running = 20`, both `uint64` gauges. Purely ADDITIVE on the
+    frozen proto — new field numbers after the previous max (18), nothing
+    renumbered/retyped/repurposed, no number reused (there are no reserved
+    numbers in this message). Per CLAUDE.md the additive shape needs no ADR.
+  - Codegen regenerated both sides: `cargo build -p kiln-proto` (prost via
+    build.rs) and the `grpc_tools.protoc` step; only `worker_pb2.py` moves.
+  - `kiln-worker/src/service.rs` Stats: populated from the engine mirrors
+    `Shared::engine_waiting` / `Shared::running`, which `publish_stats`
+    stores from `engine.num_waiting()` / `engine.num_running()` after every
+    step.
+  - `kiln-gateway/src/metrics.rs`: `kiln_worker_requests_waiting` /
+    `kiln_worker_requests_running` in `WorkerStatGauges`, following the
+    `kv_blocks_free` pattern (field, `set(...)` in `record`, `stat(...)`
+    registration with a `model` label).
+  - Tests: `worker_stats_reexport_with_model_label` extended with both new
+    series AND a second `record` that brings them back down (these are the
+    first non-monotone members of that gauge set — a lifetime-total wiring
+    would pass the first half alone); new engine-level case
+    `queue_depth_stats_track_the_engine` in `kiln-worker/tests/rpc.rs`.
+- Decisions (within spec latitude):
+  - **`requests_waiting` is engine-only, deliberately ≠
+    `HealthStatus.requests_waiting`.** Health sums `Shared::waiting`
+    (accepted by gRPC, not yet drained into the engine) with the engine
+    queue; Stats reports the engine queue alone, per the change request's
+    "from engine.num_waiting()". The two therefore differ, by at most the
+    one engine iteration it takes to drain an arriving burst, with Health ≥
+    Stats. Documented in the proto field comments and at the Stats call
+    site rather than silently reconciled — the engine-only number is the
+    admission-backpressure signal. **Flagging for the PM**: if the identical
+    field name across two messages is judged a consumer trap, aligning Stats
+    to the Health sum is a one-line change; I did not make that call.
+  - `uint64` (not Health's `uint32`): matches every other `WorkerStats`
+    field and the gauge helper's `u64` argument.
+  - The new test lives in `kiln-worker/tests/rpc.rs` (already CI-gated by
+    the model-gated blocking step) because that is the only place where the
+    real engine and the exposed proto values meet. It asserts against real
+    pressure, not defaults: a 5-deep burst of distinct >prefill_chunk
+    prompts, `waiting + running == 5` (per-request accounting, right unit),
+    both ≥ 1, peak waiting ≥ 2, Health sees the same non-empty queue, then
+    cancel → both gauges return to 0 and `requests_total == 5`. The queue is
+    structural, not a race: kiln-engine's `admit` stops admitting while any
+    admitted request is still prefilling, so the observed shape is a stable
+    waiting=4/running=1 (four consecutive runs, identical).
+  - Staleness documented in the proto per the change request: same
+    heartbeat/poll cadence as every other WorkerStats mirror (engine
+    republishes at each step end; gateway polls Stats on the 1 s
+    `HEALTH_POLL_INTERVAL`), caveat written in the `mlx_live_objects`
+    style. Also documented: the python worker does not implement Stats at
+    all (UNIMPLEMENTED; the supervisor then stops polling it), so these
+    read 0 there like every other WorkerStats field — its queue depth is on
+    HealthStatus. Not a bug; parity separately scoped.
+- Deviations: none. No engine, model, or scheduling code touched — greedy
+  determinism and the golden bar are untouched by construction.
+- Acceptance:
+  ```
+  $ cargo fmt --all --check                                              -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings                -> Finished
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> Finished
+  $ cargo build --workspace --no-default-features                        -> Finished (compile-linux shape)
+  $ cargo test --workspace            -> 56 suites, 0 failed (env-less: model-gated skip)
+  $ cargo test --workspace --release  -> 56 suites, 0 failed (test-macos-release shape)
+  $ ruff check python/ tests/e2e scripts        -> All checks passed!
+  $ ruff format --check python/ tests/e2e scripts -> 40 files already formatted
+  $ pytest python/kiln_worker_py/tests -q       -> 35 passed
+  $ uv run --project tests/e2e pytest tests/e2e/test_metrics.py -q -> 4 passed
+
+  KILN_TEST_MODELS set (the model-gated blocking step's worker slice):
+  $ cargo test -p kiln-worker --test rpc -- --nocapture
+  stats + prefix cache over RPC ok: WorkerStats { requests_total: 2, ...,
+    requests_waiting: 0, requests_running: 0 }
+  queue depth under a 5-deep burst: waiting=4 running=1 (peak waiting 4)
+  queue depth drained to zero after cancel: WorkerStats { requests_total: 5,
+    requests_cancelled: 5, ..., requests_waiting: 0, requests_running: 0 }
+  test result: ok. 1 passed; 0 failed; ... finished in 19.41s
+  (run 4x total, byte-identical queue-depth line each time)
+
+  REAL END-TO-END, at the actual scrape endpoint (not the RPC field): a
+  gateway + rust worker started through the e2e scaffolding, driven by
+  test_priority.py's 12-stream BATCH flood (12 x ~1150-token prompts,
+  ~20k slots demanded vs a 16384-slot pool; all one priority class, so
+  the surplus genuinely queues instead of preempting), sampling
+  GET /metrics at 10 Hz throughout:
+
+    idle scrape:
+      kiln_worker_requests_waiting{model="llama"} 0
+      kiln_worker_requests_running{model="llama"} 0
+    peak scrape (burst arrival, admission pacing):
+      kiln_worker_requests_waiting{model="llama"} 11
+      kiln_worker_requests_running{model="llama"} 1
+      kiln_worker_requests_total{model="llama"} 12
+    KV-saturated scrape (pool full, surplus genuinely queued):
+      kiln_worker_kv_blocks_allocated{model="llama"} 497
+      kiln_worker_kv_blocks_free{model="llama"} 15
+      kiln_worker_requests_running{model="llama"} 10
+      kiln_worker_requests_waiting{model="llama"} 2
+    drained scrape (all 12 finished, reason "length"):
+      kiln_worker_requests_waiting{model="llama"} 0
+      kiln_worker_requests_running{model="llama"} 0
+      kiln_worker_requests_preempted_total{model="llama"} 2
+
+  Not verified (stated, not implied): the /admin/models Health cross-check
+  in that probe returned `admin_disabled` — the e2e stack sets no
+  admin_token_hash. The Stats-vs-Health agreement is covered instead by
+  the new rpc.rs case, which asserts both report the same non-empty queue.
+  Untouched and not re-run: the model-gated model/engine suites (batching,
+  calibration, draft, leak*, preemption, prefill_pad, prefix_cache,
+  prefix_multiturn, spec_decode) and the golden trees — this change adds
+  no engine or model code. The 30-min soak was not run locally; it gates
+  on CI as usual.
+  ```
+- Next: session 3 of the MoE arc — a second MoE architecture (`qwen2_moe` /
+  `qwen3_moe`), with the three carry-ins recorded in the 2026-07-28 PR #44
+  entry (golden.rs's `"olmoe"`-keyed posture assertion; fixture tier choice;
+  dev machines must run the `KILN_GOLDEN_XL=1` golden tier).
+- DECISION NEEDED: none blocking. One judgment call is recorded above for
+  the PM's review queue rather than as a blocker — `WorkerStats
+  .requests_waiting` (engine queue only) vs `HealthStatus.requests_waiting`
+  (engine queue + not-yet-drained submissions) share a name and differ by
+  design; say the word and Stats becomes the same sum.
+
+## [2026-07-28] Observability / queue-depth metrics — PR #45 MERGED; soak crash-restart gate fired ONCE (first ever), did not reproduce — DONE
+- What: PM ruled to merge on green CI. PR #45 merged with `--merge` (not
+  squash, same as #43/#44 — the PROGRESS commit references stay valid on
+  main); merge commit 4c5d28f, feature commit f701d69.
+- CI, run 30377498688 (head f701d69): **attempt 1 FAILED**, re-run of the
+  failed job **PASSED**. Final: lint 41s, compile-linux 45s,
+  test-macos-release 5m30s, test-macos 1h17m16s (vs the 1h19m12s baseline;
+  the model cache hit — fetch-test-model.sh untouched here, so none of the
+  8m41s cold-refetch penalty from run 30326248951).
+- **THE FINDING — record it even though it went green.** Attempt 1 failed
+  the blocking 30-min soak on ONE gate: `crash-restarts observed: 1`. Per
+  the PM ruling this is logged at the same standard the ADR 0004 advisory
+  lane gets: **this gate has never fired before** (PROGRESS 2026-07-15,
+  -07-19, -07-22 all record "zero crash-restarts"), and it is currently
+  UNEXPLAINED rather than closed.
+  - The restart was on **py-smollm, the PYTHON worker**; all four rust
+    models reported `restarts=0`. py-smollm had been evicted 24x — normal
+    churn for this soak (cf. the 2026-07-15 entry's "py-smollm 24").
+  - Every other gate held: leak gates, RSS slopes, mlx live-object
+    counter, both determinism canaries (llama + spec text correct),
+    prefix reuse 100811 tokens, spec acceptance 2707/2707 = 1.00,
+    reservation-ledger uncovered growth 0.0 MB, zero hard errors. The
+    `crashed_states` gate never fired either — the 10 s poller never
+    sampled a Crashed/Unhealthy state, i.e. the worker went away between
+    samples rather than reporting itself sick.
+  - **Which recycle path fired is NOT determinable from CI.** The three
+    candidates in supervisor.rs — `child.wait()` ("worker process
+    exited"), the 3 s `HEALTH_MISSED_DEADLINE` ("worker missed health
+    deadline"), and a self-reported UNHEALTHY — are distinguished only by
+    a gateway log line, and the gateway log lives in the stack's runtime
+    dir, is never printed on failure, and is not uploaded. Filed as
+    separate work (do NOT fold into a feature PR): print/upload the
+    gateway log tail when a soak gate fails. Until then this gate is
+    blocking but un-root-causable.
+  - Context that makes an environmental cause plausible but NOT proven:
+    the run was memory-pressured (raw used above budget in 10/159
+    samples, worst t+86s 4.47 GB on a ~7 GB runner), and the python
+    worker is the fattest non-rust process (~470 MB RSS).
+- Why this was judged unrelated to the change (the merge rationale, so a
+  future reader can re-check the reasoning rather than the verdict):
+  - The diff's ONLY contact with the python worker is the regenerated
+    `worker_pb2.py` descriptor. `servicer.py`/`engine.py`/`server.py` are
+    untouched, and the python worker does not implement Stats at all, so
+    the two new fields are never constructed there. A malformed descriptor
+    would fail every start, not 1 of ~25.
+  - The gateway's Stats poll to a python worker (UNIMPLEMENTED once per
+    worker generation, then `stats_supported = false`) is pre-existing and
+    unchanged in count or cost by this diff.
+  - The rust/python asymmetry in the failing run points away from a change
+    that only adds two atomic loads to the RUST worker's Stats handler.
+  - The re-run establishes NON-REPRODUCTION, not innocence: one pass, on a
+    fresh runner, of a gate that had never fired in any prior run. Weight
+    the causal argument above, not the green tick. **If this gate fires
+    again on any PR, treat it as a real signal and do not re-run past it.**
+- Also observed, ADR 0004 record: the advisory golden lane failed on
+  gemma-3-1b-it-4bit/chat-basic in BOTH attempts — the same known
+  cross-device divergence as runs 30191249436 / 30241628948 / 30326248951,
+  same fixture, same first-divergence shape. No pattern change, which is
+  the property that matters here: this change adds no engine or model code,
+  and the lane behaved exactly as it does without it. continue-on-error by
+  design; did not gate.
+- The new queue-depth case ran and passed on the real runner in the
+  model-gated BLOCKING step (`test worker_rpc_semantics ... ok`, 17:58),
+  i.e. the admission-pacing shape it asserts holds on the CI runner's
+  shared paravirtual GPU as well as on a dev M4.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 45 -> 4/4 pass (run 30377498688 after re-run of test-macos)
+     lint 41s | compile-linux 45s | test-macos-release 5m30s | test-macos 1h17m16s
+  $ gh pr merge 45 --merge -> MERGED 2026-07-28T18:55:54Z, merge commit 4c5d28f
+  $ git log --oneline -1 origin/main -> 4c5d28f Merge pull request #45
+
+  attempt 1 (failed):
+    FAILED tests/e2e/test_soak.py::test_full_stack_soak
+    AssertionError: crash-restarts observed: 1
+    py-smollm: unloads={'evicted': 24.0, ...} restarts=1
+    (llama-int / spec-qwen25 / ttl-qwen25 / burst-gemma all restarts=0)
+  re-run (passed):
+    PASS: all gates held
+    py-smollm: unloads={'evicted': 25.0, ...} restarts=0   <- heavier churn
+  ```
+- Next: session 3 of the MoE arc — a second MoE architecture (`qwen2_moe` /
+  `qwen3_moe`), with the three carry-ins from the PR #44 entry (golden.rs's
+  `"olmoe"`-keyed posture assertion; fixture tier choice; dev machines must
+  run the `KILN_GOLDEN_XL=1` golden tier). Separately queued, not part of
+  that session: capture the gateway log on soak-gate failure.
+
 ## [2026-07-28] Soak diagnosability — gateway-log forensics on the failure path — DONE
+- Closes the item filed in the PR #45 merge entry directly above: "print/
+  upload the gateway log tail when a soak gate fails ... until then this
+  gate is blocking but un-root-causable", queued there as separate work and
+  explicitly not to be folded into a feature PR. Branch carries this and
+  the PROGRESS entry only.
+- Consequence for the standing instruction in that entry — "**if this gate
+  fires again on any PR, treat it as a real signal and do not re-run past
+  it**" — the next firing now arrives WITH its cause: which supervisor path
+  recycled the worker, that path's discriminating fields, and whether the
+  worker said anything on its way out. The judgement the PM asked for stays
+  a judgement; it just stops being made blind. Note the specific confound in
+  run 30377498688: py-smollm was evicted 24x that run, so the one restart
+  sat in a crowd of deliberate unloads — the timeline section exists to
+  separate exactly those, and the local reproduction below shows it doing so
+  (two evictions of the same model within seconds of the crash).
 - What (test harness + CI only; no Rust touched, no supervisor semantics or
   gate threshold changed):
   - `tests/e2e/test_soak.py`: new "Gateway-log forensics" section. Parses

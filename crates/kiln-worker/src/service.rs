@@ -395,6 +395,12 @@ impl Worker for WorkerService {
             // (criterion covers the gate today) — zero until they exist.
             engine_step_overhead_us_p50: 0.0,
             engine_step_overhead_us_p99: 0.0,
+            // Queue depth: the engine's own WAITING/RUNNING counts as of
+            // the last tick. Deliberately NOT the Health sum — `waiting`
+            // (accepted by gRPC, not yet drained into the engine) is
+            // excluded here; see the proto field comments.
+            requests_waiting: u64::from(shared.engine_waiting.load(Ordering::Acquire)),
+            requests_running: u64::from(shared.running.load(Ordering::Acquire)),
         }))
     }
 
