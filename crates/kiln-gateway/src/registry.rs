@@ -501,6 +501,18 @@ mod tests {
         })
     }
 
+    /// Minimal servable OLMoE config (matrix: supported MoE arch, 4-bit
+    /// uniform). The MoE geometry keys are the ones `moe.rs` is
+    /// parameterized by; `intermediate_size` is the PER-EXPERT width.
+    fn moe_config() -> serde_json::Value {
+        let mut config = supported_config();
+        config["model_type"] = serde_json::json!("olmoe");
+        config["num_experts"] = serde_json::json!(8);
+        config["num_experts_per_tok"] = serde_json::json!(2);
+        config["norm_topk_prob"] = serde_json::json!(false);
+        config
+    }
+
     fn resolve(worker: WorkerKind, config: serde_json::Value) -> (WorkerKind, bool) {
         let dir = temp_dir("resolve");
         let model = model_in_dir(&dir, worker, config);
@@ -572,6 +584,16 @@ mod tests {
             ),
             ("gemma2", serde_json::json!({"head_dim": 16})),
             ("gemma3_text", serde_json::json!({})),
+            // MoE (session 2, task 2.1): olmoe is in SUPPORTED_ARCHITECTURES,
+            // so a servable MoE checkpoint takes the rust route like any
+            // dense one — the expert geometry is config, not a special case.
+            (
+                "olmoe",
+                serde_json::json!({
+                    "num_experts": 8, "num_experts_per_tok": 2,
+                    "norm_topk_prob": false
+                }),
+            ),
         ] {
             let mut config = supported_config();
             config["model_type"] = serde_json::json!(model_type);
@@ -594,6 +616,184 @@ mod tests {
         kiln_models::ArchConfig::from_json_str(&dense.to_string()).expect("dense is servable");
         let (kind, _) = resolve(WorkerKind::Auto, dense);
         assert_eq!(kind, WorkerKind::Python);
+    }
+
+    /// The MoE half of the Phase 6 routing matrix (session 2, task 2.1).
+    /// Every MoE-shaped checkpoint the rust worker cannot serve must
+    /// degrade to python with a reason that NAMES what disqualified it —
+    /// never a startup error, never a panic. The reason assertions carry as
+    /// much weight as the routing: `resolve_worker`'s "resolved to python"
+    /// log line is the operator's only explanation for why their MoE model
+    /// went to python, and "architecture" vs. "rope variant" vs.
+    /// "quantization" are three different things for them to go fix.
+    #[test]
+    fn auto_routes_unservable_moe_configs_to_python_with_a_named_reason() {
+        let mut cases: Vec<(String, serde_json::Value, String)> = Vec::new();
+
+        // The important one (SPEC §12 Phase 6 acceptance): a MoE family the
+        // rust worker does not implement serves transparently via python.
+        // ArchConfig dispatches on `model_type` before any field parsing, so
+        // these fail at the ARCHITECTURE check — which is what should be
+        // reported, whatever expert-geometry keys the family happens to use
+        // (`num_local_experts`, `n_routed_experts`, ...).
+        for family in ["qwen2_moe", "qwen3_moe", "phimoe", "mixtral", "deepseek_v3"] {
+            let mut config = moe_config();
+            config["model_type"] = serde_json::json!(family);
+            cases.push((
+                format!("unimplemented MoE family {family}"),
+                config,
+                format!("unsupported model_type \"{family}\""),
+            ));
+        }
+
+        // Per-module quantization overrides landing on expert/router
+        // tensors: real mixed-precision MoE checkpoints ship these, and
+        // serde would silently drop them from `Quantization` — the model
+        // would load with the uniform parameters and fail far away. The
+        // existing fail-loud path, exercised with MoE key names.
+        let mut expert_override = moe_config();
+        expert_override["quantization"]["model.layers.0.mlp.switch_mlp.gate_proj"] =
+            serde_json::json!({"group_size": 64, "bits": 8});
+        cases.push((
+            "per-module override on an expert tensor".into(),
+            expert_override,
+            "per-module quantization overrides".into(),
+        ));
+        let mut router_override = moe_config();
+        // The router (gate) linear is commonly left unquantized.
+        router_override["quantization"]["model.layers.0.mlp.gate"] = serde_json::json!(false);
+        cases.push((
+            "per-module override on the router tensor".into(),
+            router_override,
+            "per-module quantization overrides".into(),
+        ));
+
+        // Non-affine quantization mode on a MoE config.
+        let mut mxfp4 = moe_config();
+        mxfp4["quantization"]["mode"] = serde_json::json!("mxfp4");
+        cases.push((
+            "non-affine quantization mode".into(),
+            mxfp4,
+            "quantization mode".into(),
+        ));
+
+        // Out-of-matrix bits / group size (SPEC §7.3: 4/8 @ 32/64/128).
+        let mut bits3 = moe_config();
+        bits3["quantization"] = serde_json::json!({"group_size": 64, "bits": 3});
+        cases.push((
+            "out-of-matrix bits".into(),
+            bits3,
+            "bits=3 group_size=64".into(),
+        ));
+        let mut group16 = moe_config();
+        group16["quantization"] = serde_json::json!({"group_size": 16, "bits": 4});
+        cases.push((
+            "out-of-matrix group size".into(),
+            group16,
+            "bits=4 group_size=16".into(),
+        ));
+
+        // rope_scaling variant the rust worker does not implement, on a MoE
+        // config: the reason must say ROPE, not architecture — olmoe IS
+        // implemented, and sending the operator hunting for a missing
+        // architecture would be a lie.
+        let mut longrope = moe_config();
+        longrope["rope_scaling"] = serde_json::json!({"rope_type": "longrope", "factor": 4.0});
+        cases.push((
+            "unimplemented rope variant on a MoE config".into(),
+            longrope,
+            "unsupported rope_scaling".into(),
+        ));
+
+        // Degenerate expert geometry: caught at load, named as such, rather
+        // than surfacing as an opaque shape error inside the expert
+        // dispatch on the first forward pass.
+        let mut no_experts = moe_config();
+        no_experts["num_experts"] = serde_json::json!(0);
+        cases.push((
+            "degenerate expert geometry".into(),
+            no_experts,
+            "num_experts=0".into(),
+        ));
+
+        for (label, config, expected_reason) in cases {
+            let reason = kiln_models::ArchConfig::from_json_str(&config.to_string())
+                .expect_err(&format!("{label} must be rejected: {config}"))
+                .to_string();
+            assert!(
+                reason.contains(&expected_reason),
+                "{label}: reason {reason:?} must name the actual cause \
+                 ({expected_reason:?})"
+            );
+            let (kind, has_tokenizer) = resolve(WorkerKind::Auto, config.clone());
+            assert_eq!(kind, WorkerKind::Python, "{label}: {config}");
+            assert!(
+                !has_tokenizer,
+                "{label}: python route must not load a tokenizer"
+            );
+        }
+    }
+
+    /// The other side of the same coin: `worker = "auto"` degrades quietly,
+    /// but an operator who explicitly asked for the rust worker on a MoE
+    /// family it does not implement gets a loud startup error naming the
+    /// family — they asked for something impossible.
+    #[test]
+    fn explicit_rust_on_an_unimplemented_moe_family_is_a_startup_error() {
+        for family in ["qwen2_moe", "qwen3_moe", "phimoe", "mixtral", "deepseek_v3"] {
+            let mut config = moe_config();
+            config["model_type"] = serde_json::json!(family);
+            let dir = temp_dir("rust-moe-unimpl");
+            let model = model_in_dir(&dir, WorkerKind::Rust, config);
+            let result = resolve_worker(&model, &dir);
+            let _ = std::fs::remove_dir_all(&dir);
+            let err = result.expect_err("must fail loudly");
+            assert!(
+                matches!(err, RegistryError::RustUnsupported { .. }),
+                "{family}: {err}"
+            );
+            assert!(
+                err.to_string().contains(family),
+                "{family}: error must name the family: {err}"
+            );
+        }
+    }
+
+    /// The synthetic configs above prove the matrix; this proves the matrix
+    /// matches a checkpoint that actually exists. Config + tokenizer only —
+    /// no weights are loaded, so it costs a few milliseconds and needs no
+    /// Metal device. Skips when the pinned model is absent (CI runs
+    /// `cargo test --workspace` deliberately env-less).
+    #[test]
+    fn auto_routes_the_pinned_moe_checkpoint_to_rust() {
+        const MODEL_NAME: &str = "olmoe-1b-7b-0125-4bit";
+        let Some(root) = std::env::var_os("KILN_TEST_MODELS") else {
+            eprintln!("skipping: KILN_TEST_MODELS not set");
+            return;
+        };
+        let model_dir = PathBuf::from(root).join(MODEL_NAME);
+        if !model_dir.join("config.json").is_file() {
+            eprintln!("skipping: {MODEL_NAME} missing under KILN_TEST_MODELS");
+            return;
+        }
+        let model = ModelConfig {
+            id: MODEL_NAME.into(),
+            path: model_dir.to_string_lossy().into_owned(),
+            worker: WorkerKind::Auto,
+            pinned: false,
+            ttl_seconds: 0,
+            speculative: None,
+        };
+        let (kind, tokenizer) = resolve_worker(&model, &model_dir).expect("pinned MoE resolves");
+        assert_eq!(
+            kind,
+            WorkerKind::Rust,
+            "the pinned MoE proxy must route rust"
+        );
+        assert!(
+            tokenizer.is_some(),
+            "a rust route must carry the gateway-side tokenizer"
+        );
     }
 
     #[test]

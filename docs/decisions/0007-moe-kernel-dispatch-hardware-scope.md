@@ -1,7 +1,6 @@
 # ADR 0007: MoE kernel-dispatch verification is scoped to M4-class hardware; M3 Ultra deployment is a tracked, unverified gap
 
-- Status: recorded (directed by the 2026-07-25 MoE session-1 task; PM
-  ratification pending like any ADR)
+- Status: accepted (PM-directed, 2026-07-27)
 - Date: 2026-07-25 (MoE arc, session 1)
 - Relationship: the fifth instance of the structural pattern ADRs
   0002/0003/0004/0005 record — the pinned MLX selects between Metal

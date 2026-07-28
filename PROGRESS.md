@@ -8534,3 +8534,456 @@
   session 2 (quantization variants / second MoE architecture /
   worker="auto" MoE routing, per the arc plan). Open PM item: ADR 0007
   ratification (status "recorded", ratification pending).
+
+## [2026-07-27] Maintenance — automated build-cache pruning (out-of-band) — DONE
+- What: target/debug hit 63G; set up weekly automatic pruning so the build
+  cache stops needing manual attention. New `scripts/sweep-build-cache.sh`
+  (cargo sweep --time 14, skips if cargo/rustc running, logs size-capped to
+  ~/.kiln/logs/cargo-sweep.log) + launchd LaunchAgent
+  `com.kiln.build-cache-sweep` (~/Library/LaunchAgents, Mondays 09:30, local
+  machine only — not committed). CLAUDE.md gained a "Build cache pruning"
+  section so future sessions know this exists.
+- Decisions: cargo-sweep over scheduled `cargo clean` — removes only artifacts
+  untouched 14 days, so recent incremental state stays warm and the job is
+  safe to fire-and-forget. launchd over cron per macOS convention. Script
+  committed to the repo (other contributors will hit the same growth); plist
+  stays per-machine with setup steps in the script header.
+- Deviations: none (machine maintenance, no SPEC scope).
+- Acceptance:
+  ```
+  $ launchctl list | grep build-cache-sweep -> "- 0 com.kiln.build-cache-sweep"
+  $ launchctl start com.kiln.build-cache-sweep
+  ~/.kiln/logs/cargo-sweep.log:
+    ==== 2026-07-27 08:25:02 -0600 cargo-sweep (14d) ====
+    [INFO] Cleaned 18.10 GiB from "/Users/isaacmatta/KILN/target"
+    target/: 69378 MB -> 57149 MB (freed 12228 MB)
+  du -sh target: 68G before -> 56G after (debug 63G -> 54G)
+  ```
+- Next: unchanged — MoE arc session 2 (quantization variants / second MoE
+  architecture / worker="auto" MoE routing); open PM item: ADR 0007
+  ratification.
+
+## [2026-07-27] MoE arc / Session 2 / Task 2.1 — worker="auto" MoE routing — DONE
+- What:
+  - ADR 0007 ratified (PM ruling carried in the session-2 task — a one-time
+    authorization to edit the otherwise read-only `docs/decisions/`): the
+    Status line flipped from "recorded (... PM ratification pending like any
+    ADR)" to "accepted (PM-directed, 2026-07-27)". That one line is the
+    entire diff — `git diff docs/decisions/` = 1 insertion / 2 deletions,
+    the 2026-07-26 CI self-draft carve-out addendum byte-identical.
+    `docs/decisions/` is read-only again as of commit 4fe1b52.
+  - Ground truth checked before writing anything: `olmoe` has been in
+    `SUPPORTED_ARCHITECTURES` since session 1 and `resolve_worker` routes on
+    `ArchConfig::from_model_dir`, so a servable MoE checkpoint ALREADY took
+    the rust route. The gap was assertion, not behavior — no MoE-shaped
+    config had ever been pushed through the predicate or its rejection
+    paths. Tests only; the predicate needed no change, and that is a result
+    rather than an assumption (every new assertion passes against it
+    unmodified).
+  - `auto_prefers_rust_but_downgrades_without_tokenizer` now enumerates
+    `olmoe` alongside the five dense architectures, preserving the existing
+    from_json_str-accepts + downgrade-on-missing-tokenizer shape.
+  - New `auto_routes_unservable_moe_configs_to_python_with_a_named_reason`
+    (9 cases): unimplemented MoE families (`qwen2_moe`, `qwen3_moe`,
+    `phimoe`, `mixtral`, `deepseek_v3`), per-module quantization overrides
+    on an expert tensor and on the router tensor, non-affine mode,
+    out-of-matrix bits and group_size, an unimplemented rope variant on a
+    MoE config, and degenerate expert geometry (`num_experts = 0`). Each
+    asserts BOTH that it degrades to python (never a startup error, never a
+    panic) AND that `ArchConfig`'s reason names the actual cause.
+  - New `explicit_rust_on_an_unimplemented_moe_family_is_a_startup_error`:
+    the same five families stay a loud, family-naming `RustUnsupported`
+    under `worker = "rust"` — SPEC §12 Phase 6's two halves (transparent
+    under `auto`, impossible when explicitly demanded) both pinned.
+  - New `auto_routes_the_pinned_moe_checkpoint_to_rust`:
+    KILN_TEST_MODELS-gated, config + tokenizer only (no weights, no Metal).
+    The synthetic configs prove the matrix; this proves the matrix matches a
+    checkpoint that exists.
+- Decisions:
+  - Asserted the REASON TEXT, not just the routing outcome. The
+    "worker=auto resolved to python" log line is the operator's only
+    explanation for why their MoE model went to python, and "architecture"
+    vs. "rope variant" vs. "quantization" send them to three different
+    fixes; a test checking only `== Python` would pass on a predicate that
+    gave the wrong explanation.
+  - Included `num_experts = 0` (not in the task's list) because it is the
+    MoE-specific analogue of the existing load-time fail-loud cases: the one
+    MoE rejection that would otherwise surface as an opaque shape error
+    inside the expert dispatch on the first forward pass.
+  - The unimplemented-family cases carry a full MoE-shaped body on purpose.
+    `ArchConfig` dispatches on `model_type` BEFORE any field parsing, so
+    they must fail at the ARCHITECTURE check whatever expert-geometry keys
+    the family actually uses (`num_local_experts`, `n_routed_experts`, ...);
+    the assertion pins that ordering.
+- Deviations: none. ADR 0007 scope unchanged — routing is
+  device-independent, so nothing here touches the M4-verified surface.
+- Acceptance:
+  ```
+  $ cargo test -p kiln-gateway
+  test registry::tests::auto_prefers_rust_but_downgrades_without_tokenizer ... ok
+  test registry::tests::auto_routes_unservable_moe_configs_to_python_with_a_named_reason ... ok
+  test registry::tests::explicit_rust_on_an_unimplemented_moe_family_is_a_startup_error ... ok
+  test registry::tests::auto_routes_the_pinned_moe_checkpoint_to_rust ... ok
+  test result: ok. 133 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s
+
+  (First run of this suite showed 1 failure,
+  admin_register::tests::estimate_prices_local_dirs_against_the_live_budget —
+  `fits` = fits_budget && fits_system, and fits_system is a LIVE probe of
+  real machine memory, which was depressed by the concurrent 7.2 GB model
+  download. Verified environmental, not this change: it failed identically
+  on a stashed clean tree at HEAD, and passes above once the fetch settled.
+  Pre-existing fragility, noted rather than touched.)
+  ```
+- Next: task 2.2 (8-bit MoE quantization variant), same session.
+
+## [2026-07-27] MoE arc / Session 2 / Task 2.2 — 8-bit MoE quantization variant — DONE
+- What:
+  - Pin verified BEFORE anything else, at the stated revision:
+    `mlx-community/OLMoE-1B-7B-0125-Instruct-8bit` @
+    `7055a795fc029a51108f881d4a118c6f17deb59f` resolves, 2 shards, and its
+    `config.json` quantization block is uniform affine
+    `{group_size: 64, bits: 8}` — no per-module overrides, no `mode` key.
+    Same base model as the 4-bit proxy with identical geometry
+    (`num_experts` 64, `num_experts_per_tok` 8, `norm_topk_prob` false,
+    hidden 2048 / per-expert intermediate 1024, 16 layers), so the two cells
+    differ ONLY in `bits` — the qwen3-0.6b-4bit/8bit construction applied to
+    the expert path. The pin choice is sound; nothing to report there.
+  - ADR 0001 B1 re-verified before generating anything: the worker venv
+    reports mlx.core **0.31.1** (= gen-golden.py's `EXPECTED_MLX_CORE`, =
+    the MLX the vendored mlx-c v0.6.0 builds) and mlx-lm **0.31.2**. The
+    version guard PASSED rather than being bypassed.
+  - Pin added to `scripts/fetch-test-model.sh` with the reasoning comment
+    (8-bit cell of the MoE quantization matrix; same base model as the
+    4-bit proxy; ADR 0007 scope unchanged).
+  - Fixtures FIRST, from pure mlx-lm, before any Rust code ran against this
+    checkpoint: 6 fixtures into `tests/golden/olmoe-1b-7b-0125-8bit/`, the
+    same case set as the 4-bit dir. Cross-checked as genuinely 8-bit rather
+    than copied — the two cells' greedy streams diverge as early as token 0
+    (per case, first divergence index: 0, 0, 2, 4, 55, 61).
+  - **Zero architecture changes.** No per-expert layout, scales/biases
+    shape, shard-split or `switch_mlp.*`-vs-`experts.N.*` change was needed;
+    nothing under `crates/kiln-models/src/` was touched by this task.
+  - Incidental, worth the record: this is the FIRST multi-shard checkpoint
+    in the pinned test set (every other pin is a single `model.safetensors`),
+    so it is also the first real exercise of `WeightStore`'s
+    `model.safetensors.index.json` `weight_map` path. It worked unchanged.
+  - Engine posture re-asserted rather than assumed, and now pinned in the
+    harness: `golden.rs` prints `monolithic prefill` / `ADR 0005 envelope`
+    per fixture model and ASSERTS, for every `model_type == "olmoe"` dir,
+    that monolithic prefill is required and the envelope is `None`. Both
+    hold for the 8-bit checkpoint, inherited by architecture exactly as
+    `model.rs` dispatches them (`Self::Olmoe(_) => true` /
+    `Self::Olmoe(_) => return None`, unconditional in `bits`). A
+    quantization variant that somehow slipped the posture now fails here
+    instead of silently fine-chunking a MoE prefill or attaching a drafter
+    to an uncertified trunk. NOTE FOR SESSION 3: that assertion keys on the
+    literal `"olmoe"`, so adding a second MoE family means adding it there
+    too, or the new family's posture goes unasserted.
+- Measured — `calibrate_deterministic_width` (task step 5):
+  ```
+  == olmoe-1b-7b-0125-4bit: model_type=olmoe, 6 fixture(s), deterministic width 9, monolithic prefill true, ADR 0005 envelope None
+  == olmoe-1b-7b-0125-8bit: model_type=olmoe, 6 fixture(s), deterministic width 9, monolithic prefill true, ADR 0005 envelope None
+  ```
+  **9 at 8-bit, the same as 4-bit's 9** — reported as the probe measured it
+  on the loaded checkpoint, not pinned. Context that makes the result
+  legible rather than a coincidence: every quantized pin on this machine
+  calibrates to 9 (llama, qwen2, qwen3-4bit, qwen3-8bit, gemma2, gemma3,
+  both olmoe cells) and only the bf16 pin differs (smollm2 = 1). So on this
+  device the row-stability boundary tracks quantized-matmul kernel dispatch
+  generally, and moving the expert path from bits=4 to bits=8 did NOT move
+  it. M4-class measurement only (ADR 0007): it says nothing about where the
+  boundary sits on another GPU class, which is exactly why the width is
+  calibrated at load instead of tabled.
+- Decisions:
+  - Wired the pin into `PINS` plainly (a bare fetch pulls it) rather than
+    building a tier mechanism, because a tier mechanism IS option (A) of the
+    CI question below, and building it would have picked the answer the task
+    reserved for the PM. The consequence is stated honestly rather than
+    hidden: as wired, a bare `./scripts/fetch-test-model.sh` — exactly what
+    CI runs — now fetches 7.35 GB more and invalidates the model cache.
+    That is why the branch is held unpushed.
+  - Put the MoE posture assertion in `golden.rs` (which already loads every
+    fixture model and already calibrated the width) rather than adding a new
+    test file: it costs nothing and binds for every future MoE checkpoint
+    and quantization cell automatically.
+  - `CLAUDE.md`'s pinned-model list gained the 8-bit entry; that list mirrors
+    the script, and leaving it stale would have been drift introduced here.
+- Deviations: none. ADR 0007 scope unchanged — everything measured here
+  extends the M4-verified surface; the M3-Ultra-verified surface remains
+  empty by decision (3).
+- Acceptance:
+  ```
+  $ cargo test -p kiln-models --test golden
+  == gemma-2-2b-it-4bit:      width 9, monolithic prefill true,  envelope None
+  == gemma-3-1b-it-4bit:      width 9, monolithic prefill false, envelope Some(7)
+  == llama-3.2-1b-4bit:       width 9, monolithic prefill false, envelope Some(7)
+  == olmoe-1b-7b-0125-4bit:   width 9, monolithic prefill true,  envelope None
+  == olmoe-1b-7b-0125-8bit:   width 9, monolithic prefill true,  envelope None
+  == qwen2.5-0.5b-4bit:       width 9, monolithic prefill false, envelope Some(3)
+  == qwen3-0.6b-4bit:         width 9, monolithic prefill false, envelope Some(7)
+  == qwen3-0.6b-8bit:         width 9, monolithic prefill false, envelope Some(7)
+  == smollm2-135m-bf16:       width 1, monolithic prefill true,  envelope None
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1045.58s
+
+  GOLDEN COUNTS: 208/208 exact-match rounds = 52 fixtures x 9 model dirs'
+  worth x {sequential, width-16} x {gather, paged kernel}. Session 1's bar
+  was 184/184 over 46 fixtures; the new 8-bit dir adds exactly 24
+  (6 fixtures x 2 rounds x 2 attention paths), all exact. Leak baseline
+  held: golden.rs's closing `live_objects() == baseline` assertion passed
+  (the run is green), as did --test leak and --test leak_batched.
+
+  $ cargo test -p kiln-models --test batching --test calibration --test draft \
+      --test leak --test leak_batched --test preemption --test prefill_pad \
+      --test prefix_cache --test prefix_multiturn
+  batching   1 passed 17.12s     calibration 1 passed  7.57s
+  draft      1 passed  8.94s     leak        1 passed 16.23s
+  leak_batched 1 passed 64.88s   preemption  1 passed 27.91s
+  prefill_pad  1 passed 10.50s   prefix_cache 1 passed 12.95s
+  prefix_multiturn 1 passed 28.63s
+
+  $ cargo test -p kiln-models --test spec_decode
+  == olmoe-1b-7b-0125-8bit: 6 fixture(s), deterministic width 9, ADR 0005 envelope None, gamma effective 0
+  olmoe-1b-7b-0125-8bit self-draft:   speculation disabled (envelope None, width 9); plain-path outputs verified
+  olmoe-1b-7b-0125-8bit adversarial:  speculation disabled (envelope None, width 9); plain-path outputs verified
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 401.43s
+
+  $ cargo test -p kiln-gateway      -> 133 passed; 0 failed (task 2.1)
+  $ cargo fmt --check               -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings                    -> Finished, 2m 08s
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> Finished, 22.37s
+  $ cargo build --workspace --no-default-features                            -> Finished, 29.92s
+  $ ruff check python/ tests/e2e scripts        -> All checks passed!
+  $ ruff format --check python/ tests/e2e scripts -> 40 files already formatted
+  (ruff run through the worker venv as CI does; a bare `uvx ruff` pulls a
+  newer ruff with different default rules and reports 20 findings — not the
+  pinned gate.)
+  ```
+- Next: session 3 of the MoE arc (a second MoE architecture — `qwen2_moe` /
+  `qwen3_moe` — explicitly out of scope here). BLOCKING PM item first: the
+  CI decision below. The branch `claude/moe-session2` is held unpushed until
+  it is ruled on, so the first CI run is not the measurement.
+- DECISION NEEDED: how the 8-bit MoE pin and its fixtures reach CI. Nothing
+  is implemented, `.github/workflows/ci.yml` is untouched, no existing
+  assertion was weakened, and the branch is unpushed.
+
+  The collision, with this session's measurements:
+  (i)   CI runs `./scripts/fetch-test-model.sh` bare and caches
+        `~/.kiln/test-models` keyed on the script's hash. The new pin means
+        CI fetches +7.35 GB AND the key changes, so every other pinned model
+        is refetched once too.
+  (ii)  Hosted `macos-14` runners have ~7 GB RAM; the checkpoint is
+        7,352,886,621 bytes of safetensors. It cannot load there at all —
+        unlike the session-1 self-draft double-load this is not a slow path,
+        it is impossible.
+  (iii) `golden.rs` asserts every `tests/golden/<model>` dir has a model
+        under `KILN_TEST_MODELS` ("fixtures exist but the model is
+        missing"), and `spec_decode.rs` carries the identical assertion and
+        enumeration. Committed 8-bit fixtures therefore make BOTH suites
+        demand a model CI cannot hold.
+  (iv)  A dev-machine cost, MEASURED rather than predicted. spec_decode's
+        self-draft arm calls `DraftModel::load(model_dir, ...)` BEFORE it
+        discovers `gamma_effective == 0`, so an envelope-None MoE model is
+        still double-loaded: 2 x 7.35 GB = 14.71 GB against this machine's
+        17.18 GB (86% of physical RAM in weights alone, vs the carve-out's
+        stated design line of <= half of RAM = 8.59 GB here). I expected the
+        session-1 pathology; the measurement says otherwise — it COMPLETED.
+        spec_decode went 214.46s (session 1, same env-unset mode) ->
+        401.43s, i.e. ~187s added by the 8-bit dir, of which the 8-bit
+        segment itself was ~110s (header at 10:39:14, memory released
+        ~10:41:05). The machine did swap through that window (free% dipped
+        to 25%, vm_stat swapouts climbing) but there was no 62-minute crawl.
+        So: a headroom note, not a blocker — and worth stating plainly since
+        it contradicts the prediction, not the other way round.
+
+  Options:
+
+  (A) Named tier / default set in `fetch-test-model.sh`. Each pin carries a
+      tier; a bare run fetches the `default` tier (what CI calls), dev
+      fetches everything; golden.rs and the enumerating suites skip cleanly
+      and loudly on an absent tiered model.
+      + One mechanism covers both the fetch cost and the enumeration, for
+        every future oversized pin (a deployment-scale MoE checkpoint would
+        dwarf this one).
+      - Most moving parts, and it puts a skip path inside the keystone test.
+        The tier data must be machine-readable from the test side (a
+        manifest both the script and the suites read), or the suites cannot
+        tell "declared non-default" from "someone forgot to fetch".
+      Never-weaken exposure: HIGH. Crossing is avoided only if ABSENCE ALONE
+      NEVER AUTHORIZES A SKIP — a model must be positively declared
+      non-default in the manifest, and a fixture dir whose model is absent
+      without such a declaration must still hard-fail exactly as today. Dev
+      must keep fetching everything by default, so the full bar stays the
+      default experience and only CI opts down.
+
+  (B) Per-fixture-dir requirement marker consumed by the suites (fixtures
+      declare what they need; absence is a stated skip).
+      + The requirement lives next to the thing that has it, and it can
+        express (iv)'s double-load need as well as the single-load one.
+      - Does not address (i) at all: CI still downloads 7.35 GB it can never
+        use and still invalidates the cache, so it needs (A) anyway. Two
+        declarations (script pin + fixture marker) that can drift.
+      Never-weaken exposure: HIGHEST in spirit — the fixture directory would
+      declare its own exemption, and a future session could silence a real
+      failure by editing a marker. Crossing is avoided only if the marker
+      states a HARDWARE CAPABILITY the harness evaluates against the actual
+      machine (bytes of RAM required), never a boolean "optional"/"skip me",
+      and if a dir with no marker keeps the hard assertion.
+
+  (C) Keep the 8-bit fixtures out of `tests/golden/` entirely — own tree
+      (e.g. `tests/golden-xl/olmoe-1b-7b-0125-8bit/`), own env gate, pin
+      fetched via `--only` rather than by the bare run. Dev-machine-only by
+      construction.
+      + The only option under which NO existing assertion changes:
+        golden.rs keeps its exact current force over its exact current set,
+        and no enumeration learns a skip path.
+      + Disposes of (iv) for free — the 8-bit dir never enters spec_decode's
+        enumeration, so the dev machine meets the 14.71 GB double-load only
+        if something opts in explicitly.
+      + Honest about physics rather than working around it: a 7.35 GB
+        checkpoint is not a CI artifact on a 7 GB runner, and ADR 0007
+        already scopes CI's MoE role to "proxy-scale, foreign-device,
+        advisory" — CI presence for this cell would buy nothing even if the
+        runner could hold it, since ADR 0004 binds bit-exactness to the
+        generating device anyway.
+      - A dev-only tree can rot; nobody runs what CI does not.
+      Never-weaken exposure: LOWEST — nothing existing is relaxed. Rot is
+      the real risk, mitigated by putting the gated command in CLAUDE.md's
+      acceptance list (run every MoE session) and by making the gate FAIL
+      LOUDLY when it is set but the model is absent — the same
+      fixtures-imply-model assertion, scoped to the XL tree — so "on" means
+      fully bound and only "off" is a skip.
+
+  I would pick (C), plus the minimum piece of (A) needed to keep the pin out
+  of CI's bare fetch (an opt-in pin, not a general tier system). Reason: it
+  is the only option that leaves the keystone test's "fixtures exist =>
+  model present" assertion at full strength over an unchanged set. (A) and
+  (B) both convert a hard assertion into a conditional one, and every
+  conditional is somewhere a real regression can hide — which is precisely
+  what that assertion exists to prevent. If the PM expects more oversized
+  pins soon, (A) is the better investment instead, but then the manifest
+  must be the single source of truth for both the script and the suites,
+  under the positive-declaration rule above.
+
+  Whichever way this goes: the fixtures were generated into
+  `tests/golden/olmoe-1b-7b-0125-8bit/` as the task directed, so (C) means
+  moving that directory while (A)/(B) leave it where it is.
+
+## [2026-07-27] MoE arc / Session 2 follow-up — XL fixture tier (option C, PM-directed) — DONE
+- What: PM approved option (C) from the DECISION NEEDED block above —
+  dev-only fixture tree plus opt-in pin — and directed it as a small
+  dedicated change ahead of session 3.
+  - `tests/golden/olmoe-1b-7b-0125-8bit/` -> `tests/golden-xl/olmoe-1b-7b-0125-8bit/`
+    (git mv; all 6 fixtures byte-identical, not regenerated — git records
+    them as pure renames).
+  - `golden.rs`: the tree walk is now `run_fixture_tree(fixture_root,
+    models_root, fetch_hint)` — ONE implementation and ONE bar whichever
+    tree it is pointed at. `tests/golden/` is walked unconditionally exactly
+    as before, so its fixtures-imply-model assertion keeps full force over
+    an unchanged set; `tests/golden-xl/` is walked afterwards under
+    `KILN_GOLDEN_XL`. `fetch_hint` changes only the remedy printed with an
+    absence failure, since XL pins must be named explicitly to be fetched.
+  - The gate is the ONLY skip. Gated + model absent -> hard failure with the
+    same fixtures-imply-model text. Gated + `KILN_TEST_MODELS` unset ->
+    panic instead of the usual skip, because the operator asked for the
+    tier. `KILN_GOLDEN_XL=0` or empty is an explicit off.
+  - `scripts/fetch-test-model.sh`: a named `OPT_IN` list. A bare run (what
+    CI invokes) fetches the default set and skips opt-in pins; `--only
+    <name>` fetches them; `--list` now reports which set each pin is in.
+    Deliberately a named opt-out list, NOT option (A)'s general tier system
+    — that remains available if more oversized pins arrive.
+  - `CLAUDE.md`: the gated command is in the acceptance list marked DEV
+    MACHINES MUST RUN THIS (rot is option C's stated risk and CI can never
+    catch it), the golden-harness section states the XL tier's bar and which
+    fixtures belong where, the pinned-model entry documents the opt-in
+    fetch, and the repository map gains `tests/golden-xl`.
+- Findings — the acceptance run caught a bug I introduced, before it landed:
+  - My first cut added a SECOND `#[test]` for the XL tree. libtest runs test
+    functions in PARALLEL, so two threads drove MLX at once and the process
+    aborted: `-[_MTLCommandBuffer addCompletedHandler:]:1011: failed
+    assertion 'Completed handler provided after commit call'` (SIGABRT,
+    after 6 passing fixtures). That is exactly the CLAUDE.md FFI rule — all
+    MLX work on one thread, `Stream` is `!Send` — and it would also have
+    raced the two `live_objects()` leak baselines against each other. Fixed
+    by folding both trees into the one existing test function, called
+    sequentially; the reason is recorded in a comment at the test so nobody
+    re-splits it. Rejected the alternative (`--test-threads=1`): a flag
+    every caller must remember is a worse contract than a structure that
+    cannot be run wrong.
+- Net effect on CI: a bare fetch is back to the pre-session-2 default set,
+  so no recurring +7.35 GB; `tests/golden/` is back to its 8 directories, so
+  `golden.rs`, `spec_decode.rs` and `spec_probe.rs` enumerate exactly what
+  they did before session 2. The model cache key (`hashFiles` over the
+  script) does change because the script changed, so CI refetches the
+  default set ONCE — unavoidable for any script edit, and one-time rather
+  than per-run. Item (iv) of the decision block is disposed of as expected:
+  spec_decode no longer sees the 8-bit dir, so the dev machine never meets
+  the 14.71 GB double-load unless something opts in explicitly (measured
+  below: 401.43s -> 193.90s, back under session 1's 214.46s).
+- Decisions:
+  - Implemented the opt-in pin as well as the fixture move. The approved
+    recommendation was explicitly "(C) plus the minimum piece of (A) needed
+    to keep the pin out of CI's bare fetch"; the move alone would have left
+    CI still downloading 7.35 GB it cannot use — problem (i) unsolved.
+- Deviations: none. ADR 0007 scope unchanged; no fixture regenerated, no
+  existing assertion relaxed.
+- Acceptance (all against the final committed source):
+  ```
+  $ KILN_GOLDEN_XL=1 cargo test -p kiln-models --test golden
+  test result: ok. 1 passed; 0 failed; ... finished in 981.87s
+  208 exact-match rounds = 184 (tests/golden, 8 dirs) + 24 (tests/golden-xl,
+  the 8-bit MoE cell: 6 fixtures x {sequential, width-16} x {gather, paged
+  kernel}). Both trees' live_objects() leak baselines held.
+
+  $ cargo test -p kiln-models --test golden          # gate off = the CI shape
+  skipping tests/golden-xl: KILN_GOLDEN_XL not set (dev-machine tier; hosted
+    CI runners cannot load these checkpoints)
+  test result: ok. 1 passed; 0 failed; ... finished in 727.65s
+  184 exact-match rounds over the 8 tests/golden dirs.
+
+  FAIL-LOUD, gated (the property option C depends on):
+  $ KILN_GOLDEN_XL=1 KILN_TEST_MODELS=<farm with the 8 default models, no 8-bit>
+    cargo test -p kiln-models --test golden
+  panicked at crates/kiln-models/tests/golden.rs:412:
+  fixtures exist for olmoe-1b-7b-0125-8bit but the model is missing under
+  KILN_TEST_MODELS — run ./scripts/fetch-test-model.sh --only <name> (XL pins
+  are opt-in and are NOT fetched by a bare run)
+  test result: FAILED. 0 passed; 1 failed; ... finished in 719.55s
+  (reached only AFTER the main tree passed — the XL walk is genuinely
+  binding, not short-circuited)
+
+  $ KILN_GOLDEN_XL=1 (KILN_TEST_MODELS unset) cargo test -p kiln-models --test golden
+  panicked: KILN_GOLDEN_XL is set but KILN_TEST_MODELS is not — the XL tier
+  needs both
+  test result: FAILED. 0 passed; 1 failed
+
+  $ cargo test -p kiln-models --test spec_decode
+  8 model dirs enumerated (pre-session-2 set; no 8-bit double-load)
+  test result: ok. 1 passed; 0 failed; ... finished in 193.90s
+
+  $ ./scripts/fetch-test-model.sh --list
+  llama-3.2-1b-4bit      ... [default]      qwen3-0.6b-4bit    ... [default]
+  gemma-3-1b-it-4bit     ... [default]      smollm2-135m-bf16  ... [default]
+  qwen2.5-0.5b-4bit      ... [default]      gemma-2-2b-it-4bit ... [default]
+  qwen3-0.6b-8bit        ... [default]      olmoe-1b-7b-0125-4bit ... [default]
+  olmoe-1b-7b-0125-8bit  ... [opt-in (--only olmoe-1b-7b-0125-8bit)]
+
+  $ cargo fmt --check                                                        -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings                    -> Finished
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings -> Finished
+  $ cargo build --workspace --no-default-features                            -> Finished
+  $ ruff check / ruff format --check (worker venv)  -> All checks passed! / 40 formatted
+  (clippy's first pass flagged `ptr_arg` on `run_fixture_tree`'s `&PathBuf`
+  params; changed to `&Path` and both golden runs above were re-run against
+  the corrected source.)
+
+  The llama-only model-gated suites (batching, calibration, draft, leak,
+  leak_batched, preemption, prefill_pad, prefix_cache, prefix_multiturn) are
+  untouched by this change — no golden-tree walk, fixed MODEL_NAME constants
+  — and were green at the previous commit; not re-run.
+  ```
+- Next: session 3 of the MoE arc — a second MoE architecture (`qwen2_moe` /
+  `qwen3_moe`). Carry into its task list explicitly: golden.rs's MoE posture
+  assertion keys on the literal `"olmoe"`, so a new family must be added
+  there or its monolithic-prefill / envelope-None posture goes unasserted;
+  and new-family fixtures belong in `tests/golden/` unless the checkpoint is
+  too large for a ~7 GB hosted runner, in which case `tests/golden-xl/`.

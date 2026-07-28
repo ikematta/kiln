@@ -37,7 +37,7 @@
 #![cfg(feature = "metal")]
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -68,6 +68,15 @@ struct Fixture {
 fn golden_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden")
 }
+
+/// The XL fixture tree: same bar, checkpoints too large for hosted CI.
+fn golden_xl_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden-xl")
+}
+
+/// Gate for the XL tree. Set on dev machines; never set on CI, whose
+/// runners cannot hold these checkpoints at all.
+const XL_GATE: &str = "KILN_GOLDEN_XL";
 
 type Collected = (Rc<RefCell<Vec<u32>>>, Rc<RefCell<Option<FinishSummary>>>);
 
@@ -223,10 +232,33 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
         .calibrate_deterministic_width(&stream)
         .expect("calibrates");
     eprintln!(
-        "== {model_name}: model_type={}, {} fixture(s), deterministic width {det_width}",
+        "== {model_name}: model_type={}, {} fixture(s), deterministic width {det_width}, \
+         monolithic prefill {}, ADR 0005 envelope {:?}",
         model.model_type(),
-        fixture_paths.len()
+        fixture_paths.len(),
+        model.monolithic_prefill_required(),
+        model.speculative_gamma_bound(),
     );
+    // ADR 0007 decision (4): the MoE engine posture is keyed on the
+    // ARCHITECTURE, so every MoE checkpoint inherits it whatever its
+    // quantization — reference-shaped prefill (the pad rule's empirical
+    // base excludes expert routing) and no speculation (the
+    // gather_qmm/SwitchGLU family has no kernel-class certificate).
+    // Asserted per fixture model rather than assumed from the enum
+    // dispatch, so a quantization variant that somehow slipped the
+    // posture would fail here instead of silently fine-chunking a MoE
+    // prefill or attaching a drafter to an uncertified trunk.
+    if model.model_type() == "olmoe" {
+        assert!(
+            model.monolithic_prefill_required(),
+            "{model_name}: MoE trunks take reference-shaped prefill (model.rs)"
+        );
+        assert_eq!(
+            model.speculative_gamma_bound(),
+            None,
+            "{model_name}: MoE targets are outside the ADR 0005 envelope"
+        );
+    }
     let fixtures: Vec<(String, Fixture, Vec<u32>)> = fixture_paths
         .iter()
         .map(|path| {
@@ -344,20 +376,22 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
     }
 }
 
-#[test]
-fn greedy_parity_is_exact_for_every_fixture_model() {
-    if !kiln_mlx::memory::metal_is_available() {
-        eprintln!("skipping: no Metal device");
-        return;
-    }
-    let Some(root) = std::env::var_os("KILN_TEST_MODELS") else {
-        eprintln!("skipping: KILN_TEST_MODELS not set");
-        return;
-    };
-    let root = PathBuf::from(root);
-
-    let mut model_names: Vec<String> = std::fs::read_dir(golden_root())
-        .expect("tests/golden exists")
+/// Proves parity for every fixture-model directory under `fixture_root`,
+/// against the checkpoints under `models_root`.
+///
+/// The bar is identical whichever tree it is pointed at, and in particular
+/// A FIXTURE DIRECTORY WHOSE MODEL IS ABSENT IS A FAILURE, never a skip:
+/// fixtures and `fetch-test-model.sh` must not drift apart. `fetch_hint`
+/// only changes the remedy printed with that failure, because the XL tree's
+/// pins are opt-in and need naming explicitly.
+fn run_fixture_tree(fixture_root: &Path, models_root: &Path, fetch_hint: &str) {
+    let tree = fixture_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("?")
+        .to_owned();
+    let mut model_names: Vec<String> = std::fs::read_dir(fixture_root)
+        .unwrap_or_else(|err| panic!("tests/{tree} exists: {err}"))
         .filter_map(|entry| {
             let entry = entry.expect("readable dir entry");
             entry
@@ -367,17 +401,20 @@ fn greedy_parity_is_exact_for_every_fixture_model() {
         })
         .collect();
     model_names.sort();
-    assert!(!model_names.is_empty(), "no golden fixture directories");
+    assert!(
+        !model_names.is_empty(),
+        "no golden fixture directories under tests/{tree}"
+    );
 
     let baseline = debug::live_objects();
     for model_name in &model_names {
-        let model_dir = root.join(model_name);
+        let model_dir = models_root.join(model_name);
         assert!(
             model_dir.join("config.json").is_file(),
             "fixtures exist for {model_name} but the model is missing under \
-             KILN_TEST_MODELS — run ./scripts/fetch-test-model.sh"
+             KILN_TEST_MODELS — run {fetch_hint}"
         );
-        let mut fixture_paths: Vec<PathBuf> = std::fs::read_dir(golden_root().join(model_name))
+        let mut fixture_paths: Vec<PathBuf> = std::fs::read_dir(fixture_root.join(model_name))
             .expect("fixture dir readable")
             .filter_map(|entry| {
                 let path = entry.expect("readable dir entry").path();
@@ -387,13 +424,74 @@ fn greedy_parity_is_exact_for_every_fixture_model() {
         fixture_paths.sort();
         assert!(
             !fixture_paths.is_empty(),
-            "no fixtures under tests/golden/{model_name}"
+            "no fixtures under tests/{tree}/{model_name}"
         );
         run_model(model_name, &model_dir, &fixture_paths);
     }
     assert_eq!(
         debug::live_objects(),
         baseline,
-        "golden run leaked mlx handles"
+        "golden run over tests/{tree} leaked mlx handles"
     );
+}
+
+/// Whether the XL tier was asked for. Empty or `0` is an explicit "off",
+/// so the gate can be cleared without unsetting it.
+fn xl_tier_requested() -> bool {
+    match std::env::var_os(XL_GATE) {
+        Some(value) => !(value.is_empty() || value == "0"),
+        None => false,
+    }
+}
+
+/// Both fixture trees run in ONE test function on purpose. MLX work must be
+/// issued from a single thread (CLAUDE.md FFI discipline; `Stream` is
+/// `!Send`), and libtest runs test functions in parallel — a second `#[test]`
+/// here aborted the process on `_MTLCommandBuffer addCompletedHandler:
+/// Completed handler provided after commit call` and would also have made
+/// the two `live_objects()` leak baselines race. Sequential calls keep one
+/// MLX thread and one coherent baseline per tree.
+#[test]
+fn greedy_parity_is_exact_for_every_fixture_model() {
+    let xl = xl_tier_requested();
+    if !kiln_mlx::memory::metal_is_available() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let Some(root) = std::env::var_os("KILN_TEST_MODELS") else {
+        // Deliberately NOT a skip when the XL tier was explicitly asked
+        // for: the operator requested it, so a missing models root is a
+        // misconfiguration to surface rather than swallow.
+        assert!(
+            !xl,
+            "{XL_GATE} is set but KILN_TEST_MODELS is not — the XL tier needs both"
+        );
+        eprintln!("skipping: KILN_TEST_MODELS not set");
+        return;
+    };
+    let root = PathBuf::from(root);
+
+    run_fixture_tree(&golden_root(), &root, "./scripts/fetch-test-model.sh");
+
+    // The XL tier (PROGRESS 2026-07-27, PM-directed option C): fixture
+    // models whose checkpoints cannot be hosted on CI at all — the 7.35 GB
+    // 8-bit MoE cell against ~7 GB runners. Keeping them out of
+    // `tests/golden/` is what lets the tree above keep its
+    // fixtures-imply-model assertion at full strength over an unchanged
+    // set, instead of teaching the keystone test a skip path a genuinely
+    // missing model could hide behind. The gate is the ONLY skip: once
+    // set, the XL tree is exactly as binding as the main one.
+    if xl {
+        run_fixture_tree(
+            &golden_xl_root(),
+            &root,
+            "./scripts/fetch-test-model.sh --only <name> (XL pins are opt-in \
+             and are NOT fetched by a bare run)",
+        );
+    } else {
+        eprintln!(
+            "skipping tests/golden-xl: {XL_GATE} not set (dev-machine tier; \
+             hosted CI runners cannot load these checkpoints)"
+        );
+    }
 }
