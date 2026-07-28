@@ -329,6 +329,31 @@ message WorkerStats {
   uint64 engine_steps_total = 16;
   double engine_step_overhead_us_p50 = 17;        // non-GPU overhead per step
   double engine_step_overhead_us_p99 = 18;
+  // Queue depth (SPEC §6.1 lifecycle), gauges: the engine's own WAITING /
+  // RUNNING counts — kiln-engine `num_waiting()` / `num_running()` — as
+  // published by the last engine tick. Added 2026-07-28 (queue-depth
+  // metrics change request) — ADDITIVE, per the compatibility rules above.
+  //
+  // Staleness: heartbeat-cadence mirrors, exactly like every other field
+  // in this message. The engine republishes them at the end of each step
+  // and the gateway polls Stats on its health interval (default 1s), so a
+  // scraped value is up to one poll old and is never a live read of the
+  // engine. Same caveat class as MemoryReport.mlx_live_objects: fine to
+  // report and alert on trends, not a value to compute admission against.
+  //
+  // NOT the same number as HealthStatus.requests_waiting (field 3), which
+  // additionally counts submissions accepted by gRPC but not yet drained
+  // into the engine; Health is therefore >= this field for the one engine
+  // iteration it takes to drain an arriving burst. This field is
+  // deliberately engine-only — it is the admission-backpressure signal.
+  //
+  // Python worker: 0. It does not serve Stats at all (UNIMPLEMENTED; the
+  // gateway stops polling after the first such reply), so these read 0
+  // there like every other WorkerStats field — a python-served model's
+  // queue depth is on HealthStatus instead. Worker parity is separately
+  // scoped: 0 from a python-served model is not a bug.
+  uint64 requests_waiting = 19;                   // gauge
+  uint64 requests_running = 20;                   // gauge
 }
 
 // ---------------------------------------------------------------------------

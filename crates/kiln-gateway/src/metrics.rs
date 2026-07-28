@@ -151,6 +151,8 @@ pub struct WorkerStatGauges {
     spec_tokens_proposed_total: IntGaugeVec,
     spec_tokens_accepted_total: IntGaugeVec,
     engine_steps_total: IntGaugeVec,
+    requests_waiting: IntGaugeVec,
+    requests_running: IntGaugeVec,
 }
 
 impl WorkerStatGauges {
@@ -189,6 +191,8 @@ impl WorkerStatGauges {
             stats.spec_tokens_accepted_total,
         );
         set(&self.engine_steps_total, stats.engine_steps_total);
+        set(&self.requests_waiting, stats.requests_waiting);
+        set(&self.requests_running, stats.requests_running);
     }
 }
 
@@ -440,6 +444,19 @@ impl Metrics {
                 "kiln_worker_engine_steps_total",
                 "Engine iterations (worker lifetime)",
             )?,
+            // Queue depth (SPEC §6.1). Engine WAITING/RUNNING as of the
+            // worker's last engine tick, sampled at the poll cadence —
+            // see the proto fields for the staleness contract. Absent for
+            // a python-served model: it does not implement Stats, so the
+            // supervisor stops polling and never records this series.
+            requests_waiting: stat(
+                "kiln_worker_requests_waiting",
+                "Requests queued in the engine WAITING state (incl. preempted)",
+            )?,
+            requests_running: stat(
+                "kiln_worker_requests_running",
+                "Requests currently prefilling or decoding",
+            )?,
         };
 
         Ok(Self {
@@ -550,6 +567,8 @@ mod tests {
             spec_tokens_proposed_total: 96,
             spec_tokens_accepted_total: 64,
             engine_steps_total: 1234,
+            requests_waiting: 5,
+            requests_running: 3,
             ..WorkerStats::default()
         };
         metrics.worker_stats.record("m", &stats);
@@ -562,6 +581,26 @@ mod tests {
             "kiln_worker_spec_tokens_proposed_total{model=\"m\"} 96",
             "kiln_worker_spec_tokens_accepted_total{model=\"m\"} 64",
             "kiln_worker_engine_steps_total{model=\"m\"} 1234",
+            "kiln_worker_requests_waiting{model=\"m\"} 5",
+            "kiln_worker_requests_running{model=\"m\"} 3",
+        ] {
+            assert!(text.contains(needle), "missing {needle} in:\n{text}");
+        }
+        // Queue depth is a gauge, not a lifetime total: a later snapshot
+        // must be able to bring it back down (the totals above only ever
+        // climb, so nothing else in this test covers the descent).
+        metrics.worker_stats.record(
+            "m",
+            &WorkerStats {
+                requests_waiting: 0,
+                requests_running: 1,
+                ..stats
+            },
+        );
+        let text = metrics.encode().expect("encode");
+        for needle in [
+            "kiln_worker_requests_waiting{model=\"m\"} 0",
+            "kiln_worker_requests_running{model=\"m\"} 1",
         ] {
             assert!(text.contains(needle), "missing {needle} in:\n{text}");
         }
