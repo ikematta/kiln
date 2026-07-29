@@ -9653,3 +9653,67 @@
   entry is above. Only this forward pointer was touched; nothing
   recording what happened was altered.)
 
+
+## [2026-07-29] Phase 10 follow-up / admin UI — PR #47 MERGED; CI timing recorded; soak gate did NOT recur — DONE
+- What: merged on green per the PM's "merge on green" instruction. PR #47
+  merged with `--merge` (not squash, same as #43/#44/#45/#46 — the
+  PROGRESS commit references stay valid on main); merge commit 9dc1d1d,
+  feature commits 70a6cb8 + 0ba4cac, merge-of-main f00f6b7.
+- CI, run 30418605396 (head f00f6b7): **all four checks passed on the
+  first attempt, no re-runs.** lint 41s, compile-linux 48s,
+  test-macos-release 5m24s, test-macos 1h15m6s (vs the 1h17m16s of run
+  30377498688 and the 1h19m12s baseline; model cache hit —
+  fetch-test-model.sh untouched here).
+- **The soak crash-restart gate did NOT fire.** This matters as the first
+  data point after the PR #45 entry recorded that gate firing for the
+  first time ever, left it explicitly unexplained, and set the standing
+  instruction that a second firing is to be treated as real signal rather
+  than re-run past. It did not recur here. That is one clean run, NOT an
+  explanation: the #45 firing remains unexplained, and the standing
+  instruction stands. Worth noting that this PR was a favourable test of
+  it — the diff contains no engine, model, or python-worker code at all,
+  so a firing here would have been strong evidence for the environmental
+  reading, and its absence is correspondingly weak evidence for anything.
+  `Upload soak gateway log (failures only)` (new, from PR #46) correctly
+  skipped, the soak having passed — so the artifact path itself is still
+  unexercised on a real failure.
+- ADR 0004 record: the advisory golden lane failed again on
+  gemma-3-1b-it-4bit/chat-basic — same fixture, same first-divergence
+  shape, now the fifth consecutive run (30191249436 / 30241628948 /
+  30326248951 / 30377498688 / this one). No pattern change, which is the
+  only property that carries signal; continue-on-error by design, did not
+  gate. **Method note for future readers: do NOT read this lane's status
+  out of the jobs API.** A `continue-on-error` step reports
+  `conclusion=success` there even when its command exited non-zero, so
+  the step showed green while `cargo test --test golden` had in fact
+  reported `test result: FAILED. 0 passed; 1 failed`. The lane's real
+  verdict is only in the step log.
+- The new admin-UI e2e ran on the real runner inside the blocking E2E
+  step and passed, i.e. the queue-depth/counters/KV assertions hold on a
+  macos-14 paravirtual GPU as well as on a dev M4. The local determinism
+  caveat recorded in the entry above (the victim request escaping its
+  TTFT budget on fast hardware, leaving the timeout counter to burst
+  stragglers) did not bite here.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ gh pr checks 47
+    lint               pass  41s
+    compile-linux      pass  48s
+    test-macos-release pass  5m24s
+    test-macos         pass  1h15m6s
+  $ gh pr merge 47 --merge -> MERGED 2026-07-29T04:23:13Z, merge commit 9dc1d1d
+  $ git log --oneline -1 origin/main -> 9dc1d1d Merge pull request #47
+
+  test-macos steps, all success (incl. the blocking ones):
+    Model-gated suites (device-independent, blocking)     success
+    E2E suite (... + admin UI browser flow)               success
+    Full-stack soak (30 min mixed load, blocking)         success
+    Upload soak gateway log (failures only)               skipped
+  advisory lane, true verdict from the step log (not the API):
+    golden gemma-3-1b-it-4bit/chat-basic -> divergence, test result: FAILED
+  ```
+- Next: unchanged — session 3 of the MoE arc (`qwen2_moe` / `qwen3_moe`)
+  with the three carry-ins from the PR #44 entry (golden.rs's
+  `"olmoe"`-keyed posture assertion; fixture tier choice; dev machines
+  must run the `KILN_GOLDEN_XL=1` golden tier).
