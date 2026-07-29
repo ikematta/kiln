@@ -19,6 +19,7 @@ import contextlib
 import os
 import re
 import subprocess
+import threading
 
 import httpx
 import pytest
@@ -33,6 +34,7 @@ from conftest import (
 )
 from test_add_model import add_stack, assert_only_inserted, dir_hub
 from test_admin_jobs import STUB_FILES, STUB_SHA, stub_hub  # noqa: F401 (fixture)
+from test_priority import prompt_for
 
 ADMIN_TOKEN = "kiln-e2e-ui-admin-token"
 
@@ -101,6 +103,239 @@ def connect(page, base_url: str, token: str) -> None:
     page.goto(f"{base_url}/ui/")
     page.get_by_test_id("token-input").fill(token)
     page.get_by_test_id("connect").click()
+
+
+# --- live queue depth + gateway counters -----------------------------------
+
+RL_KEY = "kiln-e2e-ui-ratelimited-key"  # rpm = 1, dedicated to this test
+# TTFT budget, and the burst that must overrun it. kiln-engine admits at
+# most one prefilling request at a time, so a burst of distinct
+# ~1150-token prompts is drained one prefill per step: the tail of a
+# 16-deep burst waits for fifteen prefills before its own, which is well
+# past 5s on any hardware this suite runs on (measured on an M4: members
+# 9+ of a 12-deep burst already overran it). That is what makes the
+# timeout counter fire from real queueing rather than from a sleep.
+UI_TTFT_S = 5
+UI_FLOOD_STREAMS = 16
+UI_FLOOD_MAX_TOKENS = 768
+# Waiting >= 1 with any running count: "2 / 10". Anchored so a leading zero
+# (an empty queue) cannot match.
+QUEUE_NONEMPTY = re.compile(r"^[1-9]\d* / \d+$")
+
+
+@contextlib.contextmanager
+def counters_stack():
+    """Rust-worker stack with the admin surface enabled, a TTFT budget, and
+    a dedicated rpm=1 key — everything needed to drive the three gateway
+    counters and the engine queue for real."""
+    gateway = build_binaries()
+
+    def hashed(raw: str) -> str:
+        return subprocess.run(
+            [gateway, "hash-key", raw], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    # ttft_timeout_secs belongs to [server], so it must precede the [auth]
+    # table this appends (running_stack splices this in after [server]'s
+    # own keys).
+    extra = (
+        f"ttft_timeout_secs = {UI_TTFT_S}\n"
+        f'[auth]\nadmin_token_hash = "{hashed(ADMIN_TOKEN)}"\n'
+        f'[[auth.api_keys]]\nname = "ui-rl"\nkey_hash = "{hashed(RL_KEY)}"\nrpm = 1\n'
+    )
+    with running_stack([(MODEL_ID, "rust")], extra_toml=extra) as stack:
+        stack.wait_ready()
+        yield stack
+
+
+def metric_total(text: str, name: str) -> float:
+    """Sum of every series of `name` in a /metrics scrape — the same number
+    the dashboard shows as a counter's total."""
+    total = 0.0
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        head, _, value = line.rpartition(" ")
+        if head == name or head.startswith(f"{name}{{"):
+            total += float(value)
+    return total
+
+
+def hold_stream(stack, tag: str, stop: threading.Event) -> None:
+    """One flood member: a real streaming completion held open until `stop`,
+    then abandoned mid-generation (the gateway cancels on disconnect, the
+    same as any client going away)."""
+    try:
+        with httpx.stream(
+            "POST",
+            f"{stack.base_url}/v1/completions",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={
+                "model": stack.model_id,
+                "prompt": prompt_for(tag),
+                "max_tokens": UI_FLOOD_MAX_TOKENS,
+                "stream": True,
+                # No priority: every member and the victim below are one
+                # class, so the surplus genuinely queues instead of
+                # preempting its way in.
+                "temperature": 0,
+            },
+            timeout=httpx.Timeout(10.0, read=600.0),
+        ) as response:
+            if response.status_code != 200:
+                response.read()
+                return
+            for _ in response.iter_lines():
+                if stop.is_set():
+                    return
+    except httpx.HTTPError:
+        return  # a timed-out or cancelled member is fine; the load is real
+
+
+def test_admin_ui_live_queue_depth_and_gateway_counters(browser_page):
+    """Queue depth and gateway counters in the live view, under REAL load.
+
+    The wiring is not the bar — the numbers moving is. A dozen concurrent
+    streams are pushed through the actual API while the dashboard is open,
+    and the UI must show the engine's own WAITING/RUNNING counts climbing
+    off zero and falling back to it, with no reload. The three gateway
+    counters are driven the same way: genuine 429s from an rpm=1 key and a
+    genuine 504 from a request that queues past its TTFT budget.
+
+    Cross-checked against /metrics: the SSE payload and the scrape are two
+    exposures of the same counters and must agree.
+    """
+    from playwright.sync_api import expect
+
+    if model_dir() is None:
+        pytest.skip(
+            f"pinned test model '{MODEL_ID}' not found; run "
+            "./scripts/fetch-test-model.sh"
+        )
+    page = browser_page
+    with counters_stack() as stack:
+        connect(page, stack.base_url, ADMIN_TOKEN)
+        expect(page.get_by_test_id("connected")).to_be_visible()
+
+        # Idle baseline. "0 / 0" (not the "–" placeholder) proves the field
+        # is genuinely arriving from worker Stats, not merely absent.
+        queue = page.get_by_test_id(f"queue-{MODEL_ID}")
+        expect(queue).to_have_text("0 / 0", timeout=15_000)
+
+        # The counters section is present and honestly zero before anything
+        # has fired, and says out loud that these are cumulative.
+        expect(page.get_by_test_id("counters-note")).to_contain_text("cumulative")
+        rate_limited = page.get_by_test_id("counter-total-kiln_rate_limited_total")
+        timed_out = page.get_by_test_id("counter-total-kiln_timeout_total")
+        uncovered = page.get_by_test_id(
+            "counter-total-kiln_admission_uncovered_bytes_total"
+        )
+        expect(rate_limited).to_have_text("0")
+        expect(timed_out).to_have_text("0")
+        expect(uncovered).to_have_text("0")
+
+        stop = threading.Event()
+        threads = [
+            threading.Thread(
+                target=hold_stream, args=(stack, f"ui-flood-{i}", stop), daemon=True
+            )
+            for i in range(UI_FLOOD_STREAMS)
+        ]
+        # Submitted behind the whole burst, so it is the last request the
+        # engine can admit — the deterministic end of the TTFT overrun.
+        # Runs on its own thread: it blocks until its 504, and the queue
+        # observation below must not wait for that.
+        victim: list[int] = []
+
+        def submit_victim() -> None:
+            try:
+                response = httpx.post(
+                    f"{stack.base_url}/v1/completions",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                    json={
+                        "model": stack.model_id,
+                        "prompt": prompt_for("ui-victim"),
+                        "max_tokens": 32,
+                        "temperature": 0,
+                    },
+                    timeout=180,
+                )
+                victim.append(response.status_code)
+            except httpx.HTTPError:
+                pass
+
+        victim_thread = threading.Thread(target=submit_victim, daemon=True)
+        try:
+            for thread in threads:
+                thread.start()
+            victim_thread.start()
+
+            # THE POINT: the live view shows a non-empty engine queue while
+            # the flood is in flight — the burst arrives together and the
+            # engine drains it one prefill at a time.
+            expect(queue).to_have_text(QUEUE_NONEMPTY, timeout=90_000)
+            observed = queue.inner_text().strip()
+            print(
+                f"admin UI queue depth under a {UI_FLOOD_STREAMS}-deep "
+                f"flood: {observed}"
+            )
+            waiting, running = (int(part) for part in observed.split(" / "))
+            assert waiting >= 1 and running >= 1, observed
+            # Sanity bound, not a tight one: the flood plus the victim is
+            # everything this test has in flight.
+            assert waiting + running <= UI_FLOOD_STREAMS + 2, (
+                f"queue depth {observed} exceeds the requests in flight"
+            )
+
+            victim_thread.join(timeout=180)
+            print(f"victim submitted behind the burst returned {victim}")
+
+            # Rate limiting: an rpm=1 key spends its single request, then
+            # every further call is a 429 counted against the key.
+            statuses = []
+            for _ in range(3):
+                response = httpx.post(
+                    f"{stack.base_url}/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {RL_KEY}"},
+                    json={
+                        "model": stack.model_id,
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "max_tokens": 1,
+                    },
+                    timeout=120,
+                )
+                statuses.append(response.status_code)
+            assert 429 in statuses, f"rpm=1 key was never limited: {statuses}"
+
+            # Both counters climb in the dashboard itself, with no reload.
+            # (Timeouts here are the victim's 504 and the burst tail's —
+            # every one of them a request that really did wait too long.)
+            expect(rate_limited).not_to_have_text("0", timeout=15_000)
+            expect(timed_out).not_to_have_text("0", timeout=15_000)
+            # Never-fired counter stays an honest zero, byte-formatted.
+            expect(uncovered).to_have_text("0")
+
+            # The two exposures agree: what the dashboard renders is what a
+            # scrape of the same counter reports.
+            scrape = stack.metrics_text()
+            for locator, name in (
+                (rate_limited, "kiln_rate_limited_total"),
+                (timed_out, "kiln_timeout_total"),
+            ):
+                shown = float(locator.inner_text().strip())
+                assert shown >= 1, f"{name} rendered {shown}"
+                assert shown == metric_total(scrape, name), (
+                    f"{name}: UI shows {shown}, /metrics totals "
+                    f"{metric_total(scrape, name)}"
+                )
+        finally:
+            stop.set()
+            for thread in threads + [victim_thread]:
+                thread.join(timeout=180)
+
+        # Released: the queue drains back to empty in the live view — the
+        # numbers track the engine down as well as up.
+        expect(queue).to_have_text("0 / 0", timeout=120_000)
 
 
 def test_admin_ui_full_operator_flow(browser_page, stub_hub):  # noqa: F811

@@ -10,6 +10,10 @@
 	let banner = $state(''); // verbatim API error message, when any
 	let models = $state([]);
 	let memory = $state(null);
+	// Gateway-level counters, from the same SSE snapshot as everything
+	// else. Null until the first frame — /admin/models carries the models
+	// table and the memory ledger, but counters ride the live stream only.
+	let gateway = $state(null);
 	let jobs = $state([]);
 	let jobsError = $state('');
 	let download = $state({ repo: '', revision: '', dest: '' });
@@ -109,6 +113,7 @@
 						const snapshot = JSON.parse(data);
 						models = snapshot.models;
 						memory = snapshot.memory;
+						gateway = snapshot.gateway;
 					}
 				}
 			} catch {
@@ -185,6 +190,36 @@
 
 	function mib(bytes) {
 		return bytes ? `${(bytes / (1024 * 1024)).toFixed(0)} MiB` : '0';
+	}
+
+	// Engine queue depth (worker Stats): WAITING / RUNNING. Distinct from
+	// the 'reqs' column, which is worker Health — that one also counts
+	// submissions accepted by gRPC but not yet drained into the engine.
+	// A worker that does not implement Stats (the python worker) has no
+	// stats block at all, so it shows the same '–' placeholder as a
+	// worker that is down.
+	function queueDepth(model) {
+		if (!model.stats) return '–';
+		return `${model.stats.requests_waiting} / ${model.stats.requests_running}`;
+	}
+
+	// Counter values render by declared unit — byte counters as MiB,
+	// everything else as a plain count.
+	function counterValue(counter, value) {
+		return counter.unit === 'bytes' ? mib(value) : String(value);
+	}
+
+	// One counter's per-label-set breakdown, e.g. 'key=ops scope=requests 3'.
+	function counterBreakdown(counter) {
+		if (!counter.series.length) return 'none';
+		return counter.series
+			.map((sample) => {
+				const labels = Object.entries(sample.labels)
+					.map(([name, value]) => `${name}=${value}`)
+					.join(' ');
+				return `${labels} ${counterValue(counter, sample.value)}`;
+			})
+			.join(', ');
 	}
 
 	// Plain human size for the add-model estimate ("needs ~4.2 GB").
@@ -343,13 +378,45 @@
 			</section>
 		{/if}
 
+		{#if gateway}
+			<section>
+				<h2>gateway counters</h2>
+				<p class="hint" data-testid="counters-note">
+					cumulative totals since gateway start — these only ever climb; they are not
+					live values like the numbers above
+				</p>
+				<table>
+					<thead>
+						<tr><th>counter</th><th>total</th><th>breakdown</th></tr>
+					</thead>
+					<tbody>
+						{#each gateway.counters as counter (counter.name)}
+							<tr data-testid="counter-{counter.name}">
+								<td>{counter.name}</td>
+								<td data-testid="counter-total-{counter.name}">
+									{counterValue(counter, counter.total)}
+								</td>
+								<td class="detail">{counterBreakdown(counter)}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</section>
+		{/if}
+
 		<section>
 			<h2>models</h2>
 			<table>
 				<thead>
 					<tr>
 						<th>id</th><th>worker</th><th>status</th><th>pinned</th><th>memory</th>
-						<th>reqs</th><th>tokens out</th><th>actions</th>
+						<th title="in flight, from worker Health: engine queue plus submissions not yet drained into it"
+							>reqs</th
+						>
+						<th title="engine queue depth, from worker Stats: WAITING / RUNNING as of the last engine tick (rust workers only)"
+							>queue w/r</th
+						>
+						<th>tokens out</th><th>actions</th>
 					</tr>
 				</thead>
 				<tbody>
@@ -363,6 +430,7 @@
 							<td data-testid="reqs-{model.id}">
 								{model.health ? model.health.requests_running : '–'}
 							</td>
+							<td data-testid="queue-{model.id}">{queueDepth(model)}</td>
 							<td data-testid="tokens-{model.id}">
 								{model.stats ? model.stats.tokens_generated_total : '–'}
 							</td>
@@ -390,7 +458,7 @@
 							</td>
 						</tr>
 					{:else}
-						<tr><td colspan="8">no models configured</td></tr>
+						<tr><td colspan="9">no models configured</td></tr>
 					{/each}
 				</tbody>
 			</table>
@@ -552,6 +620,10 @@
 	}
 	.ok {
 		color: #080;
+	}
+	.hint {
+		color: #666;
+		margin: 0 0 0.5rem;
 	}
 	.token,
 	.job {

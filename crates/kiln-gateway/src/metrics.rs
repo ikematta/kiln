@@ -9,6 +9,7 @@
 //! reset when a worker restarts, exactly like a scraped counter would.
 
 use kiln_proto::v1::{MemoryReport, WorkerStats};
+use prometheus::core::Collector;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
     TextEncoder,
@@ -498,6 +499,43 @@ impl Metrics {
     }
 }
 
+/// One live label-set of a labeled counter: its label pairs and its
+/// cumulative value.
+pub struct CounterSample {
+    pub labels: Vec<(String, String)>,
+    pub value: u64,
+}
+
+/// Every live label-set of a labeled counter, read straight off the
+/// counter's own storage.
+///
+/// Used by the admin stats SSE snapshot (crate::admin_models) to carry
+/// gateway-owned counters to the dashboard. Unlike the worker `Stats`
+/// mirrors above — which are stale copies of an authoritative RPC, and so
+/// are assembled live from the RPC instead — these counters have no other
+/// store: prometheus IS where the gateway keeps them. Reading them here
+/// is a structured in-process read, NOT a parse of the `/metrics` text
+/// exposition; the admin UI stays on one data path.
+pub fn counter_samples(counter: &IntCounterVec) -> Vec<CounterSample> {
+    let mut samples = Vec::new();
+    for family in Collector::collect(counter) {
+        for metric in family.get_metric() {
+            samples.push(CounterSample {
+                labels: metric
+                    .get_label()
+                    .iter()
+                    .map(|pair| (pair.name().to_string(), pair.value().to_string()))
+                    .collect(),
+                // Counters are integral and monotone; the f64 in the
+                // exposition model is the wire type, not the storage
+                // (`IntCounterVec`). Rust float->int casts saturate.
+                value: metric.get_counter().get_value() as u64,
+            });
+        }
+    }
+    samples
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,6 +590,51 @@ mod tests {
         let text = metrics.encode().expect("encode");
         assert!(
             text.contains("kiln_worker_memory_bytes{model=\"m\"} 0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn counter_samples_read_every_label_set() {
+        let metrics = Metrics::new().expect("metrics build");
+        // A counter nobody touched has no series at all — the admin
+        // snapshot must render that as a real zero, not a missing value.
+        assert!(counter_samples(&metrics.rate_limited_total).is_empty());
+
+        metrics
+            .rate_limited_total
+            .with_label_values(&["k1", "requests"])
+            .inc();
+        metrics
+            .rate_limited_total
+            .with_label_values(&["k1", "tokens"])
+            .inc_by(4);
+        metrics
+            .rate_limited_total
+            .with_label_values(&["k2", "requests"])
+            .inc_by(2);
+
+        let mut samples = counter_samples(&metrics.rate_limited_total);
+        samples.sort_by(|a, b| a.labels.cmp(&b.labels));
+        assert_eq!(samples.len(), 3);
+        assert_eq!(
+            samples[0].labels,
+            vec![
+                ("key".to_string(), "k1".to_string()),
+                ("scope".to_string(), "requests".to_string()),
+            ]
+        );
+        assert_eq!(
+            samples.iter().map(|sample| sample.value).sum::<u64>(),
+            7,
+            "the summed samples are the counter's total"
+        );
+
+        // The values agree with what a scrape of the same counter shows —
+        // the two exposures are the same numbers, by construction.
+        let text = metrics.encode().expect("encode");
+        assert!(
+            text.contains("kiln_rate_limited_total{key=\"k1\",scope=\"tokens\"} 4"),
             "{text}"
         );
     }
