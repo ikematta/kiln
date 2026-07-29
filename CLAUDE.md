@@ -201,3 +201,12 @@ docs/SPEC.md                 the spec               docs/decisions/  ADRs (read-
 - SSD slab files include a model fingerprint header; a fingerprint mismatch is a
   silent skip + counter increment, never an error surfaced to a request.
 - macOS file descriptors: raise `RLIMIT_NOFILE` at worker start (mmap'd slabs + sockets).
+- **Never read an advisory CI lane's result out of the GitHub jobs API.** A step
+  with `continue-on-error: true` is reported as `conclusion: success` there
+  regardless of the exit code its command actually returned, so an advisory lane
+  that genuinely failed looks green. Read the step's LOG for the real verdict
+  (`gh run view <id> --log`). Concretely, on PR #47 (run 30418605396) the golden
+  parity lane's step showed `success` while `cargo test --test golden` had
+  reported `test result: FAILED. 0 passed; 1 failed`. This matters because ADR
+  0004 makes that lane's failure *pattern* the thing to watch — reading it from
+  the API turns "unchanged, as expected" into a false "newly fixed".
