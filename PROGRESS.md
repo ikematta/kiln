@@ -9456,3 +9456,200 @@
   `"olmoe"`-keyed posture assertion; fixture tier choice; dev machines must
   run the `KILN_GOLDEN_XL=1` golden tier). The soak-log capture that was
   queued alongside it is now closed by this PR.
+
+## [2026-07-28] Phase 10 follow-up / admin UI — queue depth + gateway counters in the live view — DONE
+- What:
+  - **Investigated first; the answer was "not wired" both times.** The
+    `WorkerStats.requests_waiting`/`.requests_running` fields added earlier
+    today (PR #45) did NOT reach `/admin/stats`: `live_worker_json`
+    hand-builds the `stats` object field by field and stopped at
+    `engine_steps_total`. The `health` object does carry same-named
+    fields, but those are `HealthStatus`'s — deliberately a different
+    number (proto: engine queue PLUS submissions accepted by gRPC and not
+    yet drained). Rendering Health where the request said Stats would have
+    shown the wrong metric with no visible symptom, so this was a backend
+    change, not the frontend-only task it looked like. Likewise none of
+    `kiln_rate_limited_total` / `kiln_timeout_total` /
+    `kiln_admission_uncovered_bytes_total` were in the payload.
+  - Gateway (`admin_models.rs`): the SSE `stats` object gains
+    `requests_waiting`/`requests_running`, and the snapshot gains a
+    top-level `"gateway": {"counters": [...]}` block — one entry per
+    counter carrying `name` (the exported prometheus name), `unit`,
+    `total`, and the per-label-set `series`. Purely additive: every
+    pre-existing key keeps its shape and meaning.
+  - `metrics.rs`: `counter_samples(&IntCounterVec)` reads a labeled
+    counter's live label sets and values off its own storage through
+    `Collector::collect`. A structured in-process read — NOT a parse of
+    the `/metrics` text exposition.
+  - Admin UI (`admin/src/routes/+page.svelte`): new `queue w/r` column in
+    the models table (engine WAITING/RUNNING from Stats), and a
+    `gateway counters` section under the memory ledger showing each
+    counter's total plus its label breakdown, headed "cumulative totals
+    since gateway start — these only ever climb; they are not live values
+    like the numbers above". The existing `reqs` column keeps its Health
+    source untouched; both `<th>`s gained `title` tooltips naming which
+    RPC each number comes from.
+  - E2E (`tests/e2e/test_admin_ui.py`): new playwright test in the Phase
+    10 pattern — real browser against the real embedded SPA, real stack,
+    real load. A 16-deep burst of distinct ~1150-token prompts plus a
+    victim submitted behind it; the dashboard must show the queue climb
+    off zero and fall back to it, and the rate-limit/timeout counters
+    must climb from genuine 429s and a genuine 504.
+- Decisions:
+  - **Extend the SSE payload rather than scrape `/metrics` in the
+    browser.** The Phase 10 part 2 entry rejected prometheus as an SSE
+    source, but for the opposite case: those were worker `Stats` mirrors —
+    stale poll copies of an authoritative RPC. Gateway counters have no
+    other store; prometheus IS where the gateway keeps them, so reading
+    the counter objects reads the source, and the dashboard stays on one
+    data path instead of gaining a second, text-parsing one.
+  - Counter entries are a self-describing ARRAY (`name`/`unit`/`total`/
+    `series`), not fixed keys: a fourth counter needs no frontend change,
+    and `unit` lets the UI byte-format `admission_uncovered` without a
+    hardcoded name list in the browser.
+  - The queue column shows Stats only and never falls back to Health,
+    even though a python-served model therefore renders `–`. The two
+    numbers differ by design; substituting one for the other in a cell
+    labelled as the engine queue is exactly the confusion the proto
+    comment warns about. Those models still show Health under `reqs`.
+  - Counters ride the SSE stream only, not `GET /admin/models`: the
+    section renders from the first frame, ≤1s after connect.
+- Deviations: none.
+- Found, NOT fixed (out of scope, flagged rather than folded in):
+  `stats.kv_blocks_free` and `kv_blocks_allocated` have been in the SSE
+  payload since part 2 but are rendered nowhere in the UI. The change
+  request assumed they were already displayed; they are not. Left alone.
+- Acceptance:
+  ```
+  REAL END-TO-END, driving genuine load with the dashboard open. New e2e
+  (rust worker, ttft_timeout_secs = 5, dedicated rpm=1 key), 16-deep
+  burst of distinct ~1150-token prompts + a victim behind it:
+
+    $ uv run --project tests/e2e pytest \
+        tests/e2e/test_admin_ui.py::test_admin_ui_live_queue_depth_and_gateway_counters -s
+    admin UI queue depth under a 16-deep flood: 16 / 1
+    victim submitted behind the burst returned [504]
+    PASSED                                          1 passed in 18.08s
+
+  The test asserts, in the browser, against the live DOM: "0 / 0" at idle
+  (not the "–" placeholder — proof the field is arriving); waiting >= 1
+  and running >= 1 under the burst; rate-limit and timeout counter totals
+  leaving 0 with no reload; uncovered-bytes still 0; each rendered total
+  equal to that counter's summed series in a /metrics scrape; and "0 / 0"
+  again after the flood is released.
+
+  MANUAL LOOK (separate run, gateway on :8391, dashboard open in a real
+  browser, 16 streams x 900 tokens on an unlimited key + 3 requests on the
+  rpm=1 key). Sampled straight out of the live DOM, no reload at any point:
+    queue=0 / 0  tokens=0      rate_limited=0     <- idle
+    queue=1 / 9  tokens=5402   rate_limited=1
+    queue=2 / 8  tokens=5402   rate_limited=1
+    queue=3 / 7  tokens=5402   rate_limited=1
+    queue=4 / 6  tokens=5402   rate_limited=1     <- pool saturating,
+    queue=0 / 4  tokens=10802  rate_limited=1        requests pushed back
+    queue=0 / 0  tokens=14402  rate_limited=1     <- drained
+  and the counters table rendering
+    kiln_rate_limited_total              1  key=look scope=requests 1
+    kiln_timeout_total                   0  none
+    kiln_admission_uncovered_bytes_total 0  none
+
+  Payload shape at the endpoint itself (additive — models/memory
+  unchanged):
+    $ curl -s -H "Authorization: Bearer ..." -N /admin/stats | head -1
+    ..."stats":{...,"engine_steps_total":0,"requests_waiting":0,
+       "requests_running":0}}],"memory":{...},"gateway":{"counters":[
+       {"name":"kiln_rate_limited_total","unit":"requests","total":0,"series":[]},
+       {"name":"kiln_timeout_total","unit":"requests","total":0,"series":[]},
+       {"name":"kiln_admission_uncovered_bytes_total","unit":"bytes",
+        "total":0,"series":[]}]}}
+
+  CI-shaped gates, all local:
+  $ cargo fmt --all --check                                    -> OK
+  $ cargo clippy --workspace --all-targets -- -D warnings      -> Finished
+  $ cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+                                                               -> Finished
+  $ cargo build --workspace --no-default-features               -> Finished
+  $ cargo test --workspace   -> all suites ok, 0 failed
+      (kiln-gateway lib 135 passed, incl. the 2 new cases:
+       metrics::tests::counter_samples_read_every_label_set,
+       admin_models::tests::stats_snapshot_carries_gateway_counters)
+  $ ruff check python/ tests/e2e scripts        -> All checks passed!
+  $ ruff format --check python/ tests/e2e scripts -> 40 files already formatted
+  $ npm run build --prefix admin                -> built in 946ms
+  $ KILN_E2E_REQUIRE_BROWSER=1 uv run --project tests/e2e pytest \
+      tests/e2e/test_admin_ui.py -v                -> 6 passed in 114.19s
+      (the 5 pre-existing admin-UI tests included: the new column and the
+       colspan change break none of them)
+
+  Not run, stated rather than implied: the 30-min soak (gates in CI as
+  usual) and the model-gated model/engine suites — this change adds no
+  engine or model code. One transient local failure worth recording so a
+  future reader does not misattribute it: on the first
+  `cargo test -p kiln-gateway --lib` run,
+  admin_register::tests::estimate_prices_local_dirs_against_the_live_budget
+  failed on `fits == true`. It prices against LIVE machine memory and this
+  box was at kern.memorystatus_vm_pressure_level = 2 (warning) at that
+  moment; at level 1 it passes. Environmental, and admin_register.rs is
+  untouched by this change.
+  ```
+- Next: unchanged by this interjection — session 3 of the MoE arc, a
+  second MoE architecture (`qwen2_moe` / `qwen3_moe`) with the three
+  carry-ins from the PR #44 entry. Still separately queued: the
+  unrendered `kv_blocks_free`/`kv_blocks_allocated` noted above (closed by
+  the entry below). (Corrected while merging main in: the
+  gateway-log-on-soak-failure item this line called queued was closed
+  by PR #46, which landed on main while this branch sat in CI — its
+  entry is above. Only this forward pointer was touched; nothing
+  recording what happened was altered.)
+
+## [2026-07-28] Phase 10 follow-up / admin UI — render the KV pool columns — DONE
+- What: the `kv_blocks_allocated`/`kv_blocks_free` gap flagged (and left
+  alone) in the entry above, now closed on the same branch at the PM's
+  request. Frontend only — both fields have been in the `/admin/stats`
+  payload since Phase 10 part 2; nothing in the gateway changed.
+  - `admin/src/routes/+page.svelte`: new `kv a/f` column beside
+    `queue w/r`, sourced from worker Stats, with the same `–` rule when a
+    worker serves no Stats and a `<th>` title naming the source. Empty-row
+    colspan 9 -> 10.
+  - `tests/e2e/test_admin_ui.py`: the existing burst test now also asserts
+    the KV cell — `0 / 0` at idle (the pool is materialized on first
+    request, not at load), allocated >= 1 under the flood.
+- Decisions:
+  - The scrape cross-check compares the POOL TOTAL (allocated + free), not
+    either number alone. allocated/free churn every engine step, so
+    comparing a rendered value against a scrape taken a moment later would
+    race; their sum is the fixed pool size and cannot. This is a real
+    check, not a weakened one — it still proves both UI numbers come from
+    the same worker snapshot the scrape reads.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ KILN_E2E_REQUIRE_BROWSER=1 uv run --project tests/e2e pytest \
+      tests/e2e/test_admin_ui.py -v -s
+    admin UI queue depth under a 16-deep flood: 16 / 1
+    admin UI kv blocks (allocated / free) under load: 24 / 488
+    victim submitted behind the burst returned [504]
+    6 passed in 64.88s
+  (24 + 488 = 512 = the documented llama-3.2-1b pool; the invariant check
+   above passed against the live scrape.)
+
+  $ npm run build --prefix admin                  -> built, wrote site to "build"
+  $ ruff check tests/e2e                          -> All checks passed!
+  $ ruff format --check tests/e2e                 -> 24 files already formatted
+  No rust source touched by this change (`git diff --stat` = 2 files:
+  the svelte page and the e2e), so the cargo gates from the entry above
+  still stand and were not re-run.
+
+  Visual check, 10-column table under real load (gateway on :8392, 14
+  streams, dashboard open in a real browser): no wrapping or overflow at
+  the 64rem layout width — row read
+    llama-3.2-1b-4bit | rust | ready | no | 1188 MiB | 8 | 6 / 8 | 461 / 51 | 0
+  i.e. the pool saturated (461 of 512 blocks held) while 6 requests waited.
+  ```
+- Next: unchanged — session 3 of the MoE arc (`qwen2_moe` / `qwen3_moe`)
+  with the PR #44 carry-ins. (Corrected while merging main in: the
+  gateway-log-on-soak-failure item this line called queued was closed
+  by PR #46, which landed on main while this branch sat in CI — its
+  entry is above. Only this forward pointer was touched; nothing
+  recording what happened was altered.)
+

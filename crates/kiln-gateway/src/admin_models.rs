@@ -20,6 +20,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use kiln_proto::v1::worker_client::WorkerClient;
 use kiln_proto::v1::{HealthRequest, StatsRequest};
+use prometheus::IntCounterVec;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::timeout;
@@ -231,6 +232,14 @@ async fn live_worker_json(entry: &ModelEntry) -> (Value, Value) {
                 "spec_tokens_proposed_total": stats.spec_tokens_proposed_total,
                 "spec_tokens_accepted_total": stats.spec_tokens_accepted_total,
                 "engine_steps_total": stats.engine_steps_total,
+                // Queue depth, engine-only (the proto's contract for these
+                // two fields). Deliberately NOT the same numbers as
+                // `health.requests_waiting`/`requests_running` above, which
+                // also count submissions the gRPC layer has accepted but the
+                // engine has not drained yet — the dashboard shows both and
+                // labels which is which.
+                "requests_waiting": stats.requests_waiting,
+                "requests_running": stats.requests_running,
             })
         }
         _ => Value::Null,
@@ -238,8 +247,64 @@ async fn live_worker_json(entry: &ModelEntry) -> (Value, Value) {
     (health, stats)
 }
 
+/// One gateway-owned counter for the snapshot: its exported prometheus
+/// name, the summed total, and the per-label-set breakdown.
+///
+/// `unit` tells the dashboard how to render the number (`bytes` vs a plain
+/// count) without hardcoding a list of metric names in the frontend.
+fn counter_json(name: &str, unit: &str, counter: &IntCounterVec) -> Value {
+    let samples = crate::metrics::counter_samples(counter);
+    let total: u64 = samples.iter().map(|sample| sample.value).sum();
+    let series: Vec<Value> = samples
+        .iter()
+        .map(|sample| {
+            let labels: serde_json::Map<String, Value> = sample
+                .labels
+                .iter()
+                .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                .collect();
+            json!({ "labels": labels, "value": sample.value })
+        })
+        .collect();
+    json!({ "name": name, "unit": unit, "total": total, "series": series })
+}
+
+/// Gateway-level counters for the snapshot (SPEC §8.3 rate limiting and
+/// timeouts, §2.3 admission accounting).
+///
+/// These are CUMULATIVE totals since gateway start, not the point-in-time
+/// gauges everything else in the snapshot carries — consumers must label
+/// them as such. They ride this stream rather than a second
+/// `/metrics`-scraping path in the browser so the dashboard has exactly
+/// one data path; see `crate::metrics::counter_samples` for why reading
+/// the registry is right for these and wrong for the worker mirrors.
+///
+/// A counter that has never fired has no label sets at all and reports
+/// `total: 0` with an empty `series` — an honest zero, not a gap.
+fn gateway_json(state: &AppState) -> Value {
+    let metrics = &state.metrics;
+    json!({
+        "counters": [
+            counter_json(
+                "kiln_rate_limited_total",
+                "requests",
+                &metrics.rate_limited_total,
+            ),
+            counter_json("kiln_timeout_total", "requests", &metrics.timeouts_total),
+            counter_json(
+                "kiln_admission_uncovered_bytes_total",
+                "bytes",
+                &metrics.admission_uncovered_bytes_total,
+            ),
+        ]
+    })
+}
+
 /// One `event: stats` SSE payload: models table + memory ledger + live
-/// worker numbers.
+/// worker numbers + gateway counters.
+///
+/// Extensions here are strictly additive: existing keys keep their shape
+/// and meaning, so anything already consuming the stream keeps working.
 async fn stats_snapshot(state: &AppState) -> Value {
     let mut models = Vec::new();
     for entry in state.registry.entries() {
@@ -254,7 +319,11 @@ async fn stats_snapshot(state: &AppState) -> Value {
         row["stats"] = stats;
         models.push(row);
     }
-    json!({ "models": models, "memory": memory_json(state) })
+    json!({
+        "models": models,
+        "memory": memory_json(state),
+        "gateway": gateway_json(state),
+    })
 }
 
 /// `GET /admin/stats`: SSE stream of 1s-tick snapshots. The browser
@@ -471,6 +540,79 @@ mod tests {
         assert_eq!(snapshot["models"][0]["id"], "m");
         assert!(snapshot["models"][0]["health"].is_null());
         assert!(snapshot["models"][0]["stats"].is_null());
+        assert!(snapshot["memory"]["budget_bytes"].as_u64().unwrap_or(0) > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gateway-counter block: present on every tick, an honest zero
+    /// before anything fires, and tracking the same counters `/metrics`
+    /// exports afterwards.
+    #[tokio::test]
+    async fn stats_snapshot_carries_gateway_counters() {
+        let (state, _status_tx, _cmd_rx, dir) = state_with_model();
+
+        let snapshot = stats_snapshot(&state).await;
+        let counters = snapshot["gateway"]["counters"]
+            .as_array()
+            .expect("counters array")
+            .clone();
+        let names: Vec<&str> = counters
+            .iter()
+            .map(|counter| counter["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "kiln_rate_limited_total",
+                "kiln_timeout_total",
+                "kiln_admission_uncovered_bytes_total",
+            ]
+        );
+        for counter in &counters {
+            assert_eq!(counter["total"], 0, "untouched counter must read zero");
+            assert!(counter["series"].as_array().expect("series").is_empty());
+        }
+        // The byte counter declares its unit so the dashboard can render
+        // it as bytes rather than as a request count.
+        assert_eq!(counters[0]["unit"], "requests");
+        assert_eq!(counters[2]["unit"], "bytes");
+
+        // Fire the real counters the request path increments; the next
+        // tick reflects them, per label set and in the total.
+        state
+            .metrics
+            .rate_limited_total
+            .with_label_values(&["k", "requests"])
+            .inc();
+        state
+            .metrics
+            .rate_limited_total
+            .with_label_values(&["k", "tokens"])
+            .inc_by(2);
+        state
+            .metrics
+            .timeouts_total
+            .with_label_values(&["m", "ttft"])
+            .inc();
+        state
+            .metrics
+            .admission_uncovered_bytes_total
+            .with_label_values(&["m"])
+            .inc_by(4096);
+
+        let snapshot = stats_snapshot(&state).await;
+        let counters = &snapshot["gateway"]["counters"];
+        assert_eq!(counters[0]["total"], 3);
+        assert_eq!(counters[0]["series"].as_array().expect("series").len(), 2);
+        assert_eq!(counters[1]["total"], 1);
+        assert_eq!(counters[1]["series"][0]["labels"]["scope"], "ttft");
+        assert_eq!(counters[1]["series"][0]["value"], 1);
+        assert_eq!(counters[2]["total"], 4096);
+
+        // The pre-existing keys are untouched by the addition: this
+        // extension is additive, and the models/memory consumers must not
+        // notice it.
+        assert_eq!(snapshot["models"][0]["id"], "m");
         assert!(snapshot["memory"]["budget_bytes"].as_u64().unwrap_or(0) > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
