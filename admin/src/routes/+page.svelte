@@ -203,6 +203,16 @@
 		return `${model.stats.requests_waiting} / ${model.stats.requests_running}`;
 	}
 
+	// KV pool occupancy (worker Stats): blocks held by requests or the
+	// prefix cache / blocks free. Both zero before the pool is
+	// materialized on the first request; allocated stays above zero after
+	// a drain, because the prefix cache keeps its blocks. Same '–' rule as
+	// the queue column.
+	function kvBlocks(model) {
+		if (!model.stats) return '–';
+		return `${model.stats.kv_blocks_allocated} / ${model.stats.kv_blocks_free}`;
+	}
+
 	// Counter values render by declared unit — byte counters as MiB,
 	// everything else as a plain count.
 	function counterValue(counter, value) {
@@ -416,6 +426,9 @@
 						<th title="engine queue depth, from worker Stats: WAITING / RUNNING as of the last engine tick (rust workers only)"
 							>queue w/r</th
 						>
+						<th title="KV pool blocks, from worker Stats: allocated (requests + prefix cache) / free (rust workers only)"
+							>kv a/f</th
+						>
 						<th>tokens out</th><th>actions</th>
 					</tr>
 				</thead>
@@ -431,6 +444,7 @@
 								{model.health ? model.health.requests_running : '–'}
 							</td>
 							<td data-testid="queue-{model.id}">{queueDepth(model)}</td>
+							<td data-testid="kv-{model.id}">{kvBlocks(model)}</td>
 							<td data-testid="tokens-{model.id}">
 								{model.stats ? model.stats.tokens_generated_total : '–'}
 							</td>
@@ -458,7 +472,7 @@
 							</td>
 						</tr>
 					{:else}
-						<tr><td colspan="9">no models configured</td></tr>
+						<tr><td colspan="10">no models configured</td></tr>
 					{/each}
 				</tbody>
 			</table>

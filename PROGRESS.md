@@ -9393,3 +9393,51 @@
   carry-ins from the PR #44 entry. Still separately queued: capture the
   gateway log on soak-gate failure; and now also the unrendered
   `kv_blocks_free`/`kv_blocks_allocated` noted above.
+
+## [2026-07-28] Phase 10 follow-up / admin UI — render the KV pool columns — DONE
+- What: the `kv_blocks_allocated`/`kv_blocks_free` gap flagged (and left
+  alone) in the entry above, now closed on the same branch at the PM's
+  request. Frontend only — both fields have been in the `/admin/stats`
+  payload since Phase 10 part 2; nothing in the gateway changed.
+  - `admin/src/routes/+page.svelte`: new `kv a/f` column beside
+    `queue w/r`, sourced from worker Stats, with the same `–` rule when a
+    worker serves no Stats and a `<th>` title naming the source. Empty-row
+    colspan 9 -> 10.
+  - `tests/e2e/test_admin_ui.py`: the existing burst test now also asserts
+    the KV cell — `0 / 0` at idle (the pool is materialized on first
+    request, not at load), allocated >= 1 under the flood.
+- Decisions:
+  - The scrape cross-check compares the POOL TOTAL (allocated + free), not
+    either number alone. allocated/free churn every engine step, so
+    comparing a rendered value against a scrape taken a moment later would
+    race; their sum is the fixed pool size and cannot. This is a real
+    check, not a weakened one — it still proves both UI numbers come from
+    the same worker snapshot the scrape reads.
+- Deviations: none.
+- Acceptance:
+  ```
+  $ KILN_E2E_REQUIRE_BROWSER=1 uv run --project tests/e2e pytest \
+      tests/e2e/test_admin_ui.py -v -s
+    admin UI queue depth under a 16-deep flood: 16 / 1
+    admin UI kv blocks (allocated / free) under load: 24 / 488
+    victim submitted behind the burst returned [504]
+    6 passed in 64.88s
+  (24 + 488 = 512 = the documented llama-3.2-1b pool; the invariant check
+   above passed against the live scrape.)
+
+  $ npm run build --prefix admin                  -> built, wrote site to "build"
+  $ ruff check tests/e2e                          -> All checks passed!
+  $ ruff format --check tests/e2e                 -> 24 files already formatted
+  No rust source touched by this change (`git diff --stat` = 2 files:
+  the svelte page and the e2e), so the cargo gates from the entry above
+  still stand and were not re-run.
+
+  Visual check, 10-column table under real load (gateway on :8392, 14
+  streams, dashboard open in a real browser): no wrapping or overflow at
+  the 64rem layout width — row read
+    llama-3.2-1b-4bit | rust | ready | no | 1188 MiB | 8 | 6 / 8 | 461 / 51 | 0
+  i.e. the pool saturated (461 of 512 blocks held) while 6 requests waited.
+  ```
+- Next: unchanged — session 3 of the MoE arc (`qwen2_moe` / `qwen3_moe`)
+  with the PR #44 carry-ins. Still separately queued: capture the gateway
+  log on soak-gate failure.

@@ -121,6 +121,9 @@ UI_FLOOD_MAX_TOKENS = 768
 # Waiting >= 1 with any running count: "2 / 10". Anchored so a leading zero
 # (an empty queue) cannot match.
 QUEUE_NONEMPTY = re.compile(r"^[1-9]\d* / \d+$")
+# Same shape for the KV pool cell: allocated >= 1, i.e. the pool has been
+# materialized and is holding blocks.
+KV_IN_USE = re.compile(r"^[1-9]\d* / \d+$")
 
 
 @contextlib.contextmanager
@@ -193,17 +196,19 @@ def hold_stream(stack, tag: str, stop: threading.Event) -> None:
 
 
 def test_admin_ui_live_queue_depth_and_gateway_counters(browser_page):
-    """Queue depth and gateway counters in the live view, under REAL load.
+    """Queue depth, KV pool occupancy, and gateway counters in the live
+    view, under REAL load.
 
     The wiring is not the bar — the numbers moving is. A dozen concurrent
     streams are pushed through the actual API while the dashboard is open,
     and the UI must show the engine's own WAITING/RUNNING counts climbing
-    off zero and falling back to it, with no reload. The three gateway
-    counters are driven the same way: genuine 429s from an rpm=1 key and a
-    genuine 504 from a request that queues past its TTFT budget.
+    off zero and falling back to it, with no reload, while the KV pool
+    columns fill. The three gateway counters are driven the same way:
+    genuine 429s from an rpm=1 key and a genuine 504 from a request that
+    queues past its TTFT budget.
 
     Cross-checked against /metrics: the SSE payload and the scrape are two
-    exposures of the same counters and must agree.
+    exposures of the same numbers and must agree.
     """
     from playwright.sync_api import expect
 
@@ -218,9 +223,13 @@ def test_admin_ui_live_queue_depth_and_gateway_counters(browser_page):
         expect(page.get_by_test_id("connected")).to_be_visible()
 
         # Idle baseline. "0 / 0" (not the "–" placeholder) proves the field
-        # is genuinely arriving from worker Stats, not merely absent.
+        # is genuinely arriving from worker Stats, not merely absent. The KV
+        # pool reads 0 / 0 too: it is materialized on the first request, not
+        # at load.
         queue = page.get_by_test_id(f"queue-{MODEL_ID}")
+        kv = page.get_by_test_id(f"kv-{MODEL_ID}")
         expect(queue).to_have_text("0 / 0", timeout=15_000)
+        expect(kv).to_have_text("0 / 0")
 
         # The counters section is present and honestly zero before anything
         # has fired, and says out loud that these are cumulative.
@@ -285,6 +294,23 @@ def test_admin_ui_live_queue_depth_and_gateway_counters(browser_page):
             # everything this test has in flight.
             assert waiting + running <= UI_FLOOD_STREAMS + 2, (
                 f"queue depth {observed} exceeds the requests in flight"
+            )
+
+            # The KV pool columns fill from the same live stream. Cross-check
+            # the POOL TOTAL, not the split: allocated/free churn every
+            # engine step, so comparing either against a scrape taken a
+            # moment later would race — while their sum is the fixed pool
+            # size and cannot.
+            expect(kv).to_have_text(KV_IN_USE, timeout=30_000)
+            kv_shown = kv.inner_text().strip()
+            print(f"admin UI kv blocks (allocated / free) under load: {kv_shown}")
+            allocated, free = (int(part) for part in kv_shown.split(" / "))
+            assert allocated >= 1, kv_shown
+            pool = stack.metrics_text()
+            assert allocated + free == metric_total(
+                pool, "kiln_worker_kv_blocks_allocated"
+            ) + metric_total(pool, "kiln_worker_kv_blocks_free"), (
+                f"UI pool total {allocated + free} disagrees with the scrape"
             )
 
             victim_thread.join(timeout=180)
