@@ -8,7 +8,7 @@
 //! (`weight_map`); single-file checkpoints load `model.safetensors` directly.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Component, Path};
 
 use kiln_mlx::{Array, Dtype};
 
@@ -24,6 +24,8 @@ pub enum WeightsError {
     Parse { path: String, message: String },
     #[error("invalid weight index {path}: {message}")]
     Index { path: String, message: String },
+    #[error("weight file {file} resolves outside the model directory {dir}")]
+    Escape { dir: String, file: String },
     #[error("tensor {name} has unsupported dtype {dtype}")]
     UnsupportedDtype { name: String, dtype: String },
     #[error("missing tensor {0}")]
@@ -55,25 +57,60 @@ impl WeightStore {
                     path: index_path.display().to_string(),
                     message: e.to_string(),
                 })?;
-            index
+            let map = index
                 .get("weight_map")
                 .and_then(serde_json::Value::as_object)
                 .ok_or_else(|| WeightsError::Index {
                     path: index_path.display().to_string(),
                     message: "no weight_map object".to_owned(),
-                })?
-                .values()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
+                })?;
+            let index_error = |message: String| WeightsError::Index {
+                path: index_path.display().to_string(),
+                message,
+            };
+            let mut files = BTreeSet::new();
+            for (tensor, value) in map {
+                // A malformed entry is named and fatal rather than skipped:
+                // dropping it silently just resurfaces later as a confusing
+                // `Missing(tensor)` from whichever loader wanted it.
+                let file = value.as_str().ok_or_else(|| {
+                    index_error(format!("weight_map entry for {tensor} is not a string"))
+                })?;
+                if !is_shard_file_name(file) {
+                    return Err(index_error(format!(
+                        "weight_map entry for {tensor} is not a plain filename: {file}"
+                    )));
+                }
+                files.insert(file.to_owned());
+            }
+            files
         } else {
             BTreeSet::from(["model.safetensors".to_owned()])
         };
 
+        // Defense in depth for the name check above, which cannot see a
+        // symlink: every shard's resolved path must still land under the
+        // resolved model directory.
+        let root = dir.canonicalize().map_err(|source| WeightsError::Io {
+            path: dir.display().to_string(),
+            source,
+        })?;
+
         let mut tensors = HashMap::new();
         for file in files {
             let path = dir.join(&file);
+            let resolved = path.canonicalize().map_err(|source| WeightsError::Io {
+                path: path.display().to_string(),
+                source,
+            })?;
+            if !resolved.starts_with(&root) {
+                return Err(WeightsError::Escape {
+                    dir: root.display().to_string(),
+                    file,
+                });
+            }
             let mapped =
-                kiln_mlx::io::MappedFile::open(&path).map_err(|source| WeightsError::Io {
+                kiln_mlx::io::MappedFile::open(&resolved).map_err(|source| WeightsError::Io {
                     path: path.display().to_string(),
                     source,
                 })?;
@@ -126,5 +163,51 @@ impl WeightStore {
         let mut names: Vec<&str> = self.tensors.keys().map(String::as_str).collect();
         names.sort_unstable();
         names
+    }
+}
+
+/// True when `file` names a shard sitting directly in the checkpoint
+/// directory.
+///
+/// `model.safetensors.index.json` is authored by whoever published the
+/// checkpoint, so its `weight_map` values are untrusted input. `Path::join`
+/// adopts an absolute component wholesale and honours `..`, so an
+/// unvalidated value can name any file on the host — and its tensors would
+/// then be bound into the attacker's model and readable back through the
+/// inference API. Real mlx-lm indices only ever hold plain filenames
+/// (`model-00001-of-00002.safetensors`), so require exactly that.
+fn is_shard_file_name(file: &str) -> bool {
+    let mut components = Path::new(file).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_shard_names_accepted() {
+        assert!(is_shard_file_name("model.safetensors"));
+        assert!(is_shard_file_name("model-00001-of-00002.safetensors"));
+    }
+
+    #[test]
+    fn escaping_shard_names_rejected() {
+        for hostile in [
+            "../../other-model/model.safetensors",
+            "/Users/op/private-models/proprietary/model.safetensors",
+            "sub/model.safetensors",
+            "./model.safetensors",
+            "..",
+            "",
+        ] {
+            assert!(
+                !is_shard_file_name(hostile),
+                "weight_map value {hostile:?} must be rejected"
+            );
+        }
     }
 }
