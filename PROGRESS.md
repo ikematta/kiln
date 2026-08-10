@@ -9789,3 +9789,71 @@
   fixture, and read its verdict from the step log, never the jobs API.
 - Next: unchanged — session 3 of the MoE arc (`qwen2_moe` / `qwen3_moe`)
   with the three carry-ins from the PR #44 entry.
+
+## [2026-08-10] Security / path-traversal containment — PR #49 CI: green on re-run; admin-UI metrics flake recorded, NOT buried — DONE
+- CI, run 31366996328 (PR #49). First attempt: `test-macos` FAILED at the
+  blocking E2E step, 1h2m37s. Re-run of the failed job: all four checks
+  pass — lint 2m0s, compile-linux 2m8s, test-macos-release 11m2s,
+  test-macos 1h38m21s (longer than the ~1h15m baseline because the soak
+  actually ran this time; it was never reached on the failed attempt).
+- The failure, recorded because the standing instruction is to treat a
+  second occurrence as signal rather than re-run past it:
+  ```
+  tests/e2e/test_admin_ui.py::test_admin_ui_live_queue_depth_and_gateway_counters
+  AssertionError: UI pool total 512 disagrees with the scrape
+  assert (24 + 488) == (0.0 + 0.0)
+  admin UI kv blocks (allocated / free) under load: 24 / 488
+  ```
+  It did NOT reproduce on the re-run (E2E: 132 passed, 4 skipped, and that
+  test PASSED). So: one non-reproducing occurrence, first ever for this
+  test, with a concrete mechanism — not an unexplained one.
+- Mechanism, established by reading the code rather than inferred from the
+  failure text. The UI number and the scrape number have INDEPENDENT
+  sources:
+  - UI/SSE: `admin_models.rs:221` calls `client.stats()` on demand per
+    refresh.
+  - `/metrics`: `supervisor.rs:762` is the ONLY caller of
+    `WorkerStatGauges::record` (`metrics.rs:161`), driven by the 1s
+    health-poll loop.
+  Nothing anywhere removes a gauge series, so an absent
+  `kiln_worker_kv_blocks_*` series means `record()` was never called for
+  that model in that gateway process — which `metric_total` sums to 0.0.
+  Two pre-existing ways in, both at `supervisor.rs:759-770`:
+  `stats_supported` (init `true`, line 706) is latched PERMANENTLY to
+  `false` at line 767 on a single `Unimplemented`, with no re-probe; and
+  every other error, timeouts included, hits `_ => {}` and silently misses
+  the sample. Either leaves the dashboard healthy while `/metrics` stays
+  blank for the whole process lifetime. The Unimplemented path logs at
+  `debug` only, so CI shows nothing.
+- Attribution: NOT caused by this PR. The diff is load-time path
+  validation plus the hub downloader; it does not touch the supervisor,
+  the Stats RPC, metrics, or the admin path. Corroborating on the failed
+  run itself: 131 e2e passed, every blocking model-gated suite passed,
+  smoke passed — model loading demonstrably worked. Stated honestly: a
+  timing perturbation cannot be *proven* absent (canonicalize adds a
+  couple of syscalls per shard at load), but that is microseconds against
+  a 1s poll loop, and the assertion concerns a series that persists once
+  created.
+- Test NOT weakened, per the hard rule. The test is doing its job; the
+  fragility is in the gateway. Fixing the latch is filed as separate work
+  — it needs its own reasoning about why the latch exists (not hammering
+  a python worker that genuinely lacks Stats), and does not belong in a
+  path-traversal PR.
+- ADR 0004 record: the advisory golden lane failed again on
+  gemma-3-1b-it-4bit/chat-basic — same fixture, same first-divergence
+  shape, now the SIXTH consecutive run (30191249436 / 30241628948 /
+  30326248951 / 30377498688 / 30418605396 / this one). Pattern unchanged,
+  which is the only property that carries signal; continue-on-error by
+  design, did not gate. Read from the step log, not the jobs API, which
+  again showed the step as `success` while the log had
+  `test result: FAILED. 0 passed; 1 failed`. Note this divergence does NOT
+  reproduce on the M4 dev machine — both tiers green locally, including
+  `KILN_GOLDEN_XL=1` — so it remains cross-device, not a regression.
+- Soak: PASS, all gates held; `severed-by-drain 502 accepted` at t+766.9s
+  (unload counter moved in the ±60s window), gateway RSS late delta
+  -14.8 MB (reported, not gated). The crash-restart gate did NOT fire —
+  second consecutive clean run since the unexplained PR #45 firing. Still
+  not an explanation; the standing instruction stands.
+- Deviations: none.
+- Next: unchanged — session 3 of the MoE arc (`qwen2_moe` / `qwen3_moe`)
+  with the three carry-ins from the PR #44 entry.
