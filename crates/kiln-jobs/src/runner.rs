@@ -45,6 +45,44 @@ pub enum SpecError {
     Parse(#[from] serde_json::Error),
 }
 
+/// `org/name` shape a Hugging Face repo id has: one slash, both halves
+/// non-empty and not path-like.
+///
+/// `repo` reaches a hub URL path *and* — through the default destination —
+/// the filesystem, so a value like `..` or `org/..` must not get through.
+/// Deliberately a second copy of the gateway's front-door rule
+/// (`hf_repo_shaped` in `kiln-gateway/src/admin_register.rs`): kiln-jobs is
+/// not a dependency of kiln-gateway, and the CLI reaches this entry point
+/// without passing through the gateway at all.
+fn hf_repo_shaped(repo: &str) -> bool {
+    let Some((org, name)) = repo.split_once('/') else {
+        return false;
+    };
+    [org, name].iter().all(|part| {
+        !part.is_empty()
+            && !matches!(*part, "." | "..")
+            && !part.starts_with('~')
+            && !part.contains(['/', '\\', '?', '#'])
+            && part.chars().all(|c| !c.is_whitespace() && !c.is_control())
+    })
+}
+
+/// A git ref or commit sha, as it goes straight into a hub URL path.
+///
+/// Branch and tag names legitimately contain `/` and `.` (`refs/pr/1`,
+/// `v1.0`), so this rejects only what would change *which* URL is fetched:
+/// `.`/`..`/empty segments and the URL metacharacters.
+fn git_revision_shaped(revision: &str) -> bool {
+    !revision.is_empty()
+        && !revision.contains(['?', '#', '\\'])
+        && revision
+            .chars()
+            .all(|c| !c.is_whitespace() && !c.is_control())
+        && revision
+            .split('/')
+            .all(|segment| !segment.is_empty() && !matches!(segment, "." | ".."))
+}
+
 /// Validates and fills defaults for a download submission.
 pub fn download_job(
     repo: &str,
@@ -55,12 +93,20 @@ pub fn download_job(
     if repo.is_empty() {
         return Err(SpecError::Invalid("repo must be non-empty".into()));
     }
+    if !hf_repo_shaped(repo) {
+        return Err(SpecError::Invalid(format!(
+            "repo must be a Hugging Face id of the form org/name, got '{repo}'"
+        )));
+    }
+    let revision = revision.filter(|rev| !rev.is_empty()).unwrap_or("main");
+    if !git_revision_shaped(revision) {
+        return Err(SpecError::Invalid(format!(
+            "revision must be a git ref or commit sha, got '{revision}'"
+        )));
+    }
     Ok(DownloadJob {
         repo: repo.to_string(),
-        revision: revision
-            .filter(|rev| !rev.is_empty())
-            .unwrap_or("main")
-            .to_string(),
+        revision: revision.to_string(),
         dest: dest.unwrap_or_else(|| config.dest_root.join(repo.replace('/', "--"))),
     })
 }
@@ -163,4 +209,69 @@ async fn run_quantize(
         .await
         .map_err(|err| err.to_string())?;
     Ok(job.out.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> RunnerConfig {
+        RunnerConfig {
+            dest_root: PathBuf::from("/models"),
+            venv: PathBuf::from("/venv"),
+        }
+    }
+
+    #[test]
+    fn well_formed_repo_and_revision_accepted() {
+        let job = download_job("mlx-community/Qwen3-0.6B-4bit", None, None, &config())
+            .expect("valid repo id");
+        assert_eq!(job.revision, "main");
+        assert_eq!(
+            job.dest,
+            PathBuf::from("/models/mlx-community--Qwen3-0.6B-4bit")
+        );
+        // Refs legitimately carry slashes and dots.
+        assert!(download_job("org/name", Some("refs/pr/1"), None, &config()).is_ok());
+        assert!(download_job("org/name", Some("v1.0"), None, &config()).is_ok());
+    }
+
+    #[test]
+    fn path_like_repo_rejected() {
+        for hostile in [
+            "",
+            "..",
+            ".",
+            "../../etc",
+            "org/..",
+            "org/.",
+            "~/x",
+            "/abs/path",
+            "noslash",
+            "org/na/me",
+            "org/na me",
+        ] {
+            assert!(
+                download_job(hostile, None, None, &config()).is_err(),
+                "repo {hostile:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn path_like_revision_rejected() {
+        for hostile in [
+            "../../other-repo/tree/main",
+            "main/../..",
+            "refs//pr",
+            "main?x=1",
+            "main#frag",
+            ".",
+        ] {
+            assert!(
+                download_job("org/name", Some(hostile), None, &config()).is_err(),
+                "revision {hostile:?} must be rejected"
+            );
+        }
+    }
 }

@@ -9717,3 +9717,143 @@
   with the three carry-ins from the PR #44 entry (golden.rs's
   `"olmoe"`-keyed posture assertion; fixture tier choice; dev machines
   must run the `KILN_GOLDEN_XL=1` golden tier).
+
+## [2026-08-10] Security — path-traversal containment on the two untrusted-path sinks — DONE
+- What:
+  - `kiln-models/src/weights.rs`: `weight_map` values from
+    `model.safetensors.index.json` were joined onto the checkpoint dir
+    verbatim. Added `is_shard_file_name` (exactly one
+    `Component::Normal`); a violation is a fatal `WeightsError::Index`
+    naming the offending tensor. A non-string `weight_map` value is now
+    fatal too instead of silently `filter_map`'d away (it only resurfaced
+    later as a confusing `Missing(tensor)`). Added a canonicalized
+    `starts_with(root)` check per shard — new `WeightsError::Escape` —
+    which also covers a symlink the name check cannot see.
+  - `kiln-jobs/src/hub.rs`: tree-listing paths (remote JSON) were joined
+    onto `dest` unchecked. Added `is_contained_relative`, enforced in
+    `list_tree` *before* the `SKIP_PREFIXES` basename filter so a hostile
+    path is loud rather than quietly skipped on its basename
+    (`../../../.bashrc`), and re-asserted in `download_repo` because
+    `TreeEntry` is public and constructible. Nested repo layout
+    (`sub/tokenizer.json`) still allowed.
+  - `kiln-jobs/src/runner.rs`: `download_job` validated only that `repo`
+    was non-empty. Added `hf_repo_shaped` + `git_revision_shaped`.
+  - Tests: 2 unit + 2 stub-hub integration tests in kiln-jobs (traversal
+    and absolute tree paths fail the whole job and write nothing outside
+    `dest`), 2 unit tests in kiln-models, 3 in `runner`.
+- Decisions:
+  - Single-`Normal`-component rule for `weight_map` (not merely "no `..`"):
+    all nine pinned checkpoints hold plain filenames only, verified on
+    disk before choosing the bar, so the strict rule costs nothing.
+  - `hf_repo_shaped` is a deliberate second copy of the gateway's rule
+    rather than a shared helper: kiln-gateway does not depend on
+    kiln-jobs, and the CLI reaches `download_job` without passing the
+    gateway. It is also stricter — the gateway's version admits `org/..`.
+  - Extended the reported scope to `revision`, which flows into the same
+    hub URL path as `repo` and had the identical gap; the rule rejects
+    `.`/`..`/empty segments and URL metacharacters while keeping
+    `refs/pr/1` and `v1.0` valid.
+  - Kept the honest caveat in-code that the hub's git-backed tree API very
+    likely cannot serve an escaping path today. That is a property of the
+    upstream, which Kiln neither controls nor verifies.
+- Deviations: none. No new dependencies; no `unsafe`; no proto change; no
+  test weakened.
+- Swept for other instances of the pattern: `draft.rs:432` and
+  `admin_register.rs:487` take literal filenames, `ssd.rs` derives names
+  from integer ids. No third sink.
+- Acceptance:
+  ```
+  $ cargo fmt --check                                        -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings     -> clean (36.24s)
+
+  $ cargo test --workspace     (model-gated suites self-skip; no KILN_TEST_MODELS)
+  40 targets, every one "test result: ok"; 0 failed across all.
+  incl. kiln-jobs lib 10 passed, tests/download.rs 14 passed,
+        kiln-models lib 14 passed.
+
+  model-gated, KILN_TEST_MODELS=~/.kiln/test-models:
+  $ cargo test -p kiln-models --test calibration
+    test calibrated_width_is_the_row_stability_boundary ... ok
+    test result: ok. 1 passed; 0 failed; finished in 3.09s
+  $ cargo test -p kiln-models --test golden
+    test result: ok. 1 passed; 0 failed; finished in 766.07s
+  $ KILN_GOLDEN_XL=1 cargo test -p kiln-models --test golden
+    test result: ok. 1 passed; 0 failed; finished in 997.04s
+  ```
+  The +231s of the XL run over the base run is the 8-bit MoE cell actually
+  executing, i.e. the two-shard `weight_map` — the exact path changed here
+  — loaded through the new validator. NOTE: the ADR 0004 advisory golden
+  divergence (gemma-3-1b-it-4bit/chat-basic) does NOT reproduce on this
+  M4 dev machine; both tiers are green locally. That is unchanged
+  behaviour, not a fix — expect the CI lane to keep failing on the same
+  fixture, and read its verdict from the step log, never the jobs API.
+- Next: unchanged — session 3 of the MoE arc (`qwen2_moe` / `qwen3_moe`)
+  with the three carry-ins from the PR #44 entry.
+
+## [2026-08-10] Security / path-traversal containment — PR #49 CI: green on re-run; admin-UI metrics flake recorded, NOT buried — DONE
+- CI, run 31366996328 (PR #49). First attempt: `test-macos` FAILED at the
+  blocking E2E step, 1h2m37s. Re-run of the failed job: all four checks
+  pass — lint 2m0s, compile-linux 2m8s, test-macos-release 11m2s,
+  test-macos 1h38m21s (longer than the ~1h15m baseline because the soak
+  actually ran this time; it was never reached on the failed attempt).
+- The failure, recorded because the standing instruction is to treat a
+  second occurrence as signal rather than re-run past it:
+  ```
+  tests/e2e/test_admin_ui.py::test_admin_ui_live_queue_depth_and_gateway_counters
+  AssertionError: UI pool total 512 disagrees with the scrape
+  assert (24 + 488) == (0.0 + 0.0)
+  admin UI kv blocks (allocated / free) under load: 24 / 488
+  ```
+  It did NOT reproduce on the re-run (E2E: 132 passed, 4 skipped, and that
+  test PASSED). So: one non-reproducing occurrence, first ever for this
+  test, with a concrete mechanism — not an unexplained one.
+- Mechanism, established by reading the code rather than inferred from the
+  failure text. The UI number and the scrape number have INDEPENDENT
+  sources:
+  - UI/SSE: `admin_models.rs:221` calls `client.stats()` on demand per
+    refresh.
+  - `/metrics`: `supervisor.rs:762` is the ONLY caller of
+    `WorkerStatGauges::record` (`metrics.rs:161`), driven by the 1s
+    health-poll loop.
+  Nothing anywhere removes a gauge series, so an absent
+  `kiln_worker_kv_blocks_*` series means `record()` was never called for
+  that model in that gateway process — which `metric_total` sums to 0.0.
+  Two pre-existing ways in, both at `supervisor.rs:759-770`:
+  `stats_supported` (init `true`, line 706) is latched PERMANENTLY to
+  `false` at line 767 on a single `Unimplemented`, with no re-probe; and
+  every other error, timeouts included, hits `_ => {}` and silently misses
+  the sample. Either leaves the dashboard healthy while `/metrics` stays
+  blank for the whole process lifetime. The Unimplemented path logs at
+  `debug` only, so CI shows nothing.
+- Attribution: NOT caused by this PR. The diff is load-time path
+  validation plus the hub downloader; it does not touch the supervisor,
+  the Stats RPC, metrics, or the admin path. Corroborating on the failed
+  run itself: 131 e2e passed, every blocking model-gated suite passed,
+  smoke passed — model loading demonstrably worked. Stated honestly: a
+  timing perturbation cannot be *proven* absent (canonicalize adds a
+  couple of syscalls per shard at load), but that is microseconds against
+  a 1s poll loop, and the assertion concerns a series that persists once
+  created.
+- Test NOT weakened, per the hard rule. The test is doing its job; the
+  fragility is in the gateway. Fixing the latch is filed as separate work
+  — it needs its own reasoning about why the latch exists (not hammering
+  a python worker that genuinely lacks Stats), and does not belong in a
+  path-traversal PR.
+- ADR 0004 record: the advisory golden lane failed again on
+  gemma-3-1b-it-4bit/chat-basic — same fixture, same first-divergence
+  shape, now the SIXTH consecutive run (30191249436 / 30241628948 /
+  30326248951 / 30377498688 / 30418605396 / this one). Pattern unchanged,
+  which is the only property that carries signal; continue-on-error by
+  design, did not gate. Read from the step log, not the jobs API, which
+  again showed the step as `success` while the log had
+  `test result: FAILED. 0 passed; 1 failed`. Note this divergence does NOT
+  reproduce on the M4 dev machine — both tiers green locally, including
+  `KILN_GOLDEN_XL=1` — so it remains cross-device, not a regression.
+- Soak: PASS, all gates held; `severed-by-drain 502 accepted` at t+766.9s
+  (unload counter moved in the ±60s window), gateway RSS late delta
+  -14.8 MB (reported, not gated). The crash-restart gate did NOT fire —
+  second consecutive clean run since the unexplained PR #45 firing. Still
+  not an explanation; the standing instruction stands.
+- Deviations: none.
+- Next: unchanged — session 3 of the MoE arc (`qwen2_moe` / `qwen3_moe`)
+  with the three carry-ins from the PR #44 entry.

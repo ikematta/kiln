@@ -699,3 +699,62 @@ async fn retryable_api_status_is_retried_then_succeeds() {
     assert_eq!(retries, 2);
     let _ = std::fs::remove_dir_all(&dest);
 }
+
+/// Zip-slip: a tree listing whose path climbs out of `dest` fails the whole
+/// job rather than writing where it points. The hub's own git-backed tree
+/// API almost certainly cannot serve this today — that is an argument about
+/// the upstream, not about this code, which neither controls nor verifies
+/// that invariant.
+#[tokio::test]
+async fn escaping_tree_path_fails_the_job_and_writes_nothing_outside_dest() {
+    let victim_name = format!("kiln-escaped-{}.txt", uuid::Uuid::now_v7());
+    let escape = format!("../{victim_name}");
+    let victim = std::env::temp_dir().join(&victim_name);
+    let (endpoint, _state) = start_stub(
+        vec![
+            ("config.json", plain(br#"{"model_type":"llama"}"#.to_vec())),
+            (escape.as_str(), plain(b"pwned".to_vec())),
+        ],
+        0,
+    )
+    .await;
+    let dest = temp_dest("escape");
+
+    let err = client(&endpoint)
+        .download_repo("org/tiny", "main", &dest, &CaptureSink::default())
+        .await
+        .expect_err("hostile tree entry is refused");
+
+    assert!(
+        matches!(&err, HubError::Api(message) if message.contains("unsafe path")),
+        "{err}"
+    );
+    assert!(!victim.exists(), "wrote outside dest: {}", victim.display());
+    // Loud, not silent-skip: the benign sibling does not download either.
+    assert!(!dest.join("config.json").exists());
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_file(&victim);
+}
+
+/// The same guard covers an absolute path, which `Path::join` would
+/// otherwise adopt wholesale, discarding `dest` entirely.
+#[tokio::test]
+async fn absolute_tree_path_fails_the_job() {
+    let (endpoint, _state) = start_stub(
+        vec![("/etc/kiln-absolute-probe", plain(b"pwned".to_vec()))],
+        0,
+    )
+    .await;
+    let dest = temp_dest("absolute");
+
+    let err = client(&endpoint)
+        .download_repo("org/tiny", "main", &dest, &CaptureSink::default())
+        .await
+        .expect_err("absolute tree entry is refused");
+
+    assert!(
+        matches!(&err, HubError::Api(message) if message.contains("unsafe path")),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dest);
+}
