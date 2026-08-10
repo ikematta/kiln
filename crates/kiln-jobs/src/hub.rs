@@ -32,7 +32,7 @@
 //! and tree listings follow `Link: rel="next"` pagination.
 
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -44,7 +44,9 @@ pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_ATTEMPTS: u32 = 4;
 const RETRYABLE_HTTP: &[u16] = &[408, 425, 429, 500, 502, 503, 504];
 /// Repo files never worth downloading (`.gitattributes`, README variants) —
-/// same skip set the fetch script uses.
+/// same skip set the fetch script uses. Matched against the basename only:
+/// this is a taste filter, never a containment check (see
+/// [`is_contained_relative`]).
 const SKIP_PREFIXES: &[&str] = &[".", "README"];
 pub const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
 /// Written into the destination directory after a complete download.
@@ -291,6 +293,14 @@ impl HubClient {
                 let Some(path) = item["path"].as_str() else {
                     continue;
                 };
+                // Checked before the skip filter so a hostile path is loud
+                // even when its basename would have been skipped quietly
+                // (`../../../.bashrc` starts with `.`).
+                if !is_contained_relative(path) {
+                    return Err(HubError::Api(format!(
+                        "tree entry for {repo} has an unsafe path: {path}"
+                    )));
+                }
                 let name = path.rsplit('/').next().unwrap_or(path);
                 if SKIP_PREFIXES.iter().any(|p| name.starts_with(p)) {
                     continue;
@@ -334,6 +344,15 @@ impl HubClient {
         std::fs::create_dir_all(dest)?;
         let mut done_bytes: u64 = 0;
         for entry in &entries {
+            // Re-asserted at the point of use: `TreeEntry` is public and
+            // constructible, so `list_tree`'s check is not the only way in.
+            if !is_contained_relative(&entry.path) {
+                return Err(HubError::Api(format!(
+                    "refusing to write outside {}: {}",
+                    dest.display(),
+                    entry.path
+                )));
+            }
             let out = dest.join(&entry.path);
             if is_present_and_verified(&out, entry).await {
                 sink.emit(&Event::Skip {
@@ -519,6 +538,25 @@ impl HubClient {
     }
 }
 
+/// True when `path` names a file *inside* the destination directory.
+///
+/// Tree listings are remote JSON, so their paths are untrusted regardless of
+/// what the hub happens to enforce today: `Path::join` adopts an absolute
+/// component wholesale and honours `..`, either of which would let a listing
+/// place a file anywhere the job runner can write — a LaunchAgent, a shell
+/// rc, `authorized_keys`. Nested paths are legitimate repo layout and stay
+/// allowed (`sub/tokenizer.json`).
+fn is_contained_relative(path: &str) -> bool {
+    let mut any = false;
+    for component in Path::new(path).components() {
+        if !matches!(component, Component::Normal(_)) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 fn part_path(out: &Path) -> PathBuf {
     let mut name = out.file_name().unwrap_or_default().to_os_string();
     name.push(".part");
@@ -584,6 +622,31 @@ fn next_link(headers: &reqwest::header::HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contained_relative_paths_accepted() {
+        assert!(is_contained_relative("model.safetensors"));
+        assert!(is_contained_relative("sub/tokenizer.json"));
+        assert!(is_contained_relative("a/b/c.json"));
+    }
+
+    #[test]
+    fn escaping_tree_paths_rejected() {
+        for hostile in [
+            "../../../../Users/op/Library/LaunchAgents/com.evil.agent.plist",
+            "../../.ssh/authorized_keys",
+            "/etc/passwd",
+            "sub/../../escape.json",
+            "./config.json",
+            "..",
+            "",
+        ] {
+            assert!(
+                !is_contained_relative(hostile),
+                "tree path {hostile:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn part_path_appends_suffix() {
