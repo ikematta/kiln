@@ -33,7 +33,7 @@
 use kiln_mlx::{Array, MlxError, Stream, ops};
 
 use crate::config::Quantization;
-use crate::nn::{Linear, ModelError};
+use crate::nn::{Activation, Linear, Mlp, ModelError};
 use crate::weights::WeightStore;
 
 /// MoE geometry from the checkpoint's `config.json` (`num_experts`,
@@ -44,6 +44,39 @@ pub(crate) struct MoeOptions {
     pub(crate) num_experts: usize,
     pub(crate) top_k: usize,
     pub(crate) norm_topk_prob: bool,
+    /// The token shape the reference block operates on — see
+    /// [`TokenLayout`]. Not cosmetic: it changes the rank handed to
+    /// `gather_qmm` on the unsorted branch.
+    pub(crate) layout: TokenLayout,
+    /// `true` loads the always-on shared expert and its sigmoid gate
+    /// (`Qwen2MoeSparseMoeBlock`); olmoe has neither.
+    pub(crate) shared_expert: bool,
+}
+
+/// Which shape the reference's sparse block keeps its tokens in. The two
+/// MoE families differ here and it is NOT a free choice:
+///
+/// - `OlmoeSparseMoeBlock` flattens first (`x_flat = x.reshape(-1, D)`) and
+///   runs the router, top-k and `SwitchGLU` on 2-D token rows.
+/// - `Qwen2MoeSparseMoeBlock` never flattens; every op sees `[B, L, D]`.
+///
+/// Traced through `SwitchGLU`, the two converge on the SORTED branch:
+/// `_gather_sort`'s `x.flatten(0, -3)` collapses `[T, 1, 1, D]` and
+/// `[B, L, 1, 1, D]` to the same `[T, 1, D]`, so the three `gather_qmm`
+/// calls get byte-identical shapes either way. They do NOT converge on the
+/// unsorted branch (`indices.size < 64`), where `gather_qmm` receives a
+/// rank-4 `x` + rank-2 `indices` under `Flattened` and rank-5 + rank-3
+/// under `Native`, nor at the router matmul (`[T, D]` vs `[B, L, D]`).
+/// With Kiln's `B == 1` those differ only by a leading unit axis and are
+/// very likely bit-identical — but "very likely" is not the bar this
+/// module is held to (see the module docs), so each architecture issues
+/// the shapes its own reference issues and the goldens prove it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenLayout {
+    /// olmoe: flatten to `[T, D]` before the router.
+    Flattened,
+    /// qwen2_moe: keep `[B, L, D]` throughout.
+    Native,
 }
 
 /// One per-expert projection stack: `weight [E, out, in]` (packed u32 when
@@ -267,14 +300,24 @@ impl SwitchGlu {
         })
     }
 
-    /// `x_flat [T, D]`, `indices [T, k]` -> `[T, k, D]` — mlx-lm
-    /// `SwitchGLU.__call__`, including the `indices.size >= 64` sort
-    /// (see the module docs: the threshold is part of the op stream).
-    fn forward(&self, x_flat: &Array, indices: &Array, s: &Stream) -> Result<Array, MlxError> {
-        let (t, d) = (x_flat.dim(0), x_flat.dim(1));
-        let k = indices.dim(1);
-        // mx.expand_dims(x, (-2, -3)).
-        let x4 = ops::reshape(x_flat, &[t, 1, 1, d], s)?;
+    /// mlx-lm `SwitchGLU.__call__`, including the `indices.size >= 64`
+    /// sort (see the module docs: the threshold is part of the op stream).
+    ///
+    /// Shapes follow the caller's [`TokenLayout`]: `x [T, D]` with
+    /// `indices [T, k]` -> `[T, k, D]` under `Flattened`, and
+    /// `x [B, L, D]` with `indices [B, L, k]` -> `[B, L, k, D]` under
+    /// `Native`. `expand_dims(x, (-2, -3))` and the trailing
+    /// unflatten/squeeze carry the rank difference; the sorted branch
+    /// collapses both to the same `[T, 1, D]` working shape.
+    fn forward(&self, x: &Array, indices: &Array, s: &Stream) -> Result<Array, MlxError> {
+        let rank = x.ndim() as i32;
+        let d = x.dim(rank - 1);
+        let token_dims: Vec<i32> = (0..rank - 1).map(|i| x.dim(i)).collect();
+        let t: i32 = token_dims.iter().product();
+        let k = indices.dim(indices.ndim() as i32 - 1);
+        // mx.expand_dims(x, (-2, -3)) — [..tokens.., 1, 1, D].
+        let expanded_shape: Vec<i32> = token_dims.iter().copied().chain([1, 1, d]).collect();
+        let x4 = ops::reshape(x, &expanded_shape, s)?;
 
         let do_sort = (t as i64) * (k as i64) >= 64;
         let (xg, idx, inv_order) = if do_sort {
@@ -282,7 +325,9 @@ impl SwitchGlu {
             let idx_flat = ops::reshape(indices, &[t * k], s)?;
             let order = ops::argsort(&idx_flat, -1, s)?;
             let inv_order = ops::argsort(&order, -1, s)?;
-            // x.flatten(0, -3)[order // k].
+            // x.flatten(0, -3)[order // k]. `flatten(0, -3)` yields
+            // [T, 1, D] from BOTH layouts' expanded shapes — this is the
+            // branch where Flattened and Native converge.
             let xf = ops::reshape(&x4, &[t, 1, d], s)?;
             let divisor = Array::from_u32_slice(&[k as u32], &[1])?;
             let rows = ops::floor_divide(&order, &divisor, s)?;
@@ -306,15 +351,18 @@ impl SwitchGlu {
         let y = self.down_proj.forward(&activated, &idx, do_sort, s)?;
 
         let y = match inv_order {
-            // _scatter_unsort: x[inv_order], then unflatten to [T, k, ...].
+            // _scatter_unsort: x[inv_order], then
+            // `unflatten(0, indices.shape)` -> [..tokens.., k, 1, D].
             Some(inv) => {
                 let y = ops::take(&y, &inv, 0, s)?;
-                ops::reshape(&y, &[t, k, 1, d], s)?
+                let unflattened: Vec<i32> = token_dims.iter().copied().chain([k, 1, d]).collect();
+                ops::reshape(&y, &unflattened, s)?
             }
             None => y,
         };
-        // squeeze(-2).
-        ops::reshape(&y, &[t, k, d], s)
+        // squeeze(-2) -> [..tokens.., k, D].
+        let squeezed: Vec<i32> = token_dims.iter().copied().chain([k, d]).collect();
+        ops::reshape(&y, &squeezed, s)
     }
 }
 
@@ -329,6 +377,23 @@ pub(crate) struct MoeBlock {
     switch_mlp: SwitchGlu,
     top_k: i32,
     norm_topk_prob: bool,
+    layout: TokenLayout,
+    /// `Qwen2MoeSparseMoeBlock`'s always-on expert; `None` for olmoe.
+    /// Boxed so the family WITHOUT a shared expert does not carry its
+    /// footprint in every block (and so `FeedForward`'s variants stay
+    /// within clippy's size-difference bar).
+    shared_expert: Option<Box<SharedExpert>>,
+}
+
+/// The shared (unrouted) expert every token passes through, gated by a
+/// scalar sigmoid — `mlp.shared_expert` + `mlp.shared_expert_gate` in
+/// `Qwen2MoeSparseMoeBlock`. Its width is the checkpoint's
+/// `shared_expert_intermediate_size`, independent of the routed experts'
+/// `moe_intermediate_size`; both come from the weight shapes.
+#[derive(Debug)]
+pub(crate) struct SharedExpert {
+    mlp: Mlp,
+    gate: Linear,
 }
 
 impl MoeBlock {
@@ -339,39 +404,99 @@ impl MoeBlock {
         opts: &MoeOptions,
         s: &Stream,
     ) -> Result<Self, ModelError> {
+        let shared_expert = if opts.shared_expert {
+            Some(Box::new(SharedExpert {
+                mlp: Mlp::load(
+                    store,
+                    &format!("{mlp_prefix}.shared_expert"),
+                    quantization,
+                    Activation::Silu,
+                )?,
+                gate: Linear::load(
+                    store,
+                    &format!("{mlp_prefix}.shared_expert_gate"),
+                    quantization,
+                )?,
+            }))
+        } else {
+            None
+        };
         Ok(Self {
             gate: Linear::load(store, &format!("{mlp_prefix}.gate"), quantization)?,
             switch_mlp: SwitchGlu::load(store, mlp_prefix, opts.num_experts, quantization, s)?,
             top_k: opts.top_k as i32,
             norm_topk_prob: opts.norm_topk_prob,
+            layout: opts.layout,
+            shared_expert,
         })
     }
 
-    /// `x [B, L, D] -> [B, L, D]` — mlx-lm `OlmoeSparseMoeBlock.__call__`.
+    /// `x [B, L, D] -> [B, L, D]` — mlx-lm `OlmoeSparseMoeBlock.__call__`
+    /// under [`TokenLayout::Flattened`], `Qwen2MoeSparseMoeBlock.__call__`
+    /// under [`TokenLayout::Native`]. The two references share every op in
+    /// this body; they differ in the token shape those ops see (see
+    /// [`TokenLayout`]) and in the shared expert, which only qwen2_moe has.
     pub(crate) fn forward(&self, x: &Array, s: &Stream) -> Result<Array, MlxError> {
         let (b, l, d) = (x.dim(0), x.dim(1), x.dim(2));
         let t = b * l;
-        let x_flat = ops::reshape(x, &[t, d], s)?;
+        // olmoe flattens to [T, D] first; qwen2_moe routes on [B, L, D].
+        let routed_in = match self.layout {
+            TokenLayout::Flattened => ops::reshape(x, &[t, d], s)?,
+            TokenLayout::Native => x.clone(),
+        };
+        // Token axes of whatever layout we are in: [T] or [B, L].
+        let token_dims: Vec<i32> = match self.layout {
+            TokenLayout::Flattened => vec![t],
+            TokenLayout::Native => vec![b, l],
+        };
 
-        let router_logits = self.gate.forward(&x_flat, s)?;
-        // Reference: mx.softmax(router_logits, axis=1, precise=True) on the
-        // 2-D [T, E] — axis 1 is the last axis.
+        let router_logits = self.gate.forward(&routed_in, s)?;
+        // Reference: `softmax(..., axis=1, precise=True)` on olmoe's 2-D
+        // [T, E] and `axis=-1` on qwen2_moe's [B, L, E] — the last axis in
+        // both, i.e. over the experts.
         let routing_weights = ops::softmax(&router_logits, -1, true, s)?;
         // argpartition(-weights, kth=k-1)[..., :k]: the top-k expert ids in
         // partition order (deliberately NOT value-sorted — see module docs).
         let neg = ops::negative(&routing_weights, s)?;
         let partitioned = ops::argpartition(&neg, self.top_k - 1, -1, s)?;
-        let indices = ops::slice(&partitioned, &[0, 0], &[t, self.top_k], s)?;
+        let start = vec![0; token_dims.len() + 1];
+        let stop: Vec<i32> = token_dims.iter().copied().chain([self.top_k]).collect();
+        let indices = ops::slice(&partitioned, &start, &stop, s)?;
         let mut scores = ops::take_along_axis(&routing_weights, &indices, -1, s)?;
+        // olmoe only: qwen2_moe's block has no `norm_topk_prob` knob and
+        // never normalizes (config.rs type docs).
         if self.norm_topk_prob {
             scores = ops::divide(&scores, &ops::sum(&scores, -1, true, s)?, s)?;
         }
 
-        let y = self.switch_mlp.forward(&x_flat, &indices, s)?;
+        let y = self.switch_mlp.forward(&routed_in, &indices, s)?;
         // (y * scores[..., None]).sum(axis=-2).
-        let scores3 = ops::reshape(&scores, &[t, self.top_k, 1], s)?;
-        let y = ops::multiply(&y, &scores3, s)?;
+        let scores_shape: Vec<i32> = token_dims.iter().copied().chain([self.top_k, 1]).collect();
+        let scores_b = ops::reshape(&scores, &scores_shape, s)?;
+        let y = ops::multiply(&y, &scores_b, s)?;
         let y = ops::sum(&y, -2, false, s)?;
-        ops::reshape(&y, &[b, l, d], s)
+        // Flattened reduces to [T, D] and owes the caller [B, L, D];
+        // Native is already there and the reference issues no reshape.
+        let y = match self.layout {
+            TokenLayout::Flattened => ops::reshape(&y, &[b, l, d], s)?,
+            TokenLayout::Native => y,
+        };
+
+        match &self.shared_expert {
+            None => Ok(y),
+            // `y + sigmoid(shared_expert_gate(x)) * shared_expert(x)`, in
+            // the reference's operand order (the gated product is formed
+            // first, then added to the routed sum).
+            Some(shared) => {
+                // Issued in the reference's order — the expert first, then
+                // its gate — so the graph is built the same way round. The
+                // two are independent subgraphs, so this cannot change the
+                // arithmetic; it costs nothing and leaves one less
+                // difference to reason about.
+                let out = shared.mlp.forward(x, s)?;
+                let gate = ops::sigmoid(&shared.gate.forward(x, s)?, s)?;
+                ops::add(&y, &ops::multiply(&gate, &out, s)?, s)
+            }
+        }
     }
 }
