@@ -10024,3 +10024,95 @@
   landed and a third (`qwen3_moe`) reachable only on bigger hardware, is
   the MoE arc considered closed on M4-class hardware, or should the
   ADR 0005 speculation review be scheduled before moving on?
+
+## [2026-10-06] Phase 6 / MoE arc Session 3 — PR #50 CI: admin-UI metrics cross-check failed a SECOND time; mechanism re-diagnosed — BLOCKED
+- CI, run 37489532452 (PR #50, head c1f9a11). `test-macos` FAILED at the
+  blocking E2E step (1h6m10s); lint, compile-linux and test-macos-release
+  passed. Everything before the E2E step on `test-macos` passed: workspace
+  305 passed / 0 failed, all 17 blocking model-gated `test result:` lines
+  ok, smoke ok, python worker ok. The soak never ran (skipped after the
+  E2E failure). Not re-run: this is the second occurrence, and the PR #49
+  entry says to treat a second occurrence as signal.
+- The failure, the same test and assertion as PR #49 (run 31366996328):
+  ```
+  tests/e2e/test_admin_ui.py::test_admin_ui_live_queue_depth_and_gateway_counters
+  AssertionError: UI pool total 512 disagrees with the scrape
+  assert (8 + 504) == (0.0 + 0.0)
+  admin UI queue depth under a 16-deep flood: 8 / 1
+  admin UI kv blocks (allocated / free) under load: 8 / 504
+  E2E: 1 failed, 131 passed, 4 skipped
+  ```
+- Attribution: NOT this PR. The diff touches kiln-models (qwen2_moe,
+  moe.rs, config), golden fixtures, registry.rs's routing table, SPEC,
+  and the fetch script. It does not touch the supervisor, metrics, the
+  admin SSE path, the Stats RPC, or the worker. The stack in the failing
+  test serves llama-3.2-1b-4bit, which this PR does not touch.
+- CORRECTION to the PR #49 entry's mechanism (that entry stays as written;
+  this supersedes its hypothesis). That entry reasoned that an ABSENT
+  `kiln_worker_kv_blocks_*` series means `WorkerStatGauges::record` was
+  never called, and pointed at the `stats_supported` latch. This run's
+  scrape contradicts that. It contains
+  `kiln_worker_tokens_generated_total{model="llama-3.2-1b-4bit"} 0` (and
+  `tokens_prefilled_total 0`, `ssd_*_total 0`), and `record()`
+  (`metrics.rs`, called only from `supervisor.rs:762`) is the ONLY writer
+  of those series. So `record()` WAS called: the scrape is serving a
+  stale sample, not missing one. A pool total of 0 in that sample means
+  it predates the pool's creation (the test's own comment notes the pool
+  "is materialized on the first request, not at load"). The latch cannot
+  be the cause on this stack: the rust worker implements Stats, the UI
+  read it successfully, and the latch only fires on `Unimplemented`.
+- The mechanism, from reading the code:
+  - Two independent samplers read the same worker atomics, on unrelated
+    1 s phases. The admin SSE uses `STATS_TICK` = 1 s
+    (`admin_models.rs:34`) with an on-demand `client.stats()` per tick;
+    `/metrics` uses the supervisor's `HEALTH_POLL_INTERVAL` = 1 s
+    (`supervisor.rs:43`). The worker's `stats()` reads atomics written by
+    `publish_stats` (`engine.rs:666`), so it never waits on the engine
+    thread. The UI can therefore be up to about a second (plus RPC time)
+    fresher than `/metrics`.
+  - The test's cross-check asserts that the pool total "is the fixed pool
+    size and cannot" race (`test_admin_ui.py`, comment above the assert
+    at line 310). That is true only once the `/metrics` sampler has
+    seen the pool. Across the 0 → N creation it is false, and the test
+    checks at exactly that boundary: it scrapes immediately after the
+    UI first shows a non-empty queue and an allocated pool, which on a
+    burst that arrives all at once is the first SSE tick after the
+    first request is admitted. Both failures show an early-flood
+    allocation (8/504 here, 24/488 on PR #49), which is consistent.
+  - Not excluded: the supervisor's `_ => {}` (`supervisor.rs:768-770`)
+    drops a failed Health or Stats sample without logging, so a run of
+    dropped samples would look identical in CI. There is no reason for
+    Stats to fail (it only loads atomics), but because nothing is logged
+    it cannot be ruled out from the evidence. That alone is a reason to
+    fix the silent swallow.
+- Test NOT changed. Per the hard rule, the test's stated invariant looks
+  wrong at the creation boundary, so this is recorded rather than
+  edited.
+- ADR 0004 record: the advisory golden lane failed again on
+  gemma-3-1b-it-4bit/chat-basic (gather path, 21 prompt tokens). Same
+  fixture as before, now the SEVENTH consecutive run. Read from the step
+  LOG (`test result: FAILED. 0 passed; 1 failed`), not the jobs API,
+  which shows the step as `success`. Pattern unchanged. It still does
+  not reproduce on the M4 dev machine.
+- Deviations: none.
+- Next: resolve the decision below, then get PR #50 green.
+- DECISION NEEDED: how to handle the admin-UI cross-check flake.
+  - A: Re-run the failed `test-macos` job now. Merge PR #50 on green.
+    Fix the test separately in its own PR: before comparing, poll the
+    scrape (bounded, e.g. 5 s) until it reflects a created pool
+    (`allocated + free > 0`), then assert exact equality with the UI
+    total as today. The assertion's strength is unchanged; only the
+    creation-boundary race is removed. Fastest path for #50, but #50
+    merges on a re-run green.
+  - B: Land that same test fix first as its own PR, then merge main
+    into PR #50 and let CI run on it. Costs one extra ~1h15m CI cycle
+    before #50 can merge, but #50 then never merges past a known flake.
+  - C: Fix it in the gateway instead: one sampler feeding both the SSE
+    stream and `/metrics` (or `/metrics` pulling Stats when scraped), so
+    the two can never disagree because of sampling phase. That is the
+    structural fix, but it changes how SPEC §5/§2.3's polled re-export
+    works and is far larger than the flake.
+  - In every option, the supervisor's silent `_ => {}` and the permanent
+    `stats_supported` latch (`supervisor.rs:759-770`) stay queued as
+    their own task. They are real hazards, but this run shows they are
+    not what failed here.
