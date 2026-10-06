@@ -40,7 +40,7 @@ use kiln_engine::{KvDims, PagedKv, StepBatch, StepModel};
 use kiln_mlx::{Array, MlxError, Stream};
 
 use crate::config::OlmoeConfig;
-use crate::moe::MoeOptions;
+use crate::moe::{MoeOptions, TokenLayout};
 use crate::nn::{AttentionShape, CausalLm, ModelError, Rope, TrunkOptions};
 use crate::weights::WeightStore;
 
@@ -74,6 +74,10 @@ impl OlmoeModel {
                 num_experts: config.num_experts,
                 top_k: config.num_experts_per_tok,
                 norm_topk_prob: config.norm_topk_prob,
+                // `OlmoeSparseMoeBlock` flattens to [T, D] before routing
+                // and has no shared expert.
+                layout: TokenLayout::Flattened,
+                shared_expert: false,
             }),
             ..TrunkOptions::default()
         };

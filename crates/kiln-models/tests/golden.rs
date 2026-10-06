@@ -78,6 +78,17 @@ fn golden_xl_root() -> PathBuf {
 /// runners cannot hold these checkpoints at all.
 const XL_GATE: &str = "KILN_GOLDEN_XL";
 
+/// Every `model_type` whose trunk is mixture-of-experts, and which
+/// therefore inherits the ADR 0007 decision (4) engine posture asserted in
+/// [`run_model`]. This is a LIST, not an equality test, because the
+/// posture is keyed on the architecture family and Kiln now has more than
+/// one: a new MoE family that forgets to appear here would have its
+/// monolithic-prefill / no-speculation posture go silently unasserted
+/// (PROGRESS 2026-07-28, carry-in (a)). Keep it in step with the MoE arms
+/// of `AnyModel::monolithic_prefill_required` /
+/// `AnyModel::speculative_gamma_bound`.
+const MOE_ARCHITECTURES: &[&str] = &["olmoe", "qwen2_moe"];
+
 type Collected = (Rc<RefCell<Vec<u32>>>, Rc<RefCell<Option<FinishSummary>>>);
 
 /// Submits one greedy request (no stop tokens) and returns its
@@ -248,7 +259,7 @@ fn run_model(model_name: &str, model_dir: &PathBuf, fixture_paths: &[PathBuf]) {
     // dispatch, so a quantization variant that somehow slipped the
     // posture would fail here instead of silently fine-chunking a MoE
     // prefill or attaching a drafter to an uncertified trunk.
-    if model.model_type() == "olmoe" {
+    if MOE_ARCHITECTURES.contains(&model.model_type()) {
         assert!(
             model.monolithic_prefill_required(),
             "{model_name}: MoE trunks take reference-shaped prefill (model.rs)"

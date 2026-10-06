@@ -59,6 +59,20 @@ PINS=(
   # in PROGRESS.md (2026-07-27) about hosted-CI memory: a 7 GB runner
   # cannot load this checkpoint at all.
   "olmoe-1b-7b-0125-8bit  mlx-community/OLMoE-1B-7B-0125-Instruct-8bit  7055a795fc029a51108f881d4a118c6f17deb59f"
+  # MoE session 3 (PROGRESS 2026-09-21): the SECOND MoE architecture —
+  # `qwen2_moe`, the shared-expert MoE family. Smallest qwen2_moe
+  # checkpoint that exists (14.3B total / 2.7B active, 8.51 GB at 4-bit
+  # in 2 shards); `qwen3_moe`'s smallest is Qwen3-30B-A3B at 17.2 GB,
+  # which does not fit this 16 GB dev machine's unified memory at all,
+  # so qwen2_moe is the only reachable second family here.
+  # New surface vs the OLMoE pins: a SHARED expert + sigmoid gate added
+  # to the routed sum, experts sized by `moe_intermediate_size` (1408)
+  # independently of the dense `intermediate_size` (5632), and qwen2
+  # attention (q/k/v biases, no qk-norm). Uniform affine
+  # {group_size: 64, bits: 4}, no per-module overrides (verified against
+  # the pinned revision's config.json). Opt-in for the same reason as
+  # the 8-bit OLMoE cell: a ~7 GB hosted runner cannot load it.
+  "qwen1.5-moe-a2.7b-4bit  mlx-community/Qwen1.5-MoE-A2.7B-Chat-4bit  cf116003d120c4216cf008eba169f98b95bdf3ee"
 )
 
 # Pins a BARE run does not fetch — checkpoints hosted CI cannot use at all
@@ -70,6 +84,7 @@ PINS=(
 # visible, one-line decision (PROGRESS 2026-07-27, PM-directed option C).
 OPT_IN=(
   "olmoe-1b-7b-0125-8bit"
+  "qwen1.5-moe-a2.7b-4bit"
 )
 
 DEST="${KILN_TEST_MODELS:-$HOME/.kiln/test-models}"

@@ -15,6 +15,7 @@ use crate::llama::LlamaModel;
 use crate::nn::ModelError;
 use crate::olmoe::OlmoeModel;
 use crate::qwen2::Qwen2Model;
+use crate::qwen2_moe::Qwen2MoeModel;
 use crate::qwen3::Qwen3Model;
 
 /// A loaded model of any supported architecture, dispatched on
@@ -27,6 +28,7 @@ pub enum AnyModel {
     Gemma2(Gemma2Model),
     Gemma3(Gemma3Model),
     Olmoe(OlmoeModel),
+    Qwen2Moe(Qwen2MoeModel),
 }
 
 impl AnyModel {
@@ -42,6 +44,7 @@ impl AnyModel {
             ArchConfig::Gemma2(_) => Ok(Self::Gemma2(Gemma2Model::load(dir, s)?)),
             ArchConfig::Gemma3(_) => Ok(Self::Gemma3(Gemma3Model::load(dir, s)?)),
             ArchConfig::Olmoe(_) => Ok(Self::Olmoe(OlmoeModel::load(dir, s)?)),
+            ArchConfig::Qwen2Moe(_) => Ok(Self::Qwen2Moe(Qwen2MoeModel::load(dir, s)?)),
         }
     }
 
@@ -53,6 +56,7 @@ impl AnyModel {
             Self::Gemma2(m) => &m.config().model_type,
             Self::Gemma3(m) => &m.config().model_type,
             Self::Olmoe(m) => &m.config().model_type,
+            Self::Qwen2Moe(m) => &m.config().model_type,
         }
     }
 
@@ -65,6 +69,7 @@ impl AnyModel {
             Self::Gemma2(m) => m.config().eos_token_ids(),
             Self::Gemma3(m) => m.config().eos_token_ids(),
             Self::Olmoe(m) => m.config().eos_token_ids(),
+            Self::Qwen2Moe(m) => m.config().eos_token_ids(),
         }
     }
 
@@ -77,6 +82,7 @@ impl AnyModel {
             Self::Gemma2(m) => m.kv_dims(),
             Self::Gemma3(m) => m.kv_dims(),
             Self::Olmoe(m) => m.kv_dims(),
+            Self::Qwen2Moe(m) => m.kv_dims(),
         }
     }
 
@@ -108,10 +114,11 @@ impl AnyModel {
             Self::Gemma2(m) => m.config().quantization.is_none(),
             Self::Gemma3(m) => m.config().quantization.is_none(),
             Self::Olmoe(m) => m.config().quantization.is_none(),
+            Self::Qwen2Moe(m) => m.config().quantization.is_none(),
         };
         match self {
             Self::Gemma2(m) => dense || m.monolithic_prefill_required(),
-            Self::Olmoe(_) => true,
+            Self::Olmoe(_) | Self::Qwen2Moe(_) => true,
             _ => dense,
         }
     }
@@ -182,7 +189,7 @@ impl AnyModel {
             // (tracked in the SPEC §7.2 MoE backlog note / ADR 0007), a
             // configured drafter on a MoE target is a loud load failure
             // by design.
-            Self::Olmoe(_) => return None,
+            Self::Olmoe(_) | Self::Qwen2Moe(_) => return None,
             Self::Llama(m) => {
                 let c = m.config();
                 (
@@ -265,6 +272,7 @@ impl AnyModel {
             Self::Gemma2(m) => m.calibrate_deterministic_width(s),
             Self::Gemma3(m) => m.calibrate_deterministic_width(s),
             Self::Olmoe(m) => m.calibrate_deterministic_width(s),
+            Self::Qwen2Moe(m) => m.calibrate_deterministic_width(s),
         }
     }
 }
@@ -283,6 +291,7 @@ impl StepModel for AnyModel {
             Self::Gemma2(m) => m.forward_step(batch, kv, s),
             Self::Gemma3(m) => m.forward_step(batch, kv, s),
             Self::Olmoe(m) => m.forward_step(batch, kv, s),
+            Self::Qwen2Moe(m) => m.forward_step(batch, kv, s),
         }
     }
 }

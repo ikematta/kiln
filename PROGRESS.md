@@ -9857,3 +9857,262 @@
 - Deviations: none.
 - Next: unchanged — session 3 of the MoE arc (`qwen2_moe` / `qwen3_moe`)
   with the three carry-ins from the PR #44 entry.
+
+## [2026-09-21] Phase 6 / MoE arc Session 3 — qwen2_moe, the second MoE architecture — DONE
+- What:
+  - `crates/kiln-models/src/qwen2_moe.rs` (new) + `Qwen2MoeConfig` in
+    `config.rs`, `AnyModel::Qwen2Moe` in `model.rs`, `"qwen2_moe"` in
+    `SUPPORTED_ARCHITECTURES`. Ported op-for-op from
+    `mlx_lm.models.qwen2_moe` at the pinned reference (mlx-lm 0.31.2).
+  - `moe.rs` gained the two things this family needs and OLMoE lacks: a
+    SHARED expert (`mlp.shared_expert` + `mlp.shared_expert_gate`, added
+    to the routed sum as `y + sigmoid(gate(x)) * expert(x)`) and a
+    `TokenLayout` enum. Attention is plain qwen2 (q/k/v biases, no
+    qk-norm), so the whole architectural delta is in the feed-forward.
+  - New pin `qwen1.5-moe-a2.7b-4bit` (`mlx-community/Qwen1.5-MoE-A2.7B-Chat-4bit`
+    @ cf116003d120…), OPT_IN like the 8-bit OLMoE cell; fixtures in
+    `tests/golden-xl/qwen1.5-moe-a2.7b-4bit/` (6 cases, generated from
+    mlx-lm BEFORE the implementation was exercised).
+  - Carry-in (a) CLOSED: golden.rs's `model_type() == "olmoe"` literal is
+    now `MOE_ARCHITECTURES: &[&str] = &["olmoe", "qwen2_moe"]`, so a
+    future MoE family that forgets to register fails the ADR 0007
+    posture assertion instead of skipping it silently.
+  - Carry-in (b) APPLIED: 8.51 GB > the ~7 GB hosted-runner bar, so the
+    fixtures went to `tests/golden-xl/` + an `OPT_IN` entry, not
+    `tests/golden/`.
+  - Carry-in (c) HONORED: `KILN_GOLDEN_XL=1` was run on this dev machine
+    (acceptance below); CI never does.
+  - `registry.rs`: `qwen2_moe` added to the auto-routing matrix.
+- Decisions (within spec latitude):
+  - **qwen2_moe, not qwen3_moe — forced by hardware, not preference.**
+    The smallest published qwen3_moe checkpoint is Qwen3-30B-A3B at
+    17.19 GB (verified against the HF API), which does not fit this
+    16 GB M4 dev machine's unified memory at all. The smallest qwen2_moe
+    is 8.51 GB and loads. The session task named either family; only one
+    was reachable. qwen3_moe therefore remains UNIMPLEMENTED and stays in
+    registry.rs's unimplemented-family lists.
+  - **`norm_topk_prob` is hardcoded `false`, NOT read from config.json.**
+    `Qwen2MoeSparseMoeBlock` has no such knob and never normalizes its
+    top-k scores, where `OlmoeSparseMoeBlock` does when its config asks.
+    Reading the key would silently diverge from the reference on any
+    checkpoint carrying `true` (this pin carries `false`, so the bug
+    would not have shown here).
+  - **`decoder_sparse_step` / `mlp_only_layers` are REJECTED at load, not
+    honored and not ignored.** The reference builds a sparse block for
+    every layer unconditionally, so a checkpoint asking for interleaved
+    dense layers is one mlx-lm itself would mis-serve; reproducing that
+    bit-for-bit would mean knowingly serving a wrong model. Kiln fails
+    loudly exactly where the two would disagree and matches the reference
+    everywhere it is well defined — which is every published qwen2_moe
+    checkpoint (`decoder_sparse_step: 1`, no `mlp_only_layers`).
+  - **`TokenLayout` rather than assuming a leading unit axis is free.**
+    qwen2_moe routes on `[B, L, D]`; olmoe flattens to `[T, D]` first.
+    Traced through `SwitchGLU`, the two CONVERGE on the sorted branch —
+    `_gather_sort`'s `x.flatten(0, -3)` collapses `[T,1,1,D]` and
+    `[B,L,1,1,D]` to the same `[T,1,D]` — but NOT on the unsorted branch
+    (`indices.size < 64`), where `gather_qmm` gets rank-4 + rank-2 under
+    Flattened and rank-5 + rank-3 under Native, nor at the router matmul.
+    With Kiln's `B == 1` those differ only by a leading unit axis and are
+    very likely bit-identical, but moe.rs's stated contract is not to
+    "improve" op streams on a likelihood. Each family now issues its own
+    reference's shapes. The goldens vindicated this: both families are
+    exact.
+  - Shared expert is `Option<Box<SharedExpert>>` so the family WITHOUT
+    one does not carry its footprint per block (and `FeedForward`'s
+    variants stay inside clippy's size-difference bar).
+  - The shared expert's two sub-forwards are issued in the reference's
+    order (expert, then gate). Independent subgraphs, so this cannot
+    change arithmetic — done because it costs nothing and removes a
+    difference from the op stream.
+- Test-list change, flagged explicitly because it LOOKS like a weakened
+  test and is not: `qwen2_moe` was removed from the two
+  unimplemented-MoE-family lists in `registry.rs`
+  (`auto_routes_unservable_moe_configs_to_python_with_a_named_reason`,
+  `explicit_rust_on_an_unimplemented_moe_family_is_a_startup_error`)
+  because it became IMPLEMENTED. No assertion was relaxed; the remaining
+  four families (`qwen3_moe`, `phimoe`, `mixtral`, `deepseek_v3`) are
+  still genuinely unimplemented and keep both tests at full strength, and
+  the positive counterpart is a new `qwen2_moe` row in
+  `auto_prefers_rust_but_downgrades_without_tokenizer`.
+- Deviations: none. No new dependencies; no `unsafe`; no proto change; no
+  ADR edited; no existing pin bumped; no fixture regenerated.
+- ENVIRONMENT FINDING (cost most of the session, worth recording):
+  - Xcode was upgraded to **27.0 (27A266a)** and the upgrade DROPPED the
+    separately-installed Metal Toolchain. `xcrun -sdk macosx metal
+    --version` failed, so kiln-mlx's build.rs autodetected and built
+    `MLX_BUILD_METAL=OFF`.
+  - **The golden parity suite then PASSED, vacuously, in 0.00s:**
+    `metal_is_available()` was false, the test `return`ed, and libtest
+    reported `ok. 1 passed; 0 failed`. Caught only by reading the
+    `MLX_BUILD_METAL=` line in the build output. Filed as its own task —
+    the harness already asserts loudly when `KILN_GOLDEN_XL=1` is set
+    without `KILN_TEST_MODELS` ("a misconfiguration to surface rather
+    than swallow"); the same argument plausibly applies to a missing GPU.
+  - Restoring the toolchain was not sufficient: `cargo test -p
+    kiln-models` reused the STALE Metal-OFF build-script result (2.04s,
+    far too fast for a real 3-minute MLX rebuild). build.rs declares
+    `rerun-if-changed` on build.rs / the vendored CMakeLists / a header
+    and `rerun-if-env-changed=KILN_MLX_METAL`, but NOT on anything
+    reflecting whether the toolchain exists — so cargo cannot know the
+    answer went stale, in either direction. Worked around for this
+    session with `touch crates/kiln-mlx/build.rs`; filed as its own task.
+    Python was unaffected throughout (the pip `mlx` wheel ships
+    precompiled shaders), which is why fixture generation was never
+    blocked.
+- Acceptance:
+  ```
+  $ cargo fmt --check                                     -> clean
+  $ cargo clippy --workspace --all-targets -- -D warnings -> clean
+  $ uv run --project python/kiln_worker_py ruff check python/ tests/e2e scripts
+    All checks passed!
+  $ uv run --project python/kiln_worker_py ruff format --check python/ tests/e2e scripts
+    41 files already formatted
+
+  $ cargo test --workspace     (env-less, as CI runs it)
+    EXIT=0   targets: 56  passed: 305  failed: 0
+
+  $ cargo run -p kiln-mlx --example smoke   -> 3.0   (Metal restored)
+  $ KILN_TEST_MODELS=~/.kiln/test-models cargo test -p kiln-models --test calibration
+    calibrated deterministic width = 9 (independent boundary: first divergence at M=10)
+    test result: ok. 1 passed; 0 failed; finished in 1.07s
+
+  $ KILN_GOLDEN_XL=1 KILN_TEST_MODELS=~/.kiln/test-models \
+      cargo test -p kiln-models --test golden -- --nocapture
+    kiln-mlx: building vendored mlx-c (MLX_BUILD_METAL=ON)
+    == gemma-2-2b-it-4bit:       model_type=gemma2,      6 fixture(s), det width 9, monolithic true,  envelope None
+    == gemma-3-1b-it-4bit:       model_type=gemma3_text, 6 fixture(s), det width 9, monolithic false, envelope Some(7)
+    == llama-3.2-1b-4bit:        model_type=llama,       6 fixture(s), det width 9, monolithic false, envelope Some(7)
+    == olmoe-1b-7b-0125-4bit:    model_type=olmoe,       6 fixture(s), det width 9, monolithic true,  envelope None
+    == qwen2.5-0.5b-4bit:        model_type=qwen2,       5 fixture(s), det width 9, monolithic false, envelope Some(3)
+    == qwen3-0.6b-4bit:          model_type=qwen3,       5 fixture(s), det width 9, monolithic false, envelope Some(7)
+    == qwen3-0.6b-8bit:          model_type=qwen3,       6 fixture(s), det width 9, monolithic false, envelope Some(7)
+    == smollm2-135m-bf16:        model_type=llama,       6 fixture(s), det width 1, monolithic true,  envelope None
+    == olmoe-1b-7b-0125-8bit:    model_type=olmoe,       6 fixture(s), det width 9, monolithic true,  envelope None
+    == qwen1.5-moe-a2.7b-4bit:   model_type=qwen2_moe,   6 fixture(s), det width 9, monolithic true,  envelope None
+    232 "exact match" lines across 10 models, 0 failures
+    test result: ok. 1 passed; 0 failed; finished in 1357.16s
+  ```
+  The new family matched on all four round types (gather and
+  paged-attention kernel, each at single-request and decode width 16),
+  including the 137-token `raw-tiny-remainder` padded-tail probe and the
+  261-token long prefill. BOTH OLMoE cells still match exactly, which is
+  the regression check that matters here: `moe.rs` is shared code and
+  `TokenLayout::Flattened` had to preserve the old path byte-for-byte.
+  Also note gemma-3-1b-it-4bit/chat-basic passed AGAIN on this machine —
+  the ADR 0004 advisory divergence remains cross-device, not a
+  regression; expect the CI lane to keep failing on the same fixture and
+  read its verdict from the step LOG, never the jobs API.
+  One workspace failure occurred on an earlier run and is NOT in the
+  numbers above: `admin_register::tests::
+  estimate_prices_local_dirs_against_the_live_budget` failed `fits ==
+  true` while the 8.51 GB download had the box at
+  `kern.memorystatus_vm_pressure_level = 2`. Re-run at level 1: passes.
+  Same environmental cause already recorded on 2026-08-04; admin_register
+  is untouched by this change.
+- Next: the MoE arc's remaining items are (1) `qwen3_moe`, still
+  unimplemented and NOT reachable on this 16 GB machine — it needs
+  hardware that can hold a 17.19 GB checkpoint, so it is blocked on the
+  same M3 Ultra access the ADR 0007 backlog already tracks; and (2) the
+  ADR 0005 geometry review that would let any MoE family speculate,
+  which no session has done. Separately queued and unrelated to the MoE
+  arc: the gateway supervisor's `stats_supported` latch
+  (`supervisor.rs:759-770`, permanently latched to `false` on a single
+  `Unimplemented`, with every other error silently swallowed by
+  `_ => {}`), filed out of the PR #49 flake analysis and still unfiled as
+  a GitHub issue.
+- DECISION NEEDED: none blocking. For the PM queue: with two MoE families
+  landed and a third (`qwen3_moe`) reachable only on bigger hardware, is
+  the MoE arc considered closed on M4-class hardware, or should the
+  ADR 0005 speculation review be scheduled before moving on?
+
+## [2026-10-06] Phase 6 / MoE arc Session 3 — PR #50 CI: admin-UI metrics cross-check failed a SECOND time; mechanism re-diagnosed — BLOCKED
+- CI, run 37489532452 (PR #50, head c1f9a11). `test-macos` FAILED at the
+  blocking E2E step (1h6m10s); lint, compile-linux and test-macos-release
+  passed. Everything before the E2E step on `test-macos` passed: workspace
+  305 passed / 0 failed, all 17 blocking model-gated `test result:` lines
+  ok, smoke ok, python worker ok. The soak never ran (skipped after the
+  E2E failure). Not re-run: this is the second occurrence, and the PR #49
+  entry says to treat a second occurrence as signal.
+- The failure, the same test and assertion as PR #49 (run 31366996328):
+  ```
+  tests/e2e/test_admin_ui.py::test_admin_ui_live_queue_depth_and_gateway_counters
+  AssertionError: UI pool total 512 disagrees with the scrape
+  assert (8 + 504) == (0.0 + 0.0)
+  admin UI queue depth under a 16-deep flood: 8 / 1
+  admin UI kv blocks (allocated / free) under load: 8 / 504
+  E2E: 1 failed, 131 passed, 4 skipped
+  ```
+- Attribution: NOT this PR. The diff touches kiln-models (qwen2_moe,
+  moe.rs, config), golden fixtures, registry.rs's routing table, SPEC,
+  and the fetch script. It does not touch the supervisor, metrics, the
+  admin SSE path, the Stats RPC, or the worker. The stack in the failing
+  test serves llama-3.2-1b-4bit, which this PR does not touch.
+- CORRECTION to the PR #49 entry's mechanism (that entry stays as written;
+  this supersedes its hypothesis). That entry reasoned that an ABSENT
+  `kiln_worker_kv_blocks_*` series means `WorkerStatGauges::record` was
+  never called, and pointed at the `stats_supported` latch. This run's
+  scrape contradicts that. It contains
+  `kiln_worker_tokens_generated_total{model="llama-3.2-1b-4bit"} 0` (and
+  `tokens_prefilled_total 0`, `ssd_*_total 0`), and `record()`
+  (`metrics.rs`, called only from `supervisor.rs:762`) is the ONLY writer
+  of those series. So `record()` WAS called: the scrape is serving a
+  stale sample, not missing one. A pool total of 0 in that sample means
+  it predates the pool's creation (the test's own comment notes the pool
+  "is materialized on the first request, not at load"). The latch cannot
+  be the cause on this stack: the rust worker implements Stats, the UI
+  read it successfully, and the latch only fires on `Unimplemented`.
+- The mechanism, from reading the code:
+  - Two independent samplers read the same worker atomics, on unrelated
+    1 s phases. The admin SSE uses `STATS_TICK` = 1 s
+    (`admin_models.rs:34`) with an on-demand `client.stats()` per tick;
+    `/metrics` uses the supervisor's `HEALTH_POLL_INTERVAL` = 1 s
+    (`supervisor.rs:43`). The worker's `stats()` reads atomics written by
+    `publish_stats` (`engine.rs:666`), so it never waits on the engine
+    thread. The UI can therefore be up to about a second (plus RPC time)
+    fresher than `/metrics`.
+  - The test's cross-check asserts that the pool total "is the fixed pool
+    size and cannot" race (`test_admin_ui.py`, comment above the assert
+    at line 310). That is true only once the `/metrics` sampler has
+    seen the pool. Across the 0 → N creation it is false, and the test
+    checks at exactly that boundary: it scrapes immediately after the
+    UI first shows a non-empty queue and an allocated pool, which on a
+    burst that arrives all at once is the first SSE tick after the
+    first request is admitted. Both failures show an early-flood
+    allocation (8/504 here, 24/488 on PR #49), which is consistent.
+  - Not excluded: the supervisor's `_ => {}` (`supervisor.rs:768-770`)
+    drops a failed Health or Stats sample without logging, so a run of
+    dropped samples would look identical in CI. There is no reason for
+    Stats to fail (it only loads atomics), but because nothing is logged
+    it cannot be ruled out from the evidence. That alone is a reason to
+    fix the silent swallow.
+- Test NOT changed. Per the hard rule, the test's stated invariant looks
+  wrong at the creation boundary, so this is recorded rather than
+  edited.
+- ADR 0004 record: the advisory golden lane failed again on
+  gemma-3-1b-it-4bit/chat-basic (gather path, 21 prompt tokens). Same
+  fixture as before, now the SEVENTH consecutive run. Read from the step
+  LOG (`test result: FAILED. 0 passed; 1 failed`), not the jobs API,
+  which shows the step as `success`. Pattern unchanged. It still does
+  not reproduce on the M4 dev machine.
+- Deviations: none.
+- Next: resolve the decision below, then get PR #50 green.
+- DECISION NEEDED: how to handle the admin-UI cross-check flake.
+  - A: Re-run the failed `test-macos` job now. Merge PR #50 on green.
+    Fix the test separately in its own PR: before comparing, poll the
+    scrape (bounded, e.g. 5 s) until it reflects a created pool
+    (`allocated + free > 0`), then assert exact equality with the UI
+    total as today. The assertion's strength is unchanged; only the
+    creation-boundary race is removed. Fastest path for #50, but #50
+    merges on a re-run green.
+  - B: Land that same test fix first as its own PR, then merge main
+    into PR #50 and let CI run on it. Costs one extra ~1h15m CI cycle
+    before #50 can merge, but #50 then never merges past a known flake.
+  - C: Fix it in the gateway instead: one sampler feeding both the SSE
+    stream and `/metrics` (or `/metrics` pulling Stats when scraped), so
+    the two can never disagree because of sampling phase. That is the
+    structural fix, but it changes how SPEC §5/§2.3's polled re-export
+    works and is far larger than the flake.
+  - In every option, the supervisor's silent `_ => {}` and the permanent
+    `stats_supported` latch (`supervisor.rs:759-770`) stay queued as
+    their own task. They are real hazards, but this run shows they are
+    not what failed here.

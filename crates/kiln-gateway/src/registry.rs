@@ -594,6 +594,18 @@ mod tests {
                     "norm_topk_prob": false
                 }),
             ),
+            // MoE session 3: the second MoE family routes the same way. Its
+            // two extra widths are required fields, so a config missing
+            // them would fail parsing and fall to python — pinning them
+            // here keeps this row proving ROUTING rather than parsing.
+            (
+                "qwen2_moe",
+                serde_json::json!({
+                    "num_experts": 8, "num_experts_per_tok": 2,
+                    "moe_intermediate_size": 64,
+                    "shared_expert_intermediate_size": 128
+                }),
+            ),
         ] {
             let mut config = supported_config();
             config["model_type"] = serde_json::json!(model_type);
@@ -632,11 +644,17 @@ mod tests {
 
         // The important one (SPEC §12 Phase 6 acceptance): a MoE family the
         // rust worker does not implement serves transparently via python.
+        // `qwen2_moe` left this list in MoE session 3 because it became
+        // IMPLEMENTED — not because the assertion was relaxed. Its positive
+        // counterpart is the `qwen2_moe` row in
+        // `auto_prefers_rust_but_downgrades_without_tokenizer` above; the
+        // four families below are still genuinely unimplemented, so both
+        // this test and the explicit-rust one keep their full strength.
         // ArchConfig dispatches on `model_type` before any field parsing, so
         // these fail at the ARCHITECTURE check — which is what should be
         // reported, whatever expert-geometry keys the family happens to use
         // (`num_local_experts`, `n_routed_experts`, ...).
-        for family in ["qwen2_moe", "qwen3_moe", "phimoe", "mixtral", "deepseek_v3"] {
+        for family in ["qwen3_moe", "phimoe", "mixtral", "deepseek_v3"] {
             let mut config = moe_config();
             config["model_type"] = serde_json::json!(family);
             cases.push((
@@ -740,7 +758,7 @@ mod tests {
     /// family — they asked for something impossible.
     #[test]
     fn explicit_rust_on_an_unimplemented_moe_family_is_a_startup_error() {
-        for family in ["qwen2_moe", "qwen3_moe", "phimoe", "mixtral", "deepseek_v3"] {
+        for family in ["qwen3_moe", "phimoe", "mixtral", "deepseek_v3"] {
             let mut config = moe_config();
             config["model_type"] = serde_json::json!(family);
             let dir = temp_dir("rust-moe-unimpl");

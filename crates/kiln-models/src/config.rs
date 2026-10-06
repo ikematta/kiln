@@ -36,8 +36,15 @@ pub struct Quantization {
 /// [`ArchConfig`] dispatch below — extend both together. (`gemma3_text` is
 /// the text-only Gemma3 checkpoint type; multimodal `"gemma3"` is not
 /// supported and routes to the Python worker.)
-pub const SUPPORTED_ARCHITECTURES: &[&str] =
-    &["llama", "qwen2", "qwen3", "gemma2", "gemma3_text", "olmoe"];
+pub const SUPPORTED_ARCHITECTURES: &[&str] = &[
+    "llama",
+    "qwen2",
+    "qwen3",
+    "gemma2",
+    "gemma3_text",
+    "olmoe",
+    "qwen2_moe",
+];
 
 /// Resolved `rope_scaling` (the variants mlx-lm's `initialize_rope` supports
 /// for the SPEC §7.2 architectures: default, linear, llama3, yarn).
@@ -657,6 +664,141 @@ impl OlmoeConfig {
     }
 }
 
+/// Parsed Qwen2-MoE-family `config.json` — fields and defaults mirror
+/// `mlx_lm.models.qwen2_moe.ModelArgs` exactly. Two MoE widths coexist:
+/// `moe_intermediate_size` sizes the ROUTED experts and
+/// `shared_expert_intermediate_size` the always-on shared expert, so
+/// neither is `intermediate_size` (which the reference's ModelArgs
+/// requires but its modules never read — parsed here for the same
+/// fail-loud-on-malformed reason, not used).
+///
+/// Deliberate non-fields, both parity-critical:
+/// - **`norm_topk_prob` is not read.** `Qwen2MoeSparseMoeBlock` has no such
+///   knob and never normalizes the top-k scores, unlike
+///   `OlmoeSparseMoeBlock` which does when its config asks. Honoring the
+///   key here would silently diverge from the reference on any checkpoint
+///   that happens to carry `norm_topk_prob: true` (this pin carries
+///   `false`), so the architecture module passes a hardcoded `false`.
+/// - **`decoder_sparse_step` / `mlp_only_layers` are rejected, not
+///   honored.** The reference builds a sparse block for EVERY layer
+///   unconditionally, so a checkpoint asking for interleaved dense layers
+///   would be mis-served by mlx-lm itself; reproducing that bit-for-bit
+///   would mean knowingly serving a wrong model. Kiln instead fails loudly
+///   at load (below) for the configurations where the two would disagree,
+///   and matches the reference exactly everywhere it is well defined —
+///   which is every published qwen2_moe checkpoint (`decoder_sparse_step:
+///   1`, no `mlp_only_layers`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Qwen2MoeConfig {
+    pub model_type: String,
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub intermediate_size: usize,
+    pub num_attention_heads: usize,
+    pub num_experts_per_tok: usize,
+    pub num_experts: usize,
+    pub moe_intermediate_size: usize,
+    pub shared_expert_intermediate_size: usize,
+    pub rms_norm_eps: f32,
+    pub vocab_size: usize,
+    #[serde(default)]
+    pub num_key_value_heads: Option<usize>,
+    #[serde(default = "default_qwen2_rope_theta")]
+    pub rope_theta: f32,
+    #[serde(default)]
+    pub rope_traditional: bool,
+    #[serde(default)]
+    pub rope_scaling: Option<serde_json::Value>,
+    /// Reference default is `False` here (it is `True` for plain qwen2).
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub quantization: Option<Quantization>,
+    #[serde(default)]
+    pub eos_token_id: Option<serde_json::Value>,
+    /// Parsed only to reject the values the reference would silently
+    /// ignore (see the type docs); never used to build the trunk.
+    #[serde(default = "default_decoder_sparse_step")]
+    pub decoder_sparse_step: i64,
+    #[serde(default)]
+    pub mlp_only_layers: Vec<usize>,
+}
+
+fn default_decoder_sparse_step() -> i64 {
+    1
+}
+
+impl Qwen2MoeConfig {
+    /// Loads and validates `<dir>/config.json`.
+    pub fn from_model_dir(dir: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        Self::from_json_str(&read_config_json(dir.as_ref())?)
+    }
+
+    /// Parses and validates a `config.json` document (load-time fail-loud;
+    /// see [`LlamaConfig::from_json_str`]).
+    pub fn from_json_str(text: &str) -> Result<Self, ConfigError> {
+        let raw: serde_json::Value = serde_json::from_str(text)?;
+        let config: Self = serde_json::from_value(raw.clone())?;
+        if config.model_type != "qwen2_moe" {
+            return Err(ConfigError::UnsupportedArchitecture(
+                config.model_type.clone(),
+            ));
+        }
+        if config.num_experts == 0 || config.num_experts_per_tok == 0 {
+            return Err(ConfigError::UnsupportedArchitecture(format!(
+                "qwen2_moe with num_experts={} num_experts_per_tok={}",
+                config.num_experts, config.num_experts_per_tok
+            )));
+        }
+        // Every layer is sparse in the reference. Rather than reproduce a
+        // known-wrong result, refuse the configs where that assumption is
+        // not what the checkpoint asked for (type docs).
+        if config.decoder_sparse_step != 1 {
+            return Err(ConfigError::UnsupportedArchitecture(format!(
+                "qwen2_moe with decoder_sparse_step={} (mlx-lm makes every \
+                 layer sparse; interleaved dense layers are not reproducible)",
+                config.decoder_sparse_step
+            )));
+        }
+        if !config.mlp_only_layers.is_empty() {
+            return Err(ConfigError::UnsupportedArchitecture(format!(
+                "qwen2_moe with mlp_only_layers={:?} (mlx-lm makes every \
+                 layer sparse; dense layers are not reproducible)",
+                config.mlp_only_layers
+            )));
+        }
+        // `Qwen2MoeModelArgs.__post_init__` accepts only linear scaling.
+        match config.rope_scaling()? {
+            RopeScaling::Default | RopeScaling::Linear { .. } => {}
+            other => {
+                return Err(ConfigError::UnsupportedRope(format!(
+                    "{other:?} (qwen2_moe supports linear scaling only)"
+                )));
+            }
+        }
+        validate_quantization(&raw)?;
+        validate_quant_params(config.quantization)?;
+        Ok(config)
+    }
+
+    pub fn num_kv_heads(&self) -> usize {
+        self.num_key_value_heads.unwrap_or(self.num_attention_heads)
+    }
+
+    /// `mlx_lm.models.qwen2_moe.Attention`: always `hidden_size // n_heads`.
+    pub fn head_dim(&self) -> usize {
+        self.hidden_size / self.num_attention_heads
+    }
+
+    pub fn eos_token_ids(&self) -> Vec<u32> {
+        eos_ids_from(self.eos_token_id.as_ref())
+    }
+
+    pub fn rope_scaling(&self) -> Result<RopeScaling, ConfigError> {
+        resolve_rope_scaling(self.rope_scaling.as_ref())
+    }
+}
+
 /// A validated `config.json` for any architecture the Rust worker implements,
 /// dispatched on `model_type` ([`SUPPORTED_ARCHITECTURES`]).
 ///
@@ -672,6 +814,7 @@ pub enum ArchConfig {
     Gemma2(Gemma2Config),
     Gemma3(Gemma3Config),
     Olmoe(OlmoeConfig),
+    Qwen2Moe(Qwen2MoeConfig),
 }
 
 impl ArchConfig {
@@ -697,6 +840,7 @@ impl ArchConfig {
             "gemma2" => Ok(Self::Gemma2(Gemma2Config::from_json_str(text)?)),
             "gemma3_text" => Ok(Self::Gemma3(Gemma3Config::from_json_str(text)?)),
             "olmoe" => Ok(Self::Olmoe(OlmoeConfig::from_json_str(text)?)),
+            "qwen2_moe" => Ok(Self::Qwen2Moe(Qwen2MoeConfig::from_json_str(text)?)),
             _ => Err(ConfigError::UnsupportedArchitecture(model_type)),
         }
     }
@@ -709,6 +853,7 @@ impl ArchConfig {
             Self::Gemma2(c) => &c.model_type,
             Self::Gemma3(c) => &c.model_type,
             Self::Olmoe(c) => &c.model_type,
+            Self::Qwen2Moe(c) => &c.model_type,
         }
     }
 
@@ -720,6 +865,7 @@ impl ArchConfig {
             Self::Gemma2(c) => c.eos_token_ids(),
             Self::Gemma3(c) => c.eos_token_ids(),
             Self::Olmoe(c) => c.eos_token_ids(),
+            Self::Qwen2Moe(c) => c.eos_token_ids(),
         }
     }
 }
@@ -1105,6 +1251,122 @@ mod tests {
         let mut json = olmoe_json();
         json["num_experts_per_tok"] = serde_json::json!(0);
         let err = OlmoeConfig::from_json_str(&json.to_string()).expect_err("k=0 rejected");
+        assert!(matches!(err, ConfigError::UnsupportedArchitecture(_)));
+    }
+
+    fn qwen2_moe_json() -> serde_json::Value {
+        // The pinned qwen1.5-moe-a2.7b-4bit config, trimmed to the fields
+        // the parser reads.
+        serde_json::json!({
+            "model_type": "qwen2_moe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "intermediate_size": 5632,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "num_experts": 60,
+            "num_experts_per_tok": 4,
+            "moe_intermediate_size": 1408,
+            "shared_expert_intermediate_size": 5632,
+            "decoder_sparse_step": 1,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 151936,
+            "rope_theta": 1000000.0,
+            "tie_word_embeddings": false,
+            "eos_token_id": 151645,
+            "quantization": {"group_size": 64, "bits": 4}
+        })
+    }
+
+    #[test]
+    fn qwen2_moe_parses_and_dispatches() {
+        let arch =
+            ArchConfig::from_json_str(&qwen2_moe_json().to_string()).expect("qwen2_moe loads");
+        let ArchConfig::Qwen2Moe(c) = &arch else {
+            panic!("wrong arch: {arch:?}");
+        };
+        assert_eq!(arch.model_type(), "qwen2_moe");
+        assert_eq!(arch.eos_token_ids(), vec![151645]);
+        assert_eq!(c.num_experts, 60);
+        assert_eq!(c.num_experts_per_tok, 4);
+        // The two MoE widths are independent of each other AND of the
+        // dense `intermediate_size` — the whole point of this family's
+        // shape (routed experts vs the shared expert).
+        assert_eq!(c.moe_intermediate_size, 1408);
+        assert_eq!(c.shared_expert_intermediate_size, 5632);
+        assert_eq!(c.intermediate_size, 5632);
+        // Derived per mlx_lm.models.qwen2_moe.ModelArgs.
+        assert_eq!(c.num_kv_heads(), 16);
+        assert_eq!(c.head_dim(), 128);
+    }
+
+    #[test]
+    fn qwen2_moe_defaults_match_the_reference_model_args() {
+        let mut json = qwen2_moe_json();
+        let obj = json.as_object_mut().unwrap();
+        for key in [
+            "num_key_value_heads",
+            "rope_theta",
+            "tie_word_embeddings",
+            "decoder_sparse_step",
+        ] {
+            obj.remove(key);
+        }
+        let c: Qwen2MoeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(c.num_kv_heads(), 16);
+        assert_eq!(c.rope_theta, 1_000_000.0);
+        // NOTE: the reference defaults this to False here, where plain
+        // qwen2 defaults it to True. A copy-paste of Qwen2Config's
+        // `default_true` would silently tie a head this family does not
+        // tie.
+        assert!(!c.tie_word_embeddings);
+        assert!(!c.rope_traditional);
+        assert_eq!(c.decoder_sparse_step, 1);
+        assert!(c.mlp_only_layers.is_empty());
+        assert_eq!(c.rope_scaling().unwrap(), RopeScaling::Default);
+    }
+
+    #[test]
+    fn qwen2_moe_rejects_what_the_reference_would_mis_serve() {
+        // Interleaved dense layers: mlx-lm ignores both keys and builds a
+        // sparse block for EVERY layer, so reproducing it bit-for-bit
+        // would mean knowingly serving a wrong model. Fail loud instead.
+        let mut json = qwen2_moe_json();
+        json["decoder_sparse_step"] = serde_json::json!(2);
+        let err =
+            Qwen2MoeConfig::from_json_str(&json.to_string()).expect_err("sparse step rejected");
+        assert!(
+            err.to_string().contains("decoder_sparse_step"),
+            "reason must name the cause: {err}"
+        );
+
+        let mut json = qwen2_moe_json();
+        json["mlp_only_layers"] = serde_json::json!([0, 3]);
+        let err =
+            Qwen2MoeConfig::from_json_str(&json.to_string()).expect_err("dense layers rejected");
+        assert!(
+            err.to_string().contains("mlp_only_layers"),
+            "reason must name the cause: {err}"
+        );
+
+        // `__post_init__` accepts linear scaling only.
+        let mut json = qwen2_moe_json();
+        json["rope_scaling"] = serde_json::json!({"rope_type": "llama3", "factor": 8.0});
+        let err = Qwen2MoeConfig::from_json_str(&json.to_string()).expect_err("llama3 rejected");
+        assert!(matches!(err, ConfigError::UnsupportedRope(_)), "{err}");
+
+        let mut json = qwen2_moe_json();
+        json["rope_scaling"] = serde_json::json!({"rope_type": "linear", "factor": 2.0});
+        let c = Qwen2MoeConfig::from_json_str(&json.to_string()).expect("linear accepted");
+        assert_eq!(
+            c.rope_scaling().unwrap(),
+            RopeScaling::Linear { factor: 2.0 }
+        );
+
+        // Degenerate expert geometry, as for olmoe.
+        let mut json = qwen2_moe_json();
+        json["num_experts_per_tok"] = serde_json::json!(0);
+        let err = Qwen2MoeConfig::from_json_str(&json.to_string()).expect_err("k=0 rejected");
         assert!(matches!(err, ConfigError::UnsupportedArchitecture(_)));
     }
 

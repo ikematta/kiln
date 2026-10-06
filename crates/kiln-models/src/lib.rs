@@ -33,13 +33,15 @@ pub mod olmoe;
 #[cfg(feature = "metal")]
 pub mod qwen2;
 #[cfg(feature = "metal")]
+pub mod qwen2_moe;
+#[cfg(feature = "metal")]
 pub mod qwen3;
 #[cfg(feature = "metal")]
 pub mod weights;
 
 pub use config::{
     ArchConfig, ConfigError, Gemma2Config, Gemma3Config, LlamaConfig, OlmoeConfig, Quantization,
-    Qwen2Config, Qwen3Config, RopeScaling, SUPPORTED_ARCHITECTURES,
+    Qwen2Config, Qwen2MoeConfig, Qwen3Config, RopeScaling, SUPPORTED_ARCHITECTURES,
 };
 #[cfg(feature = "metal")]
 pub use draft::{DraftLoadError, DraftModel, DraftPoolSpec, check_draft_compat};
@@ -61,6 +63,8 @@ pub use nn::ModelError;
 pub use olmoe::OlmoeModel;
 #[cfg(feature = "metal")]
 pub use qwen2::Qwen2Model;
+#[cfg(feature = "metal")]
+pub use qwen2_moe::Qwen2MoeModel;
 #[cfg(feature = "metal")]
 pub use qwen3::Qwen3Model;
 #[cfg(feature = "metal")]
