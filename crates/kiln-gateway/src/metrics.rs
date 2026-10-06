@@ -88,6 +88,12 @@ pub struct Metrics {
     /// (`ok | tool_error | error | timeout | unavailable`). Cardinality is
     /// bounded by the servers' declared tool sets.
     pub mcp_tool_calls_total: IntCounterVec,
+    /// Health-poll ticks on which the `Stats` re-export got no fresh
+    /// sample, by model and reason (`timeout | error | health_failed |
+    /// unimplemented`). While it climbs, the `worker_stats` mirrors below
+    /// are a stale snapshot. `unimplemented` counts the single reply that
+    /// turns polling off for that worker process, not the ticks after it.
+    pub stats_samples_dropped_total: IntCounterVec,
     /// Worker `Stats` mirrors, per model.
     pub worker_stats: WorkerStatGauges,
     /// Heartbeat `MemoryReport` mirrors, per model (SPEC §2.3).
@@ -341,6 +347,13 @@ impl Metrics {
              (ok | tool_error | error | timeout | unavailable)",
             &["server", "tool", "outcome"],
         )?;
+        let stats_samples_dropped_total = counter(
+            "kiln_stats_samples_dropped_total",
+            "Health-poll ticks on which the worker Stats re-export got no fresh sample, \
+             by model and reason (timeout | error | health_failed | unimplemented); \
+             unimplemented counts once per worker process, when polling stops",
+            &["model", "reason"],
+        )?;
         // Heartbeat MemoryReport mirrors (SPEC §2.3), per model.
         let mem = |name: &str, help: &str| gauge(name, help, &["model"]);
         let worker_memory = MemoryGauges {
@@ -486,6 +499,7 @@ impl Metrics {
             mcp_up,
             mcp_connect_attempts_total,
             mcp_tool_calls_total,
+            stats_samples_dropped_total,
             worker_stats,
             worker_memory,
         })
