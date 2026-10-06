@@ -9857,3 +9857,148 @@
 - Deviations: none.
 - Next: unchanged — session 3 of the MoE arc (`qwen2_moe` / `qwen3_moe`)
   with the three carry-ins from the PR #44 entry.
+
+## [2026-10-06] Gateway / Stats re-export observability (supervisor latch + silent sample drops) — DONE
+- What:
+  - `supervisor.rs`: the monitor loop's Stats handling moved into
+    `StatsReexport` (`supervisor.rs:938`). It is built per worker process
+    at READY (`supervisor.rs:712`) and owns the UNIMPLEMENTED latch, a
+    drop counter, and rate-limited logging. Before this, any Stats error
+    other than UNIMPLEMENTED, timeouts included, hit `_ => {}`. A failed
+    Health call skipped Stats without a trace. Both now count as drops
+    and log (`supervisor.rs:774` for the Health path).
+  - New gateway counter `kiln_stats_samples_dropped_total{model,reason}`
+    (`metrics.rs:351`). Reasons: `timeout | error | health_failed |
+    unimplemented`. All four series are created at 0 at READY, so a
+    scrape shows "no drops" (present, 0) separately from "not tracked"
+    (absent). That absent-vs-stale ambiguity is what the PR #49 and
+    PR #50 diagnoses could not resolve.
+  - Logging: the first dropped sample logs at WARN right away, with
+    model, reason, error (gRPC code + message, or "no reply within
+    2000ms"), consecutive drops, and `stale_ms` (age of the sample
+    `/metrics` is still serving). After that, at most one WARN per worker
+    per `STATS_DROP_WARN_INTERVAL` = 30 s; the next WARN carries the
+    count of drops in between. A fresh sample after a gap that got a WARN
+    logs one INFO with `missed` and `stale_ms`, so the stale window is
+    bracketed in the log. A gap that never got a WARN gets no recovery
+    line either.
+  - `bounded()` (`supervisor.rs:883`) merges the RPC deadline into the
+    RPC's own error, so the Health arm now reads `Ok(status)` /
+    `Err(failure)`. Health handling is otherwise unchanged (UNHEALTHY
+    recycle, TTL, 3 s deadline).
+  - 5 new unit tests in `supervisor.rs`. They capture the real `tracing`
+    output with a thread-scoped fmt subscriber and assert on the emitted
+    lines and the counter values. Mutation-checked: removing the rate
+    limit fails 2 tests, and counting Health failures after the latch
+    fails the latch test.
+- Decisions:
+  - **Latch: log once (level by worker kind), no re-probe.** Reasons:
+    (1) The latch is already per worker process, so every restart probes
+    again. Whether a process serves Stats is fixed by its binary: the
+    python servicer inherits the generated UNIMPLEMENTED, and the rust
+    `stats()` (`kiln-worker/src/service.rs:374`) has no error path.
+    Asking the same process again can only change the answer if the
+    first UNIMPLEMENTED was spurious. The realistic source of one from a
+    rust worker is a stale or mismatched worker binary, and re-asking
+    that process cannot fix it. A backoff timer would add state without
+    being able to recover anything real.
+    (2) The frozen proto documents the current behavior:
+    `worker.proto:351` says "the gateway stops polling after the first
+    such reply". Re-probing would quietly contradict that text, and the
+    proto is not to be touched.
+    (3) The gateway knows `entry.worker_kind`, so the log level can carry
+    the signal. Python gets INFO ("expected for the python worker", once
+    per process). Rust gets WARN ("stale or mismatched worker binary?").
+    That WARN is the only latch case that means a bug, and CI logs now
+    show it.
+    (4) The latch keeps its purpose: a python worker is asked once per
+    process, never again.
+  - `unimplemented` counts once per worker process (the reply that turns
+    polling off), not once per skipped tick. The counter measures samples
+    the re-export lost, not calls it deliberately skips. `health_failed`
+    counts only while polling, since a python worker has no Stats sample
+    to lose.
+  - Name `kiln_stats_samples_dropped_total`, not `kiln_worker_*`: the
+    `kiln_worker_*` Stats mirrors are worker-reported and reset with the
+    worker process. This counter is gateway-owned and lives as long as
+    the gateway, like `kiln_admission_rejects_total`.
+  - No new dependencies. `thiserror` (for `RpcFailure`) and
+    `tracing-subscriber` (test log capture) are already normal
+    dependencies of kiln-gateway.
+- Deviations: none. Proto untouched. The flaky test
+  (`test_admin_ui_live_queue_depth_and_gateway_counters`) is untouched;
+  the PR #50 entry's DECISION NEEDED about it is still open, and this
+  change does not decide it. This is the "silent `_ => {}` and permanent
+  latch" item that entry left queued as its own task. NOTE: that entry
+  is on `claude/qwen2-moe-arch` (PR #50), not on main, which this branch
+  is cut from.
+- Observed while verifying, pre-existing, NOT changed:
+  - `HEALTH_MISSED_DEADLINE` (3 s) equals poll interval (1 s) plus
+    `HEALTH_RPC_TIMEOUT` (2 s). A single timed-out Health call therefore
+    lands right on the deadline, and whether it recycles depends on
+    millisecond timing. Two identical 4 s SIGSTOP runs went different
+    ways. In one, the worker was recycled while stopped (gone before
+    SIGCONT). The other recovered with `stale_ms: 2998` (shown below).
+  - `release()` zeroes the memory gauges but never the `worker_stats`
+    mirrors. After a crash restart, `kiln_worker_*` Stats series keep the
+    dead worker's values until the new worker's first sample (about 1 s
+    after READY). This is a second way to get a stale-but-present scrape,
+    of the kind PR #50 saw. Worth a look if option C of that decision is
+    taken.
+- Acceptance:
+  ```
+  $ cargo fmt --check                                     -> clean (exit 0)
+  $ cargo clippy --workspace --all-targets -- -D warnings
+  warning: kiln-mlx@0.0.1: kiln-mlx: building vendored mlx-c (MLX_BUILD_METAL=ON)
+      Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 40s   (exit 0)
+
+  $ cargo test -p kiln-gateway
+  test supervisor::tests::backoff_grows_and_caps ... ok
+  test supervisor::tests::bounded_folds_the_deadline_into_the_rpc_result ... ok
+  test supervisor::tests::stats_drop_series_exist_at_zero_from_ready ... ok
+  test supervisor::tests::stats_drops_are_counted_by_reason_and_keep_the_last_sample ... ok
+  test supervisor::tests::stats_drop_warnings_are_rate_limited_and_bracket_the_gap ... ok
+  test supervisor::tests::stats_unimplemented_latches_once_and_logs_by_worker_kind ... ok
+  lib:  test result: ok. 140 passed; 0 failed; 0 ignored; finished in 1.77s
+  main: test result: ok. 0 passed; 0 failed     doc: test result: ok. 0 passed
+
+  $ KILN_TEST_MODELS=~/.kiln/test-models KILN_E2E_REQUIRE_BROWSER=1 \
+    uv run --project tests/e2e pytest tests/e2e/test_metrics.py \
+      tests/e2e/test_admin_ui.py tests/e2e/test_admin_jobs.py -v
+  test_metrics.py::test_request_counters_increment[python] PASSED
+  test_metrics.py::test_worker_stats_reexported_with_model_label[python] PASSED
+  test_metrics.py::test_request_counters_increment[rust] PASSED
+  test_metrics.py::test_worker_stats_reexported_with_model_label[rust] PASSED
+  test_admin_ui.py::test_admin_ui_live_queue_depth_and_gateway_counters PASSED
+  test_admin_ui.py::test_admin_ui_full_operator_flow PASSED
+  test_admin_ui.py::test_admin_ui_add_model_full_flow PASSED
+  test_admin_ui.py::test_admin_ui_surfaces_disabled_admin_verbatim PASSED
+  test_admin_ui.py::test_ui_shell_is_served_embedded PASSED
+  test_admin_ui.py::test_ui_no_trailing_slash_full_chain PASSED
+  test_admin_jobs.py (3 tests) PASSED
+  ======================== 13 passed in 115.19s (0:01:55) ========================
+
+  Live check (scratch script on conftest.running_stack; one gateway serving
+  the pinned llama as "py" on the python worker and "rs" on the rust
+  worker; rust worker SIGSTOPped for 4 s):
+  kiln_stats_samples_dropped_total{model="py",reason="unimplemented"} 1
+  kiln_stats_samples_dropped_total{model="py",reason=...timeout|error|health_failed} 0
+  kiln_stats_samples_dropped_total{model="rs",reason="health_failed"} 1
+  kiln_stats_samples_dropped_total{model="rs",reason=...timeout|error|unimplemented} 0
+  {"level":"INFO","fields":{"message":"worker does not serve Stats (expected for the
+    python worker); its Stats-mirror series on /metrics stay unrefreshed until it
+    restarts","model":"py","worker":"python","detail":"Method not implemented!"}}
+  {"level":"WARN","fields":{"message":"worker Stats sample dropped; /metrics keeps
+    serving the last good sample for this model","model":"rs","reason":"health_failed",
+    "error":"no reply within 2000ms","consecutive":1,"suppressed":0,"stale_ms":2998}}
+  {"level":"INFO","fields":{"message":"worker Stats sampling recovered; /metrics is
+    current again","model":"rs","missed":1,"stale_ms":4437}}
+  ```
+  Setup this worktree needed first (CLAUDE.md one-time steps, nothing
+  bumped): `git submodule update --init --recursive` (mlx-c checked out
+  at the ADR 0001 pin 0726ca9), `npm ci && npm run build` in `admin/`,
+  `uv sync` for the e2e and worker projects. Not run: the full
+  `cargo test --workspace` and the full e2e suite. The diff touches only
+  `kiln-gateway`; CI runs both.
+- Next: unchanged from the PR #50 entry. Resolve its DECISION NEEDED
+  (admin-UI cross-check flake), then get PR #50 green.
