@@ -27,14 +27,16 @@ use std::time::Duration;
 use kiln_proto::v1::worker_client::WorkerClient;
 use kiln_proto::v1::{
     DrainMode, DrainRequest, HealthRequest, HealthStatus, InfoRequest, StatsRequest, WorkerState,
+    WorkerStats,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::error::Elapsed;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
 
-use crate::config::KilnConfig;
+use crate::config::{KilnConfig, WorkerKind};
 use crate::lifecycle::{self, Command as LifecycleCommand, Lifecycle};
 use crate::metrics::Metrics;
 use crate::registry::{ModelEntry, Registry, RegistryError, UnloadReason, WorkerStatus};
@@ -45,6 +47,10 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEALTH_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 /// A worker silent for longer than this is treated as crashed (SPEC §5: 3s).
 const HEALTH_MISSED_DEADLINE: Duration = Duration::from_secs(3);
+/// Floor between two "Stats sample dropped" warnings for one worker. Drops
+/// in between are still counted (`kiln_stats_samples_dropped_total`) and
+/// summed into the next warning, so a wedged worker cannot flood the log.
+const STATS_DROP_WARN_INTERVAL: Duration = Duration::from_secs(30);
 /// Max age of the cached system-memory snapshot the request-admission path
 /// prices against; health polls refresh it in the background past this.
 const SYSTEM_PROBE_MAX_AGE: Duration = Duration::from_secs(2);
@@ -703,7 +709,7 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
     // SPEC §5/§2.3: Stats is polled alongside Health and re-exported with
     // a `model` label. A worker without it (the python worker today)
     // answers UNIMPLEMENTED once and is not asked again this lifetime.
-    let mut stats_supported = true;
+    let mut stats = StatsReexport::new(&entry.id, entry.worker_kind, &ctx.metrics, last_ok);
     loop {
         tokio::select! {
             status = child.wait() => {
@@ -728,9 +734,8 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
                 }
             },
             _ = poll.tick() => {
-                match timeout(HEALTH_RPC_TIMEOUT, client.health(HealthRequest {})).await {
-                    Ok(Ok(resp)) => {
-                        let status = resp.into_inner();
+                match bounded(timeout(HEALTH_RPC_TIMEOUT, client.health(HealthRequest {})).await) {
+                    Ok(status) => {
                         if status.state() == WorkerState::Unhealthy {
                             tracing::error!(model = %entry.id, detail = %status.detail,
                                 "worker self-reported UNHEALTHY; recycling");
@@ -756,23 +761,17 @@ async fn run_once(ctx: &mut SuperviseCtx) -> RunExit {
                                 "idle past ttl_seconds; auto-unloading");
                             return unload(ctx, &mut child, pgid, &mut client, UnloadReason::IdleTtl).await;
                         }
-                        if stats_supported {
-                            match timeout(HEALTH_RPC_TIMEOUT, client.stats(StatsRequest {})).await {
-                                Ok(Ok(resp)) => {
-                                    ctx.metrics.worker_stats.record(&entry.id, &resp.into_inner());
-                                }
-                                Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
-                                    tracing::debug!(model = %entry.id,
-                                        "worker does not implement Stats; skipping re-export");
-                                    stats_supported = false;
-                                }
-                                // Transient failures: Health owns crash
-                                // detection; stats just misses a sample.
-                                _ => {}
-                            }
+                        if stats.polling() {
+                            let reply = bounded(
+                                timeout(HEALTH_RPC_TIMEOUT, client.stats(StatsRequest {})).await,
+                            );
+                            stats.observe(reply, &ctx.metrics, Instant::now());
                         }
                     }
-                    _ => {
+                    Err(failure) => {
+                        // No Health, no Stats: the re-export misses this
+                        // tick's sample too. Crash detection stays Health's.
+                        stats.health_failed(&failure, &ctx.metrics, Instant::now());
                         if last_ok.elapsed() > HEALTH_MISSED_DEADLINE {
                             tracing::error!(model = %entry.id,
                                 silent_ms = last_ok.elapsed().as_millis() as u64,
@@ -869,6 +868,198 @@ fn record_memory(ctx: &SuperviseCtx, health: &HealthStatus) {
     ctx.metrics
         .worker_memory
         .record(&ctx.entry.id, report, footprint);
+}
+
+/// Why a deadline-bounded unary worker RPC produced no reply.
+#[derive(Debug, thiserror::Error)]
+enum RpcFailure {
+    #[error("no reply within {}ms", HEALTH_RPC_TIMEOUT.as_millis())]
+    TimedOut,
+    #[error("{:?}: {}", .0.code(), .0.message())]
+    Status(tonic::Status),
+}
+
+/// Folds the [`HEALTH_RPC_TIMEOUT`] deadline into the RPC's own result.
+fn bounded<T>(
+    result: Result<Result<tonic::Response<T>, tonic::Status>, Elapsed>,
+) -> Result<T, RpcFailure> {
+    match result {
+        Ok(Ok(resp)) => Ok(resp.into_inner()),
+        Ok(Err(status)) => Err(RpcFailure::Status(status)),
+        Err(_) => Err(RpcFailure::TimedOut),
+    }
+}
+
+/// Why a health-poll tick left the `Stats` re-export without a fresh
+/// sample; labels `kiln_stats_samples_dropped_total{reason}`.
+#[derive(Debug, Clone, Copy)]
+enum StatsDrop {
+    /// Health failed, so Stats was not asked this tick.
+    HealthFailed,
+    /// The Stats call exceeded [`HEALTH_RPC_TIMEOUT`].
+    Timeout,
+    /// The Stats call failed with a status other than UNIMPLEMENTED.
+    Error,
+    /// The worker does not serve Stats; polling stops for its lifetime.
+    Unimplemented,
+}
+
+impl StatsDrop {
+    const ALL: [Self; 4] = [
+        Self::HealthFailed,
+        Self::Timeout,
+        Self::Error,
+        Self::Unimplemented,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::HealthFailed => "health_failed",
+            Self::Timeout => "timeout",
+            Self::Error => "error",
+            Self::Unimplemented => "unimplemented",
+        }
+    }
+}
+
+/// One worker process's `Stats` re-export (SPEC §5/§2.3): the polling
+/// latch, plus the bookkeeping that makes a missed sample visible. A
+/// missed sample leaves `/metrics` serving the previous snapshot, which
+/// looks exactly like a healthy one, so every miss is counted by reason
+/// and logged at warn, rate-limited per worker to one line per
+/// [`STATS_DROP_WARN_INTERVAL`]. A fresh sample after a warned gap logs
+/// once more, so the stale window is bracketed in the log.
+///
+/// Built at READY by each `run_once`, so it lives exactly as long as one
+/// worker process. The UNIMPLEMENTED latch is therefore per process:
+/// whether a worker serves Stats is fixed by its binary, so asking the
+/// same process again cannot change the answer, and every restart (a
+/// new process, possibly a new binary) probes afresh.
+struct StatsReexport {
+    model: String,
+    kind: WorkerKind,
+    /// False once this worker answered UNIMPLEMENTED.
+    polling: bool,
+    /// When `/metrics` last got a fresh sample (READY, before the first).
+    fresh_at: Instant,
+    /// Consecutive ticks without a fresh sample: the current gap.
+    gap: u64,
+    /// The current gap has been reported at warn.
+    gap_warned: bool,
+    last_warn: Option<Instant>,
+    /// Drops counted since the last warn line but not logged on their own.
+    unlogged: u64,
+}
+
+impl StatsReexport {
+    fn new(model: &str, kind: WorkerKind, metrics: &Metrics, now: Instant) -> Self {
+        // Every reason exists at 0 from READY, so a scrape tells "no
+        // drops" (present, 0) apart from "not tracked" (absent).
+        for reason in StatsDrop::ALL {
+            metrics
+                .stats_samples_dropped_total
+                .with_label_values(&[model, reason.label()]);
+        }
+        Self {
+            model: model.to_string(),
+            kind,
+            polling: true,
+            fresh_at: now,
+            gap: 0,
+            gap_warned: false,
+            last_warn: None,
+            unlogged: 0,
+        }
+    }
+
+    /// Whether Stats should be asked this tick.
+    fn polling(&self) -> bool {
+        self.polling
+    }
+
+    /// Applies one Stats reply (Health succeeded this tick).
+    fn observe(&mut self, reply: Result<WorkerStats, RpcFailure>, metrics: &Metrics, now: Instant) {
+        if !self.polling {
+            return;
+        }
+        match reply {
+            Ok(stats) => self.fresh(&stats, metrics, now),
+            Err(RpcFailure::Status(status)) if status.code() == tonic::Code::Unimplemented => {
+                self.disable(&status, metrics);
+            }
+            Err(failure @ RpcFailure::Status(_)) => {
+                self.miss(StatsDrop::Error, &failure, metrics, now);
+            }
+            Err(failure @ RpcFailure::TimedOut) => {
+                self.miss(StatsDrop::Timeout, &failure, metrics, now);
+            }
+        }
+    }
+
+    /// Health failed this tick, so Stats was not asked: a missed sample
+    /// like any other, unless this worker has no Stats to miss.
+    fn health_failed(&mut self, failure: &RpcFailure, metrics: &Metrics, now: Instant) {
+        if self.polling {
+            self.miss(StatsDrop::HealthFailed, failure, metrics, now);
+        }
+    }
+
+    fn fresh(&mut self, stats: &WorkerStats, metrics: &Metrics, now: Instant) {
+        metrics.worker_stats.record(&self.model, stats);
+        if self.gap_warned {
+            tracing::info!(model = %self.model, missed = self.gap,
+                stale_ms = now.duration_since(self.fresh_at).as_millis() as u64,
+                "worker Stats sampling recovered; /metrics is current again");
+        }
+        self.fresh_at = now;
+        self.gap = 0;
+        self.gap_warned = false;
+    }
+
+    fn miss(&mut self, reason: StatsDrop, failure: &RpcFailure, metrics: &Metrics, now: Instant) {
+        metrics
+            .stats_samples_dropped_total
+            .with_label_values(&[&self.model, reason.label()])
+            .inc();
+        self.gap += 1;
+        if self
+            .last_warn
+            .is_some_and(|at| now.duration_since(at) < STATS_DROP_WARN_INTERVAL)
+        {
+            self.unlogged += 1;
+            return;
+        }
+        tracing::warn!(model = %self.model, reason = %reason.label(), error = %failure,
+            consecutive = self.gap, suppressed = self.unlogged,
+            stale_ms = now.duration_since(self.fresh_at).as_millis() as u64,
+            "worker Stats sample dropped; /metrics keeps serving the last good sample \
+             for this model");
+        self.last_warn = Some(now);
+        self.unlogged = 0;
+        self.gap_warned = true;
+    }
+
+    fn disable(&mut self, status: &tonic::Status, metrics: &Metrics) {
+        self.polling = false;
+        metrics
+            .stats_samples_dropped_total
+            .with_label_values(&[&self.model, StatsDrop::Unimplemented.label()])
+            .inc();
+        match self.kind {
+            WorkerKind::Python => tracing::info!(model = %self.model, worker = "python",
+                detail = %status.message(),
+                "worker does not serve Stats (expected for the python worker); its \
+                 Stats-mirror series on /metrics stay unrefreshed until it restarts"),
+            // The registry resolves `auto` before any spawn, so this is a
+            // rust worker — which always serves Stats. UNIMPLEMENTED from
+            // one means a stale or mismatched worker binary.
+            WorkerKind::Rust | WorkerKind::Auto => tracing::warn!(model = %self.model,
+                worker = self.kind.as_config_str(), detail = %status.message(),
+                "rust worker answered Stats with UNIMPLEMENTED (stale or mismatched \
+                 worker binary?); its Stats-mirror series on /metrics stay unrefreshed \
+                 until it restarts"),
+        }
+    }
 }
 
 /// Releases everything a dead worker was charged for: budget ledger,
@@ -1013,5 +1204,245 @@ mod tests {
         assert_eq!(backoff(2), Duration::from_secs(1));
         assert_eq!(backoff(3), Duration::from_secs(2));
         assert_eq!(backoff(30), Duration::from_secs(10));
+    }
+
+    /// Runs `f` under a thread-scoped fmt subscriber and returns the log
+    /// lines it emitted (timestamps off, so lines are stable).
+    fn logs(f: impl FnOnce()) -> Vec<String> {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = Arc::clone(&sink);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || SinkWriter(Arc::clone(&writer)))
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = sink.lock().expect("log sink").clone();
+        String::from_utf8(bytes)
+            .expect("utf-8 logs")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    struct SinkWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SinkWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log sink").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn dropped(metrics: &Metrics, reason: &str) -> u64 {
+        metrics
+            .stats_samples_dropped_total
+            .with_label_values(&["m", reason])
+            .get()
+    }
+
+    fn unimplemented() -> Result<WorkerStats, RpcFailure> {
+        Err(RpcFailure::Status(tonic::Status::unimplemented(
+            "Method not found!",
+        )))
+    }
+
+    #[test]
+    fn stats_drop_series_exist_at_zero_from_ready() {
+        let metrics = Metrics::new().expect("metrics build");
+        let _stats = StatsReexport::new("m", WorkerKind::Rust, &metrics, Instant::now());
+        let text = metrics.encode().expect("encode");
+        for reason in ["health_failed", "timeout", "error", "unimplemented"] {
+            let needle =
+                format!("kiln_stats_samples_dropped_total{{model=\"m\",reason=\"{reason}\"}} 0");
+            assert!(text.contains(&needle), "missing {needle} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn stats_drops_are_counted_by_reason_and_keep_the_last_sample() {
+        let metrics = Metrics::new().expect("metrics build");
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut stats = StatsReexport::new("m", WorkerKind::Rust, &metrics, t0);
+        let sample = WorkerStats {
+            kv_blocks_allocated: 8,
+            kv_blocks_free: 504,
+            ..WorkerStats::default()
+        };
+        let lines = logs(|| {
+            stats.observe(Ok(sample), &metrics, at(1));
+            stats.observe(Err(RpcFailure::TimedOut), &metrics, at(2));
+            let gone = tonic::Status::unavailable("socket gone");
+            stats.observe(Err(RpcFailure::Status(gone)), &metrics, at(3));
+            stats.health_failed(&RpcFailure::TimedOut, &metrics, at(4));
+        });
+        assert_eq!(dropped(&metrics, "timeout"), 1);
+        assert_eq!(dropped(&metrics, "error"), 1);
+        assert_eq!(dropped(&metrics, "health_failed"), 1);
+        assert_eq!(dropped(&metrics, "unimplemented"), 0);
+        assert!(stats.polling(), "transient failures never stop polling");
+        // The scrape still carries the last good sample; the counter above
+        // is what tells it apart from a fresh one.
+        let text = metrics.encode().expect("encode");
+        for needle in [
+            "kiln_worker_kv_blocks_allocated{model=\"m\"} 8",
+            "kiln_worker_kv_blocks_free{model=\"m\"} 504",
+        ] {
+            assert!(text.contains(needle), "missing {needle} in:\n{text}");
+        }
+        // One warn line for the gap, naming the model, the reason, and
+        // how stale the re-export already was; the next two drops land
+        // inside the rate-limit window and are only counted.
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        let warn = &lines[0];
+        for needle in [
+            "WARN",
+            "worker Stats sample dropped",
+            "model=m",
+            "reason=timeout",
+            "error=no reply within 2000ms",
+            "consecutive=1",
+            "stale_ms=1000",
+        ] {
+            assert!(warn.contains(needle), "missing {needle} in: {warn}");
+        }
+    }
+
+    #[test]
+    fn stats_drop_warnings_are_rate_limited_and_bracket_the_gap() {
+        let metrics = Metrics::new().expect("metrics build");
+        let t0 = Instant::now();
+        let window = STATS_DROP_WARN_INTERVAL.as_secs();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut stats = StatsReexport::new("m", WorkerKind::Rust, &metrics, t0);
+
+        // A gap of window + 2 dropped ticks: a warn at its first tick, one
+        // more once the window has passed (carrying the count it held
+        // back), and an info when sampling resumes.
+        let lines = logs(|| {
+            for tick in 1..=window + 2 {
+                stats.observe(Err(RpcFailure::TimedOut), &metrics, at(tick));
+            }
+            stats.observe(Ok(WorkerStats::default()), &metrics, at(window + 3));
+        });
+        assert_eq!(dropped(&metrics, "timeout"), window + 2);
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(lines[0].contains("WARN") && lines[0].contains("suppressed=0"));
+        assert!(
+            lines[1].contains("WARN")
+                && lines[1].contains(&format!("suppressed={}", window - 1))
+                && lines[1].contains(&format!("consecutive={}", window + 1)),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("INFO")
+                && lines[2].contains("worker Stats sampling recovered")
+                && lines[2].contains("model=m")
+                && lines[2].contains(&format!("missed={}", window + 2))
+                // No sample since READY (t0), so stale from t0.
+                && lines[2].contains(&format!("stale_ms={}", (window + 3) * 1000)),
+            "{}",
+            lines[2]
+        );
+
+        // Steady sampling is silent.
+        let quiet = logs(|| stats.observe(Ok(WorkerStats::default()), &metrics, at(window + 4)));
+        assert!(quiet.is_empty(), "{quiet:#?}");
+
+        // A short gap inside the window of the last warn is counted but
+        // not logged — and neither is its recovery, so the log never
+        // reports the end of a gap it did not report the start of.
+        let quiet = logs(|| {
+            stats.health_failed(&RpcFailure::TimedOut, &metrics, at(window + 5));
+            stats.observe(Ok(WorkerStats::default()), &metrics, at(window + 6));
+        });
+        assert!(quiet.is_empty(), "{quiet:#?}");
+        assert_eq!(dropped(&metrics, "health_failed"), 1);
+
+        // The next warn carries forward every drop logged only by the
+        // counter since the last warn: the first gap's final tick and the
+        // short gap's one.
+        let lines = logs(|| {
+            stats.observe(Err(RpcFailure::TimedOut), &metrics, at(2 * window + 1));
+        });
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(
+            lines[0].contains("suppressed=2") && lines[0].contains("consecutive=1"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn stats_unimplemented_latches_once_and_logs_by_worker_kind() {
+        for (kind, level, other) in [
+            (WorkerKind::Python, "INFO", "expected for the python worker"),
+            (
+                WorkerKind::Rust,
+                "WARN",
+                "stale or mismatched worker binary",
+            ),
+        ] {
+            let metrics = Metrics::new().expect("metrics build");
+            let t0 = Instant::now();
+            let at = |secs| t0 + Duration::from_secs(secs);
+            let mut stats = StatsReexport::new("m", kind, &metrics, t0);
+            let lines = logs(|| {
+                stats.observe(unimplemented(), &metrics, at(1));
+                // Latched: no further Stats calls, so nothing after this
+                // is a dropped sample, and nothing more is logged.
+                stats.observe(unimplemented(), &metrics, at(2));
+                stats.health_failed(&RpcFailure::TimedOut, &metrics, at(3));
+                stats.observe(Err(RpcFailure::TimedOut), &metrics, at(4));
+            });
+            assert!(!stats.polling(), "{kind:?}: UNIMPLEMENTED stops polling");
+            assert_eq!(dropped(&metrics, "unimplemented"), 1, "{kind:?}");
+            assert_eq!(dropped(&metrics, "health_failed"), 0, "{kind:?}");
+            assert_eq!(dropped(&metrics, "timeout"), 0, "{kind:?}");
+            assert_eq!(lines.len(), 1, "{kind:?}: logged once: {lines:#?}");
+            for needle in [level, "model=m", "Method not found!", other] {
+                assert!(
+                    lines[0].contains(needle),
+                    "missing {needle} in: {}",
+                    lines[0]
+                );
+            }
+        }
+        // The latch belongs to one worker process: the next one probes.
+        let metrics = Metrics::new().expect("metrics build");
+        let next = StatsReexport::new("m", WorkerKind::Python, &metrics, Instant::now());
+        assert!(next.polling());
+    }
+
+    #[tokio::test]
+    async fn bounded_folds_the_deadline_into_the_rpc_result() {
+        let elapsed = timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .expect_err("a pending future cannot beat a zero deadline");
+        assert!(matches!(
+            bounded::<WorkerStats>(Err(elapsed)),
+            Err(RpcFailure::TimedOut)
+        ));
+        assert!(matches!(
+            bounded::<WorkerStats>(Ok(Err(tonic::Status::unimplemented("")))),
+            Err(RpcFailure::Status(status)) if status.code() == tonic::Code::Unimplemented
+        ));
+        let reply = bounded(Ok(Ok(tonic::Response::new(WorkerStats {
+            requests_total: 3,
+            ..WorkerStats::default()
+        }))));
+        assert_eq!(reply.expect("reply").requests_total, 3);
+        // The warn line's `error=` field: code and message, no metadata.
+        assert_eq!(
+            RpcFailure::Status(tonic::Status::unavailable("socket gone")).to_string(),
+            "Unavailable: socket gone"
+        );
+        assert_eq!(RpcFailure::TimedOut.to_string(), "no reply within 2000ms");
     }
 }
